@@ -371,16 +371,16 @@ class SNSSink:
         :meth:`_send`, settles its reply by the keyed rule SQS shares — a sender fault
         ``REJECTED`` and a final rejection, any other failed entry ``RETRYABLE``, an unreadable
         reply ``UNKNOWN``, a raise ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers
-        — marks each landed occurrence in the run's cache, and on a FIFO topic holds a group. In
-        every round but the run's last a message waits, ``RETRYABLE`` and unsent, while an
-        earlier message of its group sent in an earlier call has neither landed nor used its
-        ``max_retries + 1`` sends; in the last round nothing is held, so a held message follows
-        its predecessor's final send. The hold keeps a later *call* from overtaking an earlier
-        message of its group; what the topic does with a call's later entries when an earlier
-        one fails is the topic's. A message a run leaves held is counted ``failed`` with the
-        line ``SNSSink, <n> attempt(s), held behind an earlier message of its FIFO group``. A
-        standard topic holds nothing. This method passes only what is this sink's own: the
-        client call, its API's name and the class name its lines carry.
+        — marks each sent occurrence whose fate is final done in the run's cache, and on a FIFO
+        topic holds a group. In every round but the run's last a message waits, ``RETRYABLE``
+        and unsent, while an earlier message of its group sent in an earlier call has neither
+        landed nor used its ``max_retries + 1`` sends; in the last round nothing is held, so a
+        held message follows its predecessor's final send. The hold keeps a later *call* from
+        overtaking an earlier message of its group; what the topic does with a call's later
+        entries when an earlier one fails is the topic's. A message a run leaves held is counted
+        ``failed`` with the line ``SNSSink, <n> attempt(s), held behind an earlier message of its
+        FIFO group``. A standard topic holds nothing. This method passes only what is this sink's
+        own: the client call, its API's name and the class name its lines carry.
 
         Args:
           batch: The events this round is offered.
@@ -456,7 +456,8 @@ class SNSSink:
         ``SNSSink, exceeds the <limit>-byte message limit``, naming the run's limit the plan
         carries rather than one read when the line is written. The id failures, on a FIFO topic
         only, are announced once per round, ``SNSSink, a FIFO id callable raised <Type>``, naming
-        the first exception's type (SPEC-058 FR-004), as ``SQSSink`` announces its own. Every
+        the first exception's type (SPEC-058 FR-004), through the one line both FIFO sinks
+        share, :func:`~log_foundry.sinks._fifo.announce_id_failures`. Every
         drop is registered ``SETTLED``, so it is counted and announced only when ``emit`` returns
         — on the engine, only when the run settles (SPEC-059 FR-001, SPEC-074).
 
@@ -471,13 +472,7 @@ class SNSSink:
           None.
         """
         context = run_context()
-        entries = cast("list[_fifo.Entry | None]", context.notes(self)["prepared_round"])
         oversize = sum(1 for reason in plan.dropped.values() if reason == "oversize")
-        failures = [
-            cached.error
-            for position, reason in sorted(plan.dropped.items())
-            if reason == "id failure" and (cached := entries[position]) is not None
-        ]
         limit = plan.limit
         for _ in range(oversize):
             context.count(self, "dropped_oversized", 1, when=When.SETTLED)
@@ -485,13 +480,7 @@ class SNSSink:
                 lambda: _diag.lost("event", 1, f"SNSSink, exceeds the {limit}-byte message limit"),
                 when=When.SETTLED,
             )
-        if failures:
-            kind = _diag.type_name(failures[0])
-            count = len(failures)
-            context.announce(
-                lambda: _diag.lost("event", count, f"SNSSink, a FIFO id callable raised {kind}"),
-                when=When.SETTLED,
-            )
+        _fifo.announce_id_failures(self, plan, "SNSSink")
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-001).

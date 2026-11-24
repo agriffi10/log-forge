@@ -354,8 +354,8 @@ class SQSSink:
         entry's outcome is set from the reply: a sender fault ``REJECTED`` and marked a final
         rejection with 1.x's line, any other failed entry ``RETRYABLE``, an unreadable reply
         ``UNKNOWN`` with one line, and a raise ``RETRYABLE`` or ``REJECTED`` as
-        ``_retryable_error`` answers. Each landed occurrence is marked in the run's cache, so a
-        later round never resends a landed occurrence's ids.
+        ``_retryable_error`` answers. Each sent occurrence whose fate is final is marked done in
+        the run's cache, so a later round never hands its entry to another occurrence.
 
         Args:
           batch: The events this round is offered.
@@ -393,8 +393,10 @@ class SQSSink:
 
         The unencodable drop's line is the encode step's own (:func:`encode_round`). The oversize
         lines keep their one-per-event shape and the id failures are announced once per round,
-        naming the first exception's type (SPEC-058 FR-004), all counted and announced only when
-        ``emit`` returns — on the engine, only when the run settles.
+        naming the first exception's type (SPEC-058 FR-004), by
+        :func:`~log_foundry.sinks._fifo.announce_id_failures`, which ``SNSSink`` shares; all are
+        counted and announced only when ``emit`` returns — on the engine, only when the run
+        settles.
 
         Args:
           batch: The round's events.
@@ -413,22 +415,11 @@ class SQSSink:
             for position, reason in sorted(plan.dropped.items())
             if reason == "oversize" and (cached := entries[position]) is not None
         ]
-        failures = [
-            cached.error
-            for position, reason in sorted(plan.dropped.items())
-            if reason == "id failure" and (cached := entries[position]) is not None
-        ]
         if sizes:
             limit = plan.limit
             context.count(self, "dropped_oversized", len(sizes), when=When.SETTLED)
             context.announce(lambda: self._announce_oversized(sizes, limit), when=When.SETTLED)
-        if failures:
-            kind = _diag.type_name(failures[0])
-            count = len(failures)
-            context.announce(
-                lambda: _diag.lost("event", count, f"SQSSink, a FIFO id callable raised {kind}"),
-                when=When.SETTLED,
-            )
+        _fifo.announce_id_failures(self, plan, "SQSSink")
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-005).

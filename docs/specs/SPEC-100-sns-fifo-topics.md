@@ -804,7 +804,7 @@ class Entry:                          # was sqs._Entry; one per event occurrence
     size: int = 0
     drop: str | None = None           # "oversize" | "id failure" | "unencodable"
     error: Exception | None = None
-    landed: bool = False
+    done: bool = False                # every fate but RETRYABLE: never handed to another occurrence
 
 class Plan(NamedTuple):               # was sqs._Plan (sqs.py:103-120)
     chunks: list[list[Prepared]]      # each valid for one request, built with chunk_items
@@ -849,14 +849,17 @@ def plan_round(owner: object, batch: list[dict[str, object]], bodies: dict[int, 
 def hold(chunk: list[Prepared], blocked: set[str], sends: list[int], limit: int) -> list[bool]: ...
 def block(sent: list[Prepared], fates: list[Outcome], sends: list[int],
           blocked: set[str], limit: int) -> None: ...
+def announce_id_failures(owner: object, plan: Plan, name: str) -> None: ...
+    # The one id-failure line, SETTLED, counting every id failure of the round (FR-002).
 def send_round(owner: object, batch: list[dict[str, object]], plan: Plan, fates: list[Outcome],
                *, fifo: bool, max_retries: int,
                send: Callable[[list[Prepared], list[str]], Called[KeyedReply]],
                call: str, name: str) -> None: ...
     # The one round loop both sinks' _round call after their plan, refusal and drops: the
     # last-round gate (fifo and not RunContext.last), hold with the held line, each chunk sent
-    # through send and settled by settle_keyed, the landed marks from notes["prepared_round"],
-    # and block. hold and block are called through the module, so a patch of _fifo.hold reaches
+    # through send and settled by settle_keyed, the done marks from notes["prepared_round"] (every
+    # fate but RETRYABLE, so plan_round never hands a finished entry to another occurrence), and
+    # block, which reads the fates. hold and block are called through the module, so a patch of _fifo.hold reaches
     # both sinks. Each sink passes only its _send, its API's name and its class name (FR-004).
 
 # src/log_foundry/sinks/sns.py
@@ -1154,3 +1157,13 @@ SPEC-095's *Evidence* quotes the same `PublishBatchRequestEntry` sentences, read
     an answer is now asked its type (FR-002, a criterion added). `SNSSink(None, client=c)` built
     and failed later, so `judge` refuses a destination that is not a `str` (FR-001, a criterion
     added). Two docstring lines over 100 characters were rewrapped.
+  - **Diff review frame 2 found three more fixed in the build and one recorded**; none widens
+    the scope, and the first makes FR-002's stated behaviour hold. A repeated event object could
+    be handed another occurrence's finished entry: the cache kept a dropped, finally refused or
+    unadjudicated entry as live, so a retried occurrence was resent with another occurrence's
+    de-duplication id, or replayed its drop. An entry is now `done` at every final fate, not only
+    when it lands, and `plan_round` hands out only entries neither done nor dropped (`Entry.done`
+    replaces `Entry.landed`). The id-failure line's count and the digest's `surrogatepass` gained
+    tests on both sinks, and the line moved into `_fifo.announce_id_failures`, so it exists once.
+    Recorded in §12, for the orchestrator: `_fifo.block` blocks a group behind a message refused
+    as final or left unadjudicated, which is never resent; `block` is unchanged.

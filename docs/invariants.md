@@ -861,7 +861,11 @@ tunables are unreachable from `configure()` (SPEC-034, SPEC-051).
 
 *Observable:* a typed consumer written against the frozen surface (SPEC-034) type-checks and
 runs against every later release of the same major; mutating anything a getter returned changes
-no later event.
+no later event. *Approved exception:* SPEC-100's construction refusals on `SQSSink` — a `fifo` that
+is not a `bool` or `None`, `fifo=True` on a URL not ending in `.fifo`, an id argument on a queue
+that is not FIFO, and a `queue_url` that is not a `str` — refuse calls 1.x accepted, so the typed
+consumer's `SQSSink` id call moved to a `.fifo` URL; each refusal is invariant 13's, and the
+compatibility list of `docs/release-notes/v1.2.1.md` names them.
 *Guarded:* `tests/test_public_surface.py`, `tests/typed_consumer/` (SPEC-051).
 
 ## 11. A diagnostic names a type, never a value, says what happened, and one module writes them all

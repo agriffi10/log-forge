@@ -2035,6 +2035,21 @@ an item leaves this list when a spec closes it, not because the arc names it.
   check that half. **Closed by** adding the three to `SQSSink`'s `Attributes:`, worded as
   `SNSSink`'s are, with "queue" for "topic".
 
+- **A FIFO group waits behind a message that will never be resent** (invariant 2; found by
+  SPEC-100's second diff review, 2026-11-24; present on `5d0e7f68` for `SQSSink`, before SPEC-100;
+  not fixed, because the fix is a reading change to a settled decision). `_fifo.block` blocks a
+  group whenever a sent entry is `not ACCEPTED and count < limit`, which includes an entry
+  refused as final (`REJECTED`, a sender fault) and one left unadjudicated (`UNKNOWN`), neither of
+  which is ever resent. The group's later messages then wait behind a message that will not come
+  again: under `run_delivery(decline=...)`, events 10 and 11 of a twelve-event group whose first
+  entry was a sender fault are counted `failed` with `0 attempt(s), held behind an earlier message
+  of its FIFO group`, and without a decline they cost an extra backoff round
+  (`p7_hold_final.py`, the review's probe). Identical on `SQSSink` and `SNSSink`, which share
+  `block`, and consistent with the hold decision's literal wording ("neither landed nor used its
+  sends"). **Closed by** the orchestrator's call to block only on a `RETRYABLE` fate, written into
+  *A sink round resends only what failed, and an SQS FIFO group keeps its order*, with a test of
+  the decline case on both sinks.
+
 ### Resolved
 
 - ~~**`SNSSink` cannot write an SNS FIFO topic**~~ (SPEC-095, Out of Scope; invariant 7). `SNSSink`

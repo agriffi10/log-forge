@@ -670,6 +670,142 @@ def test_the_resend_of_a_digested_id_carries_the_same_digest(kind: str) -> None:
     assert first[1] == resend[1] == _digest("r" * 200)
 
 
+@pytest.mark.parametrize("kind", SINKS)
+def test_a_lone_surrogate_answer_over_the_limit_is_sent_as_its_digest(kind: str) -> None:
+    """FR-003: the digest encodes with ``surrogatepass``; a lone surrogate digests, not raises."""
+    answer = "s" * 150 + "\ud800"
+    expected = hashlib.sha256(answer.encode("utf-8", "surrogatepass")).hexdigest()
+    sink, client = fifo_sink(kind, message_deduplication_id=lambda e: answer)
+    sink.emit(events(1))
+    assert client.entries[0][0]["MessageDeduplicationId"] == expected
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+# --- SPEC-100 diff review 2: one event object twice, its first occurrence finished early -------
+
+
+def _fail_every_entry_of_first_call(entries: list[dict[str, Any]], call: int) -> Any:
+    if call == 1:
+        return {"Failed": [{"Id": e["Id"], "SenderFault": False, "Code": "T"} for e in entries]}
+    return {"Failed": []}
+
+
+def _first_answer(first: str | Exception, then: Callable[[int], str]) -> Callable[..., str]:
+    """A de-duplication callable answering ``first`` (or raising it) once, then ``then(n)``."""
+    asked: list[int] = []
+
+    def answer(event: dict[str, object]) -> str:
+        asked.append(1)
+        if len(asked) == 1:
+            if isinstance(first, Exception):
+                raise first
+            return first
+        return then(len(asked))
+
+    return answer
+
+
+@pytest.mark.parametrize("kind", SINKS)
+def test_a_repeated_events_id_failure_is_never_handed_to_its_retried_twin(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-002: occurrence 1 is an id failure; occurrence 2 fails once and is resent with its own id.
+
+    The cache handed occurrence 2 occurrence 1's id-failure entry in round 2, so the round was
+    refused with the first occurrence's exception and nothing was counted.
+    """
+    event: dict[str, object] = {"i": 0, "log_id": "L0", "trace_id": "T0"}
+    sink, client = fifo_sink(
+        kind,
+        _fail_every_entry_of_first_call,
+        message_deduplication_id=_first_answer(RuntimeError("flaky"), lambda n: f"d{n}"),
+        max_retries=3,
+    )
+    sink.emit([event, event])
+    assert [[e["MessageDeduplicationId"] for e in call] for call in client.entries] == [
+        ["d2"],
+        ["d2"],
+    ]
+    assert sink.losses() == SinkLosses(dropped=1, failed=0)
+    assert lost(capsys.readouterr().err) == [
+        f"log-foundry: lost 1 event(s); {kind}, a FIFO id callable raised RuntimeError"
+    ]
+
+
+@pytest.mark.parametrize("kind", SINKS)
+def test_a_repeated_events_sender_fault_keeps_its_id_off_its_twins_resend(kind: str) -> None:
+    """FR-002: occurrence 1 is refused as final; occurrence 2's resend carries its own id."""
+    event: dict[str, object] = {"i": 0, "log_id": "L0", "trace_id": "T0"}
+
+    def reply(entries: list[dict[str, Any]], call: int) -> Any:
+        if call == 1:
+            return {
+                "Failed": [
+                    {"Id": entries[0]["Id"], "SenderFault": True, "Code": "bad"},
+                    {"Id": entries[1]["Id"], "SenderFault": False, "Code": "T"},
+                ]
+            }
+        return {"Failed": []}
+
+    sink, client = fifo_sink(
+        kind, reply, message_deduplication_id=_first_answer("d1", lambda n: f"d{n}")
+    )
+    sink.emit([event, event])
+    first, [resend] = client.entries
+    assert [e["MessageDeduplicationId"] for e in first] == ["d1", "d2"]
+    assert resend["MessageDeduplicationId"] == "d2"
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+@pytest.mark.parametrize("kind", SINKS)
+def test_a_repeated_events_oversize_drop_is_never_handed_to_its_retried_twin(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-002: occurrence 1's long id makes it oversize; occurrence 2 fits, fails once, lands."""
+    base: dict[str, object] = {"i": 0, "log_id": "L0", "trace_id": "T0", "pad": ""}
+    body = 1024 - 2 - 50
+    event = {**base, "pad": "x" * (body - len(json.dumps(base)))}
+    assert len(json.dumps(event)) == body
+    sink, client = fifo_sink(
+        kind,
+        _fail_every_entry_of_first_call,
+        message_deduplication_id=_first_answer("a" * 100, lambda n: "b"),
+        max_message_bytes=1024,
+        max_retries=3,
+    )
+    sink.emit([event, event])
+    assert [[e["MessageDeduplicationId"] for e in call] for call in client.entries] == [
+        ["b"],
+        ["b"],
+    ]
+    assert sink.dropped_oversized == 1
+    assert sink.losses() == SinkLosses(dropped=1, failed=0)
+    lines = lost(capsys.readouterr().err)
+    assert len(lines) == 1 and lines[0].endswith("exceeds the 1024-byte message limit"), lines
+    if kind == "SQSSink":
+        assert f"SQSSink, {body + 2 + 100} bytes exceeds" in lines[0]
+
+
+@pytest.mark.parametrize("kind", SINKS)
+def test_the_id_failure_line_counts_every_failed_event(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-002 AC4: two of three events fail their id callable; one line counts both."""
+
+    def group(event: dict[str, object]) -> str:
+        if event["i"] in (0, 2):
+            raise ValueError("no group")
+        return "g"
+
+    sink, client = fifo_sink(kind, message_group_id=group)
+    sink.emit(events(3))
+    assert [json.loads(e[_body_key(kind)])["i"] for e in client.entries[0]] == [1]
+    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+    assert lost(capsys.readouterr().err) == [
+        f"log-foundry: lost 2 event(s); {kind}, a FIFO id callable raised ValueError"
+    ]
+
+
 def test_sns_fifo_raises_a_sink_delivery_error_when_nothing_lands() -> None:
     """A FIFO topic that is unreachable raises, as a standard topic does (SPEC-026 FR-001)."""
 

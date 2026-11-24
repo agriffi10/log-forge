@@ -88,6 +88,11 @@ class Plan(NamedTuple):
 class Entry:
     """One event occurrence's prepared entry or drop reason, kept for its delivery run.
 
+    An entry belongs to the occurrence it was prepared for until that occurrence's fate is final,
+    so :func:`plan_round` hands a later round's occurrence of the same event object only an entry
+    that is neither ``done`` nor dropped. Handing it a finished one sent another occurrence's ids
+    as this one's resend, or replayed another occurrence's drop (SPEC-100's diff review).
+
     Attributes:
       body: The serialized event, or ``""`` for a drop.
       group_id: The resolved ``MessageGroupId``, or ``None``.
@@ -95,7 +100,8 @@ class Entry:
       size: The costed bytes.
       drop: The drop reason, or ``None`` for an entry that can be sent.
       error: The id callable's exception, for an id failure.
-      landed: Whether the service has accepted this occurrence.
+      done: Whether this occurrence's fate in the run is final: it landed, was refused as final,
+        or was left unadjudicated, every outcome but ``RETRYABLE`` (:func:`send_round`).
     """
 
     body: str = ""
@@ -104,7 +110,7 @@ class Entry:
     size: int = 0
     drop: str | None = None
     error: Exception | None = None
-    landed: bool = False
+    done: bool = False
 
 
 class PrepareOne(Protocol):
@@ -416,8 +422,10 @@ def plan_round(
     the random fallback run **once per event per run** and every round resends the identical
     entry. Only the grouping and each entry's index are per round. An identity that appears twice
     keeps one entry per occurrence, and a round hands an occurrence the first entry of its
-    identity that has not landed. The round's entries, by position, are kept under
-    ``"prepared_round"`` for the sink to mark the landed ones.
+    identity that is neither ``done`` nor dropped: one whose fate is final, or one that was
+    dropped, belongs to its own occurrence and is never handed to another. The round's entries,
+    by position, are kept under ``"prepared_round"`` for :func:`send_round` to mark the done
+    ones.
 
     **A FIFO id callable that raises for one event costs only that event** (SPEC-058 FR-004),
     under the wrappers' ledger rule: when every event of the round failed in its id callable,
@@ -456,7 +464,7 @@ def plan_round(
         if held is None or held[0] is not event:
             held = (event, [])
             cache[id(event)] = held
-        live = [cached for cached in held[1] if not cached.landed]
+        live = [cached for cached in held[1] if not cached.done and cached.drop is None]
         skip = taken.get(id(event), 0)
         taken[id(event)] = skip + 1
         if skip < len(live):
@@ -539,6 +547,43 @@ def block(
             blocked.add(item.group_id or "")
 
 
+def announce_id_failures(owner: object, plan: Plan, name: str) -> None:
+    """Registers the round's one id-failure line, ``SETTLED``, for both FIFO sinks.
+
+    Every event of the round whose id callable failed is counted in the line, and the line names
+    the first failure's exception type (SPEC-058 FR-004): ``lost <n> event(s); <name>, a FIFO id
+    callable raised <Type>``. It is written only when ``emit`` returns — on the engine, only when
+    the run settles. The drops themselves are counted by the engine from the round's
+    ``DROPPED`` outcomes; this adds only the line, once, in this one place.
+
+    Args:
+      owner: The sink, whose run notes hold the round's entries.
+      plan: The round's plan, whose ``dropped`` names each id failure's position.
+      name: The shipped class name the line carries.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    context = run_context()
+    entries = cast("list[Entry | None]", context.notes(owner)["prepared_round"])
+    failures = [
+        cached.error
+        for position, reason in sorted(plan.dropped.items())
+        if reason == "id failure" and (cached := entries[position]) is not None
+    ]
+    if not failures:
+        return
+    kind = _diag.type_name(failures[0])
+    count = len(failures)
+    context.announce(
+        lambda: _diag.lost("event", count, f"{name}, a FIFO id callable raised {kind}"),
+        when=When.SETTLED,
+    )
+
+
 def send_round(
     owner: object,
     batch: list[dict[str, object]],
@@ -554,7 +599,7 @@ def send_round(
     """Sends a round's chunks once each, holding a FIFO group, and settles every reply.
 
     This is the one copy of the round loop ``SQSSink`` and ``SNSSink`` share (SPEC-100 FR-004),
-    so the FIFO half of it — the hold, the held line, the landed marks and the blocks — cannot
+    so the FIFO half of it — the hold, the held line, the done marks and the blocks — cannot
     diverge between the twins. Each sink keeps only what is its own: the plan's encode step, its
     drop lines, the client call ``send`` makes and the names its lines carry.
 
@@ -569,9 +614,12 @@ def send_round(
     earlier message of its FIFO group``. Both are called through this module's globals, so a
     patch of ``_fifo.hold`` reaches both sinks. A standard destination holds nothing.
 
-    **Each landed occurrence is marked in the run's cache**, through ``"prepared_round"``, so a
-    later round of the same event object takes the next unlanded occurrence's entry and never
-    resends a landed occurrence's ids (SPEC-074 FR-002). Each reply is settled by
+    **Each sent occurrence whose fate is final is marked done in the run's cache**, through
+    ``"prepared_round"``: one that landed, one refused as final and one left unadjudicated, every
+    outcome but ``RETRYABLE``. A later round of the same event object then takes the next
+    occurrence's own entry and never resends a finished occurrence's ids (SPEC-074 FR-002,
+    SPEC-100 FR-002). :func:`block` reads the fates, not the marks, so the hold is unchanged by
+    them. Each reply is settled by
     :func:`~log_foundry.sinks._rounds.settle_keyed`: a sender fault ``REJECTED`` and a final
     rejection, any other failed entry ``RETRYABLE``, an unreadable reply ``UNKNOWN``, and a raise
     ``RETRYABLE`` or ``REJECTED`` as the sink's ``_retryable_error`` answered.
@@ -623,7 +671,7 @@ def send_round(
         carried = [batch[item.position] for item in sending]
         mark_sent(owner, carried)
         sent = send(sending, entry_ids(owner, carried))
-        landed = settle_keyed(
+        settle_keyed(
             owner,
             positions=[item.position for item in sending],
             carried=carried,
@@ -636,10 +684,10 @@ def send_round(
             final=final,
             lost=lost,
         )
-        for position in landed:
-            cached = entries[position]
-            if cached is not None:
-                cached.landed = True
+        for item in sending:
+            cached = entries[item.position]
+            if cached is not None and fates[item.position] is not Outcome.RETRYABLE:
+                cached.done = True
         if holding:
             block(sending, fates, [sends_of(owner, event) for event in carried], blocked, limit)
     lost.register()

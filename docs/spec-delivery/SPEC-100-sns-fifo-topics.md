@@ -6,8 +6,11 @@
   `GroupIdSource`, `DedupIdSource`, `judge`, `bounded`, `group_id`, `dedup_id`, `prepare`,
   `plan_round` (the per-run entry cache, kept under `"prepared"`, `"prepared_round"` and `"limit"`
   in the calling sink's run notes, chunked with `chunk_items`), `PrepareOne`, `Prepared`, `Plan`,
-  `Entry`, `hold`, `block`, `answer` and `send_round`, the one round loop both sinks' `_round`
-  call (the last-round gate, the hold and its held line, the landed marks and the blocks).
+  `Entry`, `hold`, `block`, `answer`, `announce_id_failures` (the one id-failure line) and
+  `send_round`, the one round loop both sinks' `_round` call (the last-round gate, the hold and
+  its held line, the done marks and the blocks). An entry is `done` at every final fate, so a
+  repeated event object's retried occurrence is never handed another occurrence's finished
+  entry.
   `SQSSink` delegates to it; each sink keeps its own `encode_round` call and passes `send_round`
   only its `_send`, its API's name and its class name.
 - **`SNSSink(fifo=, message_group_id=, message_deduplication_id=)`** (FR-001, FR-002, FR-004):
@@ -70,13 +73,24 @@
   11]`) and `test_a_forwarded_deliver_takes_last_from_the_outer_runs_budget`, and also reddens
   `test_the_last_round_sends_a_held_event_after_its_predecessors_final_send` (the run raises) and
   `test_no_round_before_the_last_sends_a_held_event` (no last-round send); not marking a landed
-  occurrence (`pass` for `cached.landed = True`) is killed on both sinks by
+  occurrence (`pass` for what was then `cached.landed = True`) is killed on both sinks by
   `test_a_repeated_event_never_resends_a_landed_occurrences_ids` (the resend carries the landed
   occurrence's id). The answer's type check disabled is killed by
   `test_every_answer_not_a_str_refuses_the_batch_naming_the_id` on both sinks and both ids (the
   refusal names `strip`, not the id; the drop itself is equivalent, since `str.strip` refuses a
   non-`str` too), and the destination's type check disabled by
   `test_a_destination_that_is_not_a_str_is_refused_naming_it` on both sinks.
+- **Diff review frame 2's mutants**, each re-planted once in `_fifo`: the done mark narrowed back
+  to an accepted fate and `plan_round` handing out dropped entries again is killed on both sinks
+  by `test_a_repeated_events_id_failure_is_never_handed_to_its_retried_twin`,
+  `test_a_repeated_events_sender_fault_keeps_its_id_off_its_twins_resend` and
+  `test_a_repeated_events_oversize_drop_is_never_handed_to_its_retried_twin`; the id-failure
+  line's count fixed at 1 by `test_the_id_failure_line_counts_every_failed_event` (`lost 1` for
+  `lost 2`); the digest's `surrogatepass` dropped by
+  `test_a_lone_surrogate_answer_over_the_limit_is_sent_as_its_digest`.
+- **Recorded, not fixed:** a FIFO group waits behind a message refused as final or left
+  unadjudicated, which `_fifo.block` blocks on though it is never resent (`architecture.md` §12,
+  *Open*); the change is a reading of the hold decision, so it is the orchestrator's.
 - **moto re-run** (scratch venv; Python 3.13.1, boto3 1.44.4, moto 5.2.5) against this tree:
   case E, 4 calls, every event carrying one de-duplication id on every call, one message of the
   group sent per round, `SinkLosses(dropped=0, failed=0, resent=3)`, the FIFO subscriber holding
