@@ -474,6 +474,19 @@ def test_an_id_answer_that_cannot_be_costed_drops_only_its_event(
     ]
 
 
+@pytest.mark.parametrize("which", ["group", "deduplication"])
+@pytest.mark.parametrize("kind", SINKS)
+def test_every_answer_not_a_str_refuses_the_batch_naming_the_id(kind: str, which: str) -> None:
+    """FR-002: the answer is asked its type first, so the refusal names the id, not ``strip``."""
+    key = "message_group_id" if which == "group" else "message_deduplication_id"
+    sink, client = fifo_sink(kind, **{key: lambda e: _Strips()})
+    with pytest.raises(TypeError) as info:
+        sink.emit(events(2))
+    assert str(info.value) == f"a FIFO {which} id callable must answer a str"
+    assert client.entries == []
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
 class _LoudStr(str):
     """A ``str`` subclass whose own ``strip`` raises, so a call of it is visible."""
 
