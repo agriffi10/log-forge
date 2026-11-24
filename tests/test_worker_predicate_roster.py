@@ -1115,6 +1115,18 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "worker-naming tokens sees this because the call names the worker."
         ),
     ),
+    ("_release_after", "_state._closes.owes(member) or _state._closes.in_flight(member)", 0): (
+        MOMENT,
+        (
+            "whether a member attached to a caller's wrapper is closed after it now, or left to "
+            "a close that is someone else's (SPEC-101 FR-001): a member the record owes is closed "
+            "by its own take, and one whose close is in flight, an ordered member behind this "
+            "same holder included, is being closed already, so closing it here would be a "
+            "second close beside the first. Both are read in one critical section under "
+            "_state._lock, as the take reads them. A question about the record, not the worker; "
+            "filed here because it reads the same in-flight half `held` does."
+        ),
+    ),
     ("_shutdown_worker", "waited or stopping_worker is not None", 0): (
         EXISTENCE,
         (

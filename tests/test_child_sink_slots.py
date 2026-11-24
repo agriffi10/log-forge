@@ -64,6 +64,13 @@ _NOT_CHILD_SINK_SLOTS: dict[tuple[str, str], dict[str, str]] = {
     ("_lifecycle", "_Keep"): {
         "remaining": "a decision's record of sinks, alive only for that decision's closes "
         "(SPEC-087 FR-002), never a wrapper's child",
+        "root": "the sink the deciding swap installs, alive only for that decision's closes "
+        "(SPEC-101), never a wrapper's child",
+    },
+    ("_lifecycle", "_Member"): {
+        "ref": "one entry of the after-holder record (SPEC-101): a member the library closes "
+        "after a caller's wrapper, held weakly where its type allows; the record is in "
+        "_CloseRegistry._FORK_SKIP and a child clears it in `_clear_after_fork`",
     },
     ("config", "Config"): {
         "sink_factory": "a callable that builds a sink, never a sink; its built sink is recorded "

@@ -362,12 +362,77 @@ def test_a_shutdown_cuts_a_wait_on_the_sinks_event() -> None:
     assert _joined(out) == [True], out
 
 
+class _ParkingForwarder:
+    """A caller's wrapper that forwards the signal, leaves its member open, and can park the drain.
+
+    ``park``, when set, holds the drain thread inside ``emit``, before the member, until the test
+    sets it; ``parked`` says it is there.
+    """
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self._sig: threading.Event | None = None
+        self.park: threading.Event | None = None
+        self.parked = threading.Event()
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:
+        """The signal the library handed, also handed to the member."""
+        return self._sig
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, sig: threading.Event | None) -> None:
+        self._sig = sig
+        self._inner.log_foundry_stop_signal = sig  # type: ignore[attr-defined]
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Forwards the batch, parking the drain thread first when asked."""
+        park = self.park
+        if park is not None and threading.current_thread().name == "log-foundry-worker":
+            self.parked.set()
+            park.wait(GATE)
+        self._inner.emit(batch)  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        """Closes nothing."""
+
+
+def _expire_inside(wrapper: _ParkingForwarder, member: object) -> str:
+    """Expires a ``shutdown()`` with the drain parked in *wrapper*, then lets the drain finish.
+
+    Returns whether *member*'s own signal is set and whether it was closed, read after the drain
+    thread has ended, so the next ``configure()`` finds nothing held.
+    """
+    wrapper.park = threading.Event()
+    _traced()
+    if not wrapper.parked.wait(GATE):
+        return "the drain thread never parked"
+    worker = _lifecycle._state.worker_exists()
+    log_foundry.shutdown(timeout=0.3)
+    wrapper.park.set()
+    if worker is not None:
+        worker._thread.join(GATE)
+    signal = getattr(member, "log_foundry_stop_signal", None)
+    closed = bool(getattr(member, "_closed", False))
+    return f"set={signal is not None and signal.is_set()} closed={closed}"
+
+
 def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_published() -> None:
     """FR-002 AC-2's discriminating point: no publish is counted lost after a reinstall.
 
     ``spec097_pubsub_after_shutdown.py`` scaled down: P is handed, held by a caller's wrapper that
     forwards the signal and leaves P open, ``shutdown()`` sets P's signal, then P is configured
     again, five orphan logs publish, ``flush()`` runs and a final ``shutdown()`` closes P.
+
+    **The first ``shutdown()`` expires with the drain thread parked inside the wrapper** (SPEC-101).
+    Before SPEC-101 a completed ``shutdown()`` closed the wrapper and left P open, since the
+    wrapper's ``close()`` leaves its member alone; since SPEC-101 the library closes P after that
+    wrapper, so a completed ``shutdown()`` no longer reaches "signal set, P still open". An
+    expired one does: it sets every signal and closes nothing the drain thread is inside. The
+    drain is then let go and its thread joined before P is configured again, so the swap releases
+    the wrapper and spares P, which the graph it installs keeps. ``failed`` is counted from that
+    configure, and only the five orphan logs' confirmations are counted, so the drained span's
+    own rounds, which ran on the set signal, count in neither.
 
     Since SPEC-094 each orphan log's round waits for its own future, up to ``overflow_timeout``,
     and a set signal ends that wait after its first 50 ms slice, reading the publish ``UNKNOWN``
@@ -383,12 +448,13 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
     def work() -> str:
         from log_foundry.sinks.pubsub import GooglePubSubSink
 
-        confirmed: list[int] = []
+        confirmed: list[bytes] = []
         confirm_after = 0.3
 
         class Future:
-            def __init__(self) -> None:
+            def __init__(self, data: bytes) -> None:
                 self.ready_at = time.monotonic() + confirm_after
+                self.data = data
 
             def result(self, timeout: float | None = None) -> str:
                 left = self.ready_at - time.monotonic()
@@ -397,46 +463,31 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
                         time.sleep(max(timeout, 0))
                         raise TimeoutError("not yet")
                     time.sleep(left)
-                confirmed.append(1)
+                confirmed.append(self.data)
                 return "id"
 
         class Publisher:
             def publish(self, topic: str, data: bytes = b"", **attrs: object) -> Future:
-                return Future()
-
-        class Forwarding:
-            def __init__(self, inner: object) -> None:
-                self._inner = inner
-                self._sig: threading.Event | None = None
-
-            @property
-            def log_foundry_stop_signal(self) -> threading.Event | None:
-                return self._sig
-
-            @log_foundry_stop_signal.setter
-            def log_foundry_stop_signal(self, sig: threading.Event | None) -> None:
-                self._sig = sig
-                self._inner.log_foundry_stop_signal = sig  # type: ignore[attr-defined]
-
-            def emit(self, batch: list[dict[str, object]]) -> None:
-                self._inner.emit(batch)  # type: ignore[attr-defined]
-
-            def close(self) -> None:
-                pass
+                return Future(data)
 
         p = GooglePubSubSink("projects/p/topics/t", client=Publisher(), overflow_timeout=1.0)
         log_foundry.configure(service="pubsub", sink=p)
         log_foundry.info("before")
-        log_foundry.configure(sink=Forwarding(p))  # type: ignore[arg-type]
+        wrapper = _ParkingForwarder(p)
+        log_foundry.configure(sink=wrapper)  # type: ignore[arg-type]
         log_foundry.info("via the wrapper")
-        log_foundry.shutdown(timeout=GATE)
+        premise = _expire_inside(wrapper, p)
+        if premise != "set=True closed=False":
+            return f"the premise: {premise}"
         confirmed.clear()
+        before = p.failed
         log_foundry.configure(sink=p)
         for index in range(5):
             log_foundry.info(f"after {index}")
         log_foundry.flush(timeout=GATE)
         log_foundry.shutdown(timeout=GATE)
-        return f"confirmed={len(confirmed)} failed={p.failed}"
+        after = sum(1 for data in confirmed if b'"after ' in data)
+        return f"confirmed={after} failed={p.failed - before}"
 
     child = run_in_child(work, timeout=30)
     assert child.output == "confirmed=5 failed=0", child.output
@@ -453,6 +504,9 @@ def test_a_kafka_sink_configured_again_after_a_shutdown_confirms_what_it_produce
     arrive 0.3 s after each produce, inside the 1.0 s ``flush_timeout``: with the reinstall's clear
     each round waits and confirms, ``failed=0`` for the five, and without it each is counted,
     ``failed=5`` (measured with the clear removed).
+
+    The first ``shutdown()`` expires with the drain thread parked inside the wrapper, for the
+    Pub/Sub test's reason (SPEC-101): a completed one now closes K after the wrapper.
     """
 
     def work() -> str:
@@ -494,32 +548,15 @@ def test_a_kafka_sink_configured_again_after_a_shutdown_confirms_what_it_produce
                         return left
                     time.sleep(min(0.005, max(0.0, end - time.monotonic())))
 
-        class Forwarding:
-            def __init__(self, inner: object) -> None:
-                self._inner = inner
-                self._sig: threading.Event | None = None
-
-            @property
-            def log_foundry_stop_signal(self) -> threading.Event | None:
-                return self._sig
-
-            @log_foundry_stop_signal.setter
-            def log_foundry_stop_signal(self, sig: threading.Event | None) -> None:
-                self._sig = sig
-                self._inner.log_foundry_stop_signal = sig  # type: ignore[attr-defined]
-
-            def emit(self, batch: list[dict[str, object]]) -> None:
-                self._inner.emit(batch)  # type: ignore[attr-defined]
-
-            def close(self) -> None:
-                pass
-
         k = KafkaSink("t", producer=Producer(), flush_timeout=1.0)
         log_foundry.configure(service="kafka", sink=k)
         log_foundry.info("before")
-        log_foundry.configure(sink=Forwarding(k))  # type: ignore[arg-type]
+        wrapper = _ParkingForwarder(k)
+        log_foundry.configure(sink=wrapper)  # type: ignore[arg-type]
         log_foundry.info("via the wrapper")
-        log_foundry.shutdown(timeout=GATE)
+        premise = _expire_inside(wrapper, k)
+        if premise != "set=True closed=False":
+            return f"the premise: {premise}"
         (late,) = k.deliver([{"message": "late"}]).outcomes
         log_foundry.configure(sink=k)
         before = k.failed

@@ -114,6 +114,36 @@ def _defined_here(cls: type) -> bool:
     return module == _PACKAGE or module.startswith(f"{_PACKAGE}.")
 
 
+def _member_defined_here(value: object, name: str) -> bool:
+    """Whether the class that gives *value* its member *name* was defined in this package.
+
+    The class is the first along the real type's MRO whose own namespace holds the name, read
+    through ``sinks.base._class_member``, and it is placed by :func:`_defined_here`, so no
+    descriptor, property, metaclass ``__hash__`` or ``__eq__`` runs: ``inspect.getattr_static``
+    would hash and compare the class. A member found on no class, or a class that raises while it
+    is read, is not shown to be this package's. ``_lifecycle`` asks it of a holder's ``close``
+    to tell a caller's wrapper from a shipped one (SPEC-101).
+
+    Args:
+      value: Any object.
+      name: The member's name, an exact ``str``.
+
+    Returns:
+      Whether the class defining the member is this package's.
+
+    Raises:
+      None.
+    """
+    try:
+        cls = type(value)
+        found = _class_member(cls, name)
+        if found is None:
+            return False
+        return _defined_here(_MRO(cls)[found[1]])
+    except Exception:
+        return False
+
+
 def _is_class(value: object) -> bool:
     """Whether a value is a class, decided from its real type's MRO and never from ``__class__``.
 

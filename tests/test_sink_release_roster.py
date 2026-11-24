@@ -74,8 +74,13 @@ _EXPECTED_CLOSERS = {
     ("sinks/sentry", "SentrySink.close"),
     ("sinks/_factory", "_FactorySink.close"),
     ("sinks/_factory", "_FactorySink._discard"),
+    ("_lifecycle", "_release_after"),
 }
-"""The nine sites that close a sink, named so a tenth is a decision somebody takes.
+"""The ten sites that close a sink, named so an eleventh is a decision somebody takes.
+
+``_release_after`` is the tenth (SPEC-101 FR-001): inside a release the library made of a caller's
+wrapper, it closes each member attached to that wrapper after the wrapper's own close, through the
+helper, with the wrapper as the owner, as a shipped wrapper's forward does.
 
 ``_FactorySink.close`` is the eighth (SPEC-079 FR-006): the private wrapper behind
 ``sink_factory=``, releasing the sink it built through the helper as the shipped wrappers do.
@@ -108,8 +113,16 @@ close to the owner.
 
 _EXPECTED_UNJOINED_REQUESTERS = {
     ("_lifecycle", "_close_owed"),
+    ("_lifecycle", "_release_ordered"),
 }
-"""The one site that asks for a detached close and deliberately does **not** join it.
+"""The two sites that ask for a detached close and deliberately do **not** join it.
+
+``_release_ordered`` is the second (SPEC-101): it releases the members a take ordered behind a
+caller's wrapper, in the mode the wrapper's release was in. It asks for a detached close only when
+the wrapper's own detached release performed none, refused by ``releasable`` or given no thread,
+and the request is the swap's or ``_close_owed``'s, whose joins and graced wait already cover the
+wrapper; it returns nothing to join, and each member's entry is ``GRACED``, so the graced wait
+still bounds it. Inline, it is a closer like any other.
 
 A written decision rather than a table edit (SPEC-044 FR-002). `_close_owed` releases, detached,
 a sink the worker swapped out **without a confirmed fence** whose drain thread has since ended
@@ -640,6 +653,19 @@ _LATCH_DISPOSITIONS = {
         "discharges and registers in one critical section, for every sink it takes: that pair "
         "**is** the record a later re-arm consults, since a sink not owed and not "
         "in flight (`_state._closes`) is one nothing owes anything to"
+    ),
+    ("_lifecycle", "_release_after"): (
+        "records nothing — a member attached to a caller's wrapper is closed only when the "
+        "record neither owes it nor has a close of it in flight, read in one critical section "
+        "under _state._lock, and through the decision's keep, which claims it, so a shipped "
+        "forward of the same decision does not close it again (SPEC-101 FR-001)"
+    ),
+    ("_lifecycle", "_release_ordered"): (
+        "records nothing of its own — each member a take ordered behind a caller's wrapper was "
+        "taken from the owed record in that take's critical section, so its close is already "
+        "in flight under its entry, which the release discharges; one not yet released when "
+        "another raised a BaseException is put back under _state._lock (SPEC-101 FR-002, "
+        "FR-003)"
     ),
     ("sinks/multi", "MultiSink.close"): "not a lifecycle close — a wrapper forwarding to a child",
     ("sinks/filtering", "FilteringSink.close"): "not a lifecycle close — a wrapper forwarding",

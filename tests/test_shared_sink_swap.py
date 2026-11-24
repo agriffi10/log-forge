@@ -1347,7 +1347,12 @@ class MineT(TransformSink):
 def test_a_callers_wrapper_forward_on_a_fenced_swap_and_with_no_worker(
     mine: type, path: str
 ) -> None:
-    """FR-004 AC1: the read reaches into a caller's wrapper, so A joins it and closes once."""
+    """FR-004 AC1: the read reaches into a caller's wrapper, so A joins it and stays open.
+
+    Since SPEC-101 (FR-001) the library also closes A after the wrapper's own close, so a wrapper
+    that closes its member itself gives A two closes, in sequence and never overlapping, the
+    wrapper's and then the library's; on SPEC-087's tree it read one.
+    """
     a = Shared("A")
     log_foundry.configure(service="mine", sink=a)
     _write(path)
@@ -1356,7 +1361,8 @@ def test_a_callers_wrapper_forward_on_a_fenced_swap_and_with_no_worker(
     assert a.closes == 0, a
     log_foundry.shutdown(timeout=5.0)
     join_graced()
-    assert a.closes == 1 and a.overlaps == 0 and a.refused == 0 and a.events == 3 * _per(path), a
+    assert a.closes == 2 and a.overlaps == 0 and a.refused == 0 and a.events == 3 * _per(path), a
+    assert a.events_at_close == [3 * _per(path)] * 2, a
 
 
 @pytest.mark.parametrize("route", ["unconfirmed", "straddle"])
@@ -1381,7 +1387,11 @@ def test_a_callers_wrapper_after_an_unconfirmed_swap_and_after_the_straddle(
 
 @pytest.mark.parametrize("path", ["orphan", "spans"])
 def test_a_hoarding_wrapper_with_every_close_held_open(path: str) -> None:
-    """FR-004 AC3: a wrapper that writes to A from its own `close()` finds A open."""
+    """FR-004 AC3: a wrapper that writes to A from its own `close()` finds A open.
+
+    The wrapper closes A itself, and since SPEC-101 (FR-001) the library closes A once more after
+    the wrapper's close returns: two closes in sequence, the second after every held event landed.
+    """
     a = Shared("A")
     log_foundry.configure(service="hoard", sink=a)
     _write(path)
@@ -1391,7 +1401,8 @@ def test_a_hoarding_wrapper_with_every_close_held_open(path: str) -> None:
     threading.Timer(0.3, a.close_gate.set).start()
     log_foundry.shutdown(timeout=5.0)
     join_graced()
-    assert a.events == 3 * _per(path) and a.refused == 0 and a.closes == 1, a
+    assert a.events == 3 * _per(path) and a.refused == 0 and a.closes == 2, a
+    assert a.overlaps == 0, a
 
 
 @pytest.mark.parametrize("path", ["orphan", "spans"])
@@ -1434,7 +1445,12 @@ def test_an_unbuilt_factory_releases_the_sink_counted_and_announced(
 
 @pytest.mark.parametrize("first", ["multi", "direct"])
 def test_a_wrapper_that_leaves_its_member_installed_over_a_kept_sink(first: str) -> None:
-    """FR-004 AC6: the fourth shape, installed: A is never closed, and nothing is lost."""
+    """FR-004 AC6: the fourth shape, installed: nothing is lost, and A is closed once.
+
+    On SPEC-087's tree A was never closed: the wrapper leaves its member alone and the keep spared
+    it. Since SPEC-101 (FR-001) A, which the library wrote to, is attached to the wrapper at the
+    configure and closed by the library after the wrapper's close.
+    """
     a, b = Shared("A"), Shared("B")
     log_foundry.configure(service="leaves", sink=MultiSink(a, b) if first == "multi" else a)
     _write("orphan")
@@ -1442,7 +1458,7 @@ def test_a_wrapper_that_leaves_its_member_installed_over_a_kept_sink(first: str)
     _write("orphan", 2)
     log_foundry.shutdown(timeout=5.0)
     join_graced()
-    assert a.closes == 0 and a.refused == 0 and a.events == 3, a
+    assert a.closes == 1 and a.refused == 0 and a.events == 3 and a.overlaps == 0, a
     assert _losses() == (0, 0, 0, 0, 0)
 
 
