@@ -2050,6 +2050,44 @@ an item leaves this list when a spec closes it, not because the arc names it.
   *A sink round resends only what failed, and an SQS FIFO group keeps its order*, with a test of
   the decline case on both sinks.
 
+- **Two timing tests fail `test (py3.12)` on a loaded 4-CPU runner** (invariants 3 and 2, as below;
+  found by SPEC-100's session on 2026-11-24, watching `main` after Dependabot PR #419, whose diff
+  `git diff 5d0e7f68 96252937` touches only `poetry.lock`; unfixed under the audit scope freeze).
+  Release run 45469796270 at `96252937` failed `test (py3.12)` twice and passed on the third
+  attempt, with a different failure each time; `test (py3.13)` passed on every attempt, and the
+  previous Release run, at `5d0e7f68`, passed first time. `main` also had a failed Release at
+  `5170b023`, not examined here. Neither failure was reproduced locally. Line numbers are at
+  `96252937`, and none of the files cited has changed since.
+  The first attempt failed `tests/test_invariants_model.py::test_the_soak_is_wired[http]`
+  (invariant 3) at `:985`: `invariant 3 (within its timeout plus 1.0 s): Stalled:info, info: own
+  time 1.067 s against a budget of 0.000 s; load average 12.0 / 4.2 / 1.5 on 4 CPUs seed=2`. Its
+  assumption is that an `info()` given no timeout returns within `model_oracles.EPSILON`, one
+  second, of wall-clock own time whatever the runner's load (`check_call`,
+  `tests/model_oracles.py:320`), and `_machine`'s docstring records that the bound is deliberately
+  neither skipped nor widened under load, so that a real stall cannot pass as starvation; the
+  starvation that docstring measured failed at loads of 81 to 112 on 10 cores and passed at 50 to
+  55, and this run failed at 12.0 on 4.
+  The second attempt failed
+  `tests/test_lock_reentry.py::test_the_recording_run_sees_a_re_entry_only_where_one_is_made[clean]`
+  at its `returncode == 0` assertion (`:113`), because its nested `pytest -n 4` over
+  `tests/test_runtime_state.py` and `tests/test_worker.py`, started inside the outer `-n 12` run,
+  failed `tests/test_worker.py::test_the_fast_return_reports_an_abandoned_drain_as_failure` with
+  `answered is not delivered — the batch it carried was abandoned`. That test (SPEC-021's flush
+  verdict, the announced loss of invariant 2) assumes span `a` is still queued when `flush()`
+  stamps its marker with `failed_batches` (`src/log_foundry/worker.py:1726`), but the worker
+  runs at `flush_interval=0.01` (`tests/test_worker.py:2328`) and nothing holds its drain back,
+  so a drain that emits and abandons `a` before that stamp leaves a marker that
+  `_nothing_lost_since` answers delivered while `failed_batches == 1` still holds. The code
+  admits that interleaving and the failure matches it, the premise assertion having passed, but
+  it was not reproduced. The outer test fails on any red test in the two child modules, so it
+  inherits every timing assumption they make.
+  **Closed by** two test changes. The soak's bound needs to hold on a loaded 4-CPU runner
+  without letting a real stall through, for instance by subtracting the time the calling thread
+  was not scheduled rather than widening `EPSILON`, which `_machine` rules out. The fast-return
+  test needs to hold span `a` in the queue until the marker is stamped, for instance with a sink
+  or a drain gated on an event the test sets after `flush()` has read `failed_batches`, in place
+  of the 0.01 s window.
+
 ### Resolved
 
 - ~~**`SNSSink` cannot write an SNS FIFO topic**~~ (SPEC-095, Out of Scope; invariant 7). `SNSSink`
