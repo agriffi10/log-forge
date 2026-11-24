@@ -841,7 +841,7 @@ class _CloseRegistry:
         with self._lock:
             return set(self._in_flight)
 
-    def attach(self, close: _Close, thread: threading.Thread, holder: object = None) -> None:
+    def attach(self, close: _Close, thread: threading.Thread, holder: object | None = None) -> None:
         """Records a thread performing a close, once it has started, beside any already there.
 
         Appended, never assigned: a detached release that joins an entry another participant is

@@ -4,9 +4,10 @@ Whether the record SPEC-101's prototype adds stays bounded, which SPEC-087 measu
 release not to: 200 rounds of configure(A), one log, configure(W(A)), one log, with no span, for
 W a wrapper that leaves its member alone (Leaves) and one that closes it (Mine), then shutdown().
 Prints A's closes, overlapping closes and refused events, the owed record's size, and the sizes of
-the prototype's two records, the after-holder record and the record of sinks the library wrote to
-(_lifecycle._AFTER and _ARMED; "absent" on a tree without them), at the last round and after
-shutdown(). An entry of either is dropped once its sink is collected, so the configured holder,
+the two records, the after-holder record and the record of sinks the library wrote to, at the last
+round and after shutdown(): on the build _lifecycle._state._closes._after (holders and their
+members) and ._written; failing those, the prototype's _lifecycle._AFTER and _ARMED; "absent" on a
+tree with neither. An entry of either is dropped once its sink is collected, so the configured holder,
 still alive, keeps one. Run from the repository root, never -I:
 
   PYTHONPATH=<tree>/src python -B docs/audits/2026-11-14-probes/lifecycle/spec101_rounds.py
@@ -71,6 +72,15 @@ class Mine(Leaves):
 
 
 def after():
+    closes = _lifecycle._state._closes
+    record = getattr(closes, "_after", None)
+    if record is not None:
+        written = getattr(closes, "_written", None)
+        members = sum(len(entry[1]) for entry in record.values())
+        return (
+            f"{len(record)} holder(s), {members} member(s) "
+            f"written_record={'absent' if written is None else len(written)}"
+        )
     record = getattr(_lifecycle, "_AFTER", None)
     armed = getattr(_lifecycle, "_ARMED", None)
     if record is None:

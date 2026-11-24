@@ -1690,11 +1690,12 @@ DRAWS_DIGEST = "067042001a29068db3424a51e15f58ba1594c3e0ae8df04b093240fefdd8684f
 
 
 def test_the_install_draw_leaves_every_seeds_steps_unchanged() -> None:
-    """SPEC-101 FR-004 AC2: the install draw has a stream of its own, so the steps are the base's.
+    """SPEC-101 FR-004 AC2: every default seed draws the same steps it drew before SPEC-101.
 
     The digest was read on the tree before SPEC-101: 24 seeds, 168 ``configure`` steps among
-    them. A draw that took from ``sequential:<seed>`` would shift every later step of the seed and
-    change it, so the gate's seeds keep their meaning only while this holds.
+    them. It pins what ``_draws`` returns over the default seeds, and so ``_draws`` itself,
+    ``STEP_WEIGHTS`` and ``SEQ_STEPS``, which together decide each seed's steps: a change to any of
+    them changes the digest, so the gate's seeds keep their meaning only while this holds.
     """
     drawn = repr([_draws(seed) for seed in DEFAULT_SEQ_SEEDS])
     assert hashlib.sha256(drawn.encode()).hexdigest() == DRAWS_DIGEST

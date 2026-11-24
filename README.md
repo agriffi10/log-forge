@@ -1344,10 +1344,11 @@ both delivery paths:
   delivered to directly after each close of your wrapper that the library makes, and a member it
   never delivered to directly is yours to close.
 
-A wrapper that closes its member itself gets a second `close()` of that member from the library,
-after its own, wherever the library has delivered to that member directly; the protocol's
-idempotent `close()` absorbs it. Either way, the library closes such a member only once your
-wrapper's `close()` has returned, so a slow `close()` delays that member's close.
+When the library closes a wrapper that closes its member itself, the member gets a second
+`close()` from the library, after the wrapper's own, wherever the library has delivered to that
+member directly; the protocol's idempotent `close()` absorbs it. Either way, the library closes
+such a member only once your wrapper's `close()` has returned, so a slow `close()` delays that
+member's close.
 
 A wrapper that closes a sink it was handed must not have that sink configured directly after it:
 `configure(sink=MyWrapper(file))` then `configure(sink=file)` lets your wrapper's `close()` close

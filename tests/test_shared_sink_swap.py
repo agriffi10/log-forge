@@ -1369,7 +1369,11 @@ def test_a_callers_wrapper_forward_on_a_fenced_swap_and_with_no_worker(
 def test_a_callers_wrapper_after_an_unconfirmed_swap_and_after_the_straddle(
     route: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """FR-004 AC2: A stays open until `shutdown()` and refuses nothing; two closes may remain."""
+    """FR-004 AC2: A stays open until `shutdown()` and refuses nothing.
+
+    Since SPEC-101 (FR-001, FR-002) both routes read what the forward shape reads: two closes of
+    A, the wrapper's and then the library's, in sequence and never overlapping.
+    """
     a = Shared("A")
     log_foundry.configure(service="mine-owed", sink=a)
     _write("spans")
@@ -1382,7 +1386,7 @@ def test_a_callers_wrapper_after_an_unconfirmed_swap_and_after_the_straddle(
     assert a.closes == 0, a
     log_foundry.shutdown(timeout=5.0)
     join_graced()
-    assert a.refused == 0 and a.closes >= 1, a
+    assert a.refused == 0 and a.closes == 2 and a.overlaps == 0, a
 
 
 @pytest.mark.parametrize("path", ["orphan", "spans"])
