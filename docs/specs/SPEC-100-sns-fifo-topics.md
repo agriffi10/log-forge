@@ -51,8 +51,8 @@ idempotent.
 - Every way a FIFO publish can be refused is read by the rules SPEC-093 and SPEC-094 already set,
   and each is pinned by a test (FR-005).
 - SPEC-092's corpus gains an `SNSSink[fifo]` variant beside `SQSSink[fifo]` (FR-006).
-- The record: `architecture.md` §12, three decisions and one new one, the README, the pending
-  release notes and the component inventory (FR-007).
+- The record: `docs/invariants.md`, `architecture.md` §12, five decisions and one new one, the
+  README, the pending release notes, the component inventory and the docstrings (FR-007).
 
 **Twin paths (invariant 6).** `SQSSink` and `SNSSink` become twins for FIFO behaviour, and FR-002
 makes them one mechanism rather than two copies. The worker, the orphan path and
@@ -94,15 +94,16 @@ says what it does get).
 
 ## Functional Requirements
 
-**Bases.** Every premise below was read at `03dbf502`, and every `file:line` cites that tree.
-SPEC-093, SPEC-095 and SPEC-096 are Draft there and change both sinks, and this spec depends on all
-three. The build therefore starts from a `main` that carries them. SPEC-096 was built before this
-spec landed (`dd77b3fb`). At `1e9ab67e`, which carries it, `spec100_ids_once.py`,
-`spec100_costing.py`, `spec100_ordering.py`, `spec100_refusals.py` and `spec100_moto_shapes.py`
-read the same as at `03dbf502`, apart from moto's random message ids. `spec100_prototype.patch`
-applies to `03dbf502` only, and the build ports it onto SPEC-096's code. Where a criterion names `max_message_bytes`, `resent` or
-`dropped_unadjudicated`, it means what those specs define. *Evidence* gives each measurement and
-the tree it was taken on.
+**Bases.** The spec was authored at `03dbf502`, where SPEC-093, SPEC-095 and SPEC-096 were Draft.
+It was re-verified at the build's start against `5d0e7f68`, the `main` that carries SPEC-093,
+SPEC-094, SPEC-095 and SPEC-096, and every `file:line` in the requirements, the Data Model and the
+Interface Contract cites that tree. SPEC-096 was built before this spec landed (`dd77b3fb`). At
+`1e9ab67e`, which carries it, `spec100_ids_once.py`, `spec100_costing.py`, `spec100_ordering.py`,
+`spec100_refusals.py` and `spec100_moto_shapes.py` read the same as at `03dbf502`, apart from
+moto's random message ids. `spec100_prototype.patch` applies to `03dbf502` only, and the build
+ports it onto the current code (*Evidence → The prototype* says what that changes). Where a
+criterion names `max_message_bytes`, `resent` or `dropped_unadjudicated`, it means what those
+specs define. *Evidence* gives each measurement and the tree it was taken on.
 
 **What this spec builds on.**
 
@@ -138,10 +139,19 @@ Each is stored as a public attribute of the same name, as on `SQSSink`. `GroupId
 `DedupIdSource` are exported from `log_foundry.sinks.sns` as well as from `log_foundry.sinks.sqs`.
 They are the same objects, defined once in the shared module (FR-002).
 
-**The judgement** is one helper, `_fifo.judge`, which both constructors call before any client is
-built. On `SNSSink` it runs after every refusal the constructor makes today, and on `SQSSink` after
-`max_retries`, where the blank-group check runs today, so a call refused at the base keeps its
-exact error on both. It judges the types first and then the values:
+**The judgement** is one helper, `_fifo.judge`. On both sinks every refusal the constructor makes
+today stays where it is, in its order, and `judge` runs after all of them and before any client is
+built, so a call refused at the base keeps its exact error on both:
+
+- On `SNSSink` the base refuses `max_retries` (`sns.py:147`) and then `max_message_bytes`
+  (:148-154), and builds the client at :155. `judge` runs between the two.
+- On `SQSSink` the base refuses the two id types through `require_callable` (`sqs.py:278-279`),
+  then `max_retries` (:280), then a blank constant group (:281-287), then `max_message_bytes`
+  (:288-294), and builds the client at :295. `judge` runs after `max_message_bytes`. There it
+  re-asks the three refusals the base has already made, which therefore cannot fire on `SQSSink`,
+  and adds the new ones.
+
+It judges the types first and then the values:
 
 - `message_group_id` that is not a `str` subclass, not callable and not `None` is refused with
   `TypeError` `<Class> message_group_id must be a str, a callable or None, not <type>`, and
@@ -152,8 +162,9 @@ exact error on both. It judges the types first and then the values:
   subclassed, so the test admits `True` and `False` alone, and no subclass case exists to read as
   SPEC-066 reads an `int` subclass. `SQSSink` has read `fifo` by truthiness since SPEC-016, so
   `fifo=1` stops constructing there.
-- A constant group id that is blank after `str.strip` is refused with `ValueError`, naming
-  `message_group_id`.
+- A constant group id that is blank after `str.strip` is refused with `ValueError` `message_group_id
+  must be a non-empty string; pass None to group by trace_id`, the base's text, which names no
+  class, on both sinks.
 - `fifo=True` on a queue URL or topic ARN that does not end in `.fifo` is refused with
   `ValueError` `<Class> fifo=True needs a <queue_url|topic_arn> ending in .fifo: AWS requires every
   FIFO <queue|topic> name to end so`. That sink can never deliver, so it is the bad-argument rule's
@@ -175,15 +186,19 @@ an exception to invariant 13.
 
 - `tests/test_type_doors.py`: `_REFUSED`, the subclass test, the accepted-values test and the
   blank-group test gain `SNSSink` beside `SQSSink`. `_REFUSED` gains `fifo=1`, `fifo="yes"` and a
-  value whose `__class__` claims `bool`, on both sinks. The accepted-values test moves to a `.fifo`
-  URL, because it builds `SQSSink("https://q", message_group_id=value, ...)`, which is now
-  refused.
+  value whose `__class__` claims `bool`, on both sinks. `_REFUSED`'s two standard-URL cases
+  (`tests/test_type_doors.py:306` and `:316`) still raise their `TypeError`, not the new
+  `ValueError`, because types are judged first. The accepted-values test moves to a `.fifo` URL,
+  because it builds `SQSSink("https://q", message_group_id=value, ...)`, which is now refused.
 - `tests/test_type_door_roster.py`: `EXPECTED_DOORS` gains `sinks._fifo.judge`, fourteen doors,
   and the count in its docstring follows. `judge` carries both an `issubclass(type(fifo), bool)`
   and a stored-name read, so the roster's mutation sweep plants in it. With only that line
   changed, the file passes on the prototype.
 - `tests/test_public_surface.py::test_the_aliases_a_public_signature_names_are_exported`.
-- `tests/typed_consumer/accepts.py`, the frozen-surface consumer (SPEC-051).
+- `tests/typed_consumer/accepts.py`, the frozen-surface consumer (SPEC-051). Its line 321 builds
+  `SQSSink("https://sqs.invalid/q", message_group_id=_GROUP, message_deduplication_id=_DEDUP)`,
+  ids on a standard URL, which FR-001 refuses. The file is type-checked and never run, but it
+  documents a call a caller may write, so the build moves that line to a `.fifo` URL.
 - `tests/test_sinks_encode.py::test_the_public_surface_grows_only_by_five_losses`, which gains the
   three new public attributes for `SNSSink`.
 - `tests/test_sinks_sqs_chunks.py`'s `_sink` helper builds `SQSSink("https://q", fifo=fifo, ...)`.
@@ -218,12 +233,15 @@ client build option, and the prototype passes all three unchanged.
       each on a FIFO and a standard name) raises the same `TypeError` text on `SNSSink`, naming
       `SNSSink` or a subclass's own name, and builds no client (invariants 13 and 6).
 - [ ] Every call refused at the base keeps its exact error on both sinks: `SQSSink("https://q",
-      max_retries=2.5, fifo="x")` raises the `max_retries` `TypeError`, and `SQSSink("https://q",
-      fifo="x", message_group_id=5)` and its `SNSSink` twin raise the `message_group_id` one
-      (invariants 13 and 6).
-- [ ] `message_group_id="  "` raises `ValueError` naming `message_group_id` before any client is
-      built, and a `str` subclass constant is accepted and sent as the `str` it holds, without its
-      own `strip` running (invariant 13).
+      max_retries=2.5, fifo="x")` raises the `max_retries` `TypeError`; `SQSSink("https://q",
+      max_message_bytes=5, fifo="x")` and `SNSSink("arn:aws:sns:r:1:t", max_message_bytes=5,
+      fifo="x")` each raise the `max_message_bytes` `ValueError`; and `SQSSink("https://q",
+      fifo="x", message_group_id=5)` and its `SNSSink` twin raise the `message_group_id`
+      `TypeError` (invariants 13 and 6).
+- [ ] On both sinks, `message_group_id="  "` raises `ValueError` `message_group_id must be a
+      non-empty string; pass None to group by trace_id` before any client is built, and a `str`
+      subclass constant is accepted and sent as the `str` it holds, without its own `strip`
+      running (invariant 13).
 - [ ] `log_foundry.sinks.sns.GroupIdSource is log_foundry.sinks.sqs.GroupIdSource`, and the same
       holds for `DedupIdSource`. Both are in `sns.__all__`, and the typed consumer type-checks under
       `mypy --strict` (invariant 10).
@@ -238,17 +256,29 @@ client build option, and the prototype passes all three unchanged.
 - the argument judgement, `judge` (FR-001);
 - `bounded`, SQS's `_bounded`, which the group id keeps (FR-003);
 - `group_id` and `dedup_id`, which resolve one event's ids;
-- the per-run entry cache: SQS's `_Entry`, `_Prepared` and the identity-keyed preparation in
-  `SQSSink._chunks` and `SQSSink._prepare`;
+- the per-run entry cache: SQS's `_Entry`, `_Prepared`, `_Plan` and the identity-keyed
+  preparation in `SQSSink._chunks` and `SQSSink._prepare`;
 - `hold` and `block` (FR-004).
 
 `SQSSink` keeps its constants and its methods: `sqs.DEFAULT_GROUP_ID`, `sqs.MAX_ID_LEN`,
 `SQSSink._group_id`, `SQSSink._dedup_id`, `SQSSink._chunks`, `SQSSink._prepare` and
 `SQSSink._send` still resolve, and the two constants are the shared objects. Its module-level
-`_Prepared`, `_Entry`, `_bounded`, `_hold` and `_block` move to `_fifo.py` without the underscore.
-`sqs.py` names `_Prepared` and `_Entry` under `TYPE_CHECKING` only, so none of the five resolves
-on `sqs` at run time, and no test at the base reads one. Each sink calls `encode_round` in its own module and hands the bodies to the
-shared preparation. That keeps `tests/test_encode.py`'s roster deriving both sinks: the prototype
+`_Prepared` (`sqs.py:77`), `_Plan` (:103), `_Entry` (:124), `_bounded` (:146), `_hold` (:901) and
+`_block` (:937) move to `_fifo.py` without the underscore. All six are runtime names of `sqs`
+today, since only `threading` and `SinkLosses` sit under `TYPE_CHECKING` (:41-44), and
+`tests/test_sinks_sqs_chunks.py:25,90,111-122` imports `sqs._Plan` and reads its `chunks`,
+`dropped` and `refused`. So `sqs.py` keeps each old private name bound to the shared object
+(`sqs._Plan is _fifo.Plan`, `sqs._Prepared is _fifo.Prepared`, and so on for all six), and every
+test that reads one resolves it unchanged.
+
+**The cache keeps its key and its owner.** `SQSSink._chunks` keeps the run's entries in
+`run_context().notes(self)` under `"prepared"`, the round's under `"prepared_round"` and the run's
+limit under `"limit"` (`sqs.py:710-716`). The shared preparation keeps those three keys in the
+notes of the sink that calls it. `tests/test_sinks_queue_engine.py:622-631`
+(`test_the_per_round_id_mutant_is_caught`) disables the cache by popping
+`notes(self)["prepared"]`, and it passes unchanged.
+
+Each sink calls `encode_round` in its own module and hands the bodies to the shared preparation. That keeps `tests/test_encode.py`'s roster deriving both sinks: the prototype
 first moved the call into `_fifo.py`, and the roster lost both. `SNSSink._bodies` is replaced by
 the shared preparation and an `SNSSink._register_drops`. That method keeps SNS's oversize line,
 `SNSSink, exceeds the <limit>-byte message limit`, and adds the id-failure line `SQSSink` already
@@ -269,7 +299,7 @@ roster names it in place of `_bodies`.
 On a standard topic no id is resolved and the entry is `{"Id", "Message"}`, byte for byte as today.
 
 **The default key is `log_id`, on both sinks.** `SQSSink._dedup_id` already defaults to it
-(`sqs.py:540-564`, SPEC-016 FR-003). `spec100_ids_once.py` case A reads `L0` and `L1` on the wire
+(`sqs.py:600-624`, the `log_id` default at :619, SPEC-016 FR-003). `spec100_ids_once.py` case A reads `L0` and `L1` on the wire
 for events whose `log_id`s they are, so nothing about `SQSSink` changes here. That is also what the
 SPEC-092 double's de-duplication relies on.
 
@@ -287,9 +317,11 @@ calls), but a callable that answers differently, or the minted fallback for an e
 around the engine, which `MultiSink`'s worker loop does. FR-007 records it in the README beside
 the arguments.
 
-**Costed.** An entry's cost against the message limit is its body's UTF-8 length plus, on a FIFO
-topic, both ids' UTF-8 lengths, exactly as `SQSSink` costs it. That is SPEC-016 FR-005, and
-SPEC-096 kept it when it set the limit. SNS's pages say a message's body and its attributes count
+**Costed.** An entry's cost is its body's UTF-8 length plus, on a FIFO topic, both ids' UTF-8
+lengths, exactly as `SQSSink` costs it, and it is judged against the run's limit: `max_message_bytes`
+when it is set, else `MAX_BYTES`, at most 1 MiB, read once per run and kept under `"limit"`, as
+`SQSSink._prepare(event, body, *, limit)` (`sqs.py:757`) is handed it today. That is SPEC-016
+FR-005, and SPEC-096 kept it when it set the limit. SNS's pages say a message's body and its attributes count
 toward `MaximumMessageSize` and say nothing about the two ids. Counting them over-counts by at most
 256 bytes, which drops an event at the edge, counted and announced, rather than sending one the
 service may refuse together with its chunk. One rule on both twins also keeps FR-006's
@@ -351,8 +383,8 @@ de-duplicates. The topic's own absorption rests on AWS's word, and FR-007 says s
 
 #### Description:
 
-**The defect, on `SQSSink` today.** `_bounded` cuts an id longer than `MAX_ID_LEN` (128) to its
-first 128 characters (`sqs.py:125-141`). For a group id that merges two groups, which costs
+**The defect, on `SQSSink` today.** `_bounded` cuts an id longer than `MAX_ID_LEN` (128,
+`sqs.py:51`) to its first 128 characters (`sqs.py:146-162`). For a group id that merges two groups, which costs
 ordering. For a de-duplication id it makes two different events share one id, and a FIFO queue or
 topic accepts the second and does not deliver it. `spec100_moto_shapes.py` case F sent two events
 whose callable answered 200 characters sharing the first 128 to moto's FIFO queue. The queue held
@@ -488,8 +520,10 @@ only where a class has more than one, so:
 - **`SNSSink[fifo]` is added**, class `keyed-reply`. It is built on a `.fifo` topic ARN with
   `picks={"fifo": True}`, over an SNS double that, like the `SQSSink[fifo]` double, does not take a
   second copy of a `MessageDeduplicationId` it has taken. It runs the seven `keyed-reply` faults.
-- **`PARAMETERS`** gains `fifo`, `message_group_id` and `message_deduplication_id` for `SNSSink`.
-  `fifo` is the variant's pick. The other two go wherever SPEC-092's build put `SQSSink`'s.
+- **`PARAMETERS`** gains `fifo`, `message_group_id` and `message_deduplication_id` for `SNSSink`
+  (`tests/conformance_classes.py:553`). `fifo` is the variant's pick. The other two go in
+  `NEUTRAL["SNSSink"]` (:700), as `SQSSink`'s two id arguments sit in `NEUTRAL["SQSSink"]`
+  (:702-711).
 
 **Where its rows sit.** On `03dbf502` with this spec's prototype, its seven rows read exactly as
 `SQSSink[fifo]`'s, fault by fault: six green, and `no-verdict-shape` red at `silent-loss`
@@ -513,7 +547,24 @@ SPEC-096 moves no row (`spec096_corpus_rows.py`), so the base is SPEC-095's "aft
 | SPEC-095's "after SPEC-094" | 268 | 6, under 4 pins | 34, under 14 departures | 228 |
 | with this spec | 275 | 6, under 4 pins | 36, under 14 departures | 233 |
 
-If the base the build starts from reads otherwise, the deltas above apply to it.
+`5d0e7f68` reads the base row exactly: 268 rows, 6 pinned under 4 pins, 34 departure rows under 14
+departures, 228 that must pass, and `aws-client-retries` at 10 rows.
+
+**The literals that move**, in `tests/test_conformance_gate.py` at `5d0e7f68`:
+
+- The test name `test_the_variants_are_the_55_of_fr_001_and_spec_093_each_in_one_of_the_ten_classes`
+  (:70) and its docstring's count, `len(cc.VARIANTS) == 55` (:72) and `len(built) == 55` (:230)
+  become 56.
+- The summed `PARAMETERS` length, 173 (:147), becomes 176. The class count, 39 (:146), stays.
+- `len(table) == 268` and the unique-id count (:249-250) become 275, and `"keyed-reply": 28`
+  (:253) becomes 35.
+- `checked == 52` (:292) counts every `clean` row but `NullSink-clean`, and `len(green_clean) ==
+  52` (:1017) counts every `clean` row with no pin and no departure. `NullSink-clean` is the only
+  `clean` row with either, so both count the same 52 rows. `SNSSink[fifo]-clean` is green, so both
+  become 53.
+- In `test_the_register_holds_the_totals_of_fr_004`, `len(departing) == 34` (:1113) becomes 36
+  and the must-pass 228 (:1114) becomes 233, and its docstring gains SPEC-100's step. The pins, 4
+  (:1108), the departures, 14 (:1109), and the pinned rows, 6 (:1112), stay.
 
 #### Acceptance Criteria:
 
@@ -527,7 +578,7 @@ If the base the build starts from reads otherwise, the deltas above apply to it.
 - [ ] The corpus's literals read the base's totals plus 7 rows, 2 departure rows and 5 must-pass
       rows, with pins, pinned rows and departures unchanged. `aws-client-retries` names
       `SNSSink[standard]` where it named `SNSSink` and gains `SNSSink[fifo]`'s `refused-once` and
-      `refused-always`, 12 rows (invariants 2 and 7).
+      `refused-always`, 12 rows. The two counts of `clean` rows read 53 (invariants 2 and 7).
 - [ ] The parameter roster test passes with `SNSSink`'s three new parameters (invariant 7).
 
 ### FR-007: The record says what a FIFO topic gets, what it still does not, and what moved
@@ -569,8 +620,15 @@ These are the completion ritual's edits.
     broken, and an id argument on a sink that is not FIFO as an argument the chosen backend cannot
     use, which on `SQSSink` refuses a call that delivered; and `fifo=False` on a `.fifo` name as
     the accepted exception. Its fence names the `fifo` refusal.
-  - ***No shipped sink declares itself idempotent*** gains a dated History entry naming a FIFO
-    `SNSSink` against SPEC-095's three conditions:
+  - ***An argument door asks the type, never the value*** says in its fence that "A guard holds the
+    doors as an exact set of ten", and in its body (line 59) that the derived set "must equal ten
+    written out by name", while `tests/test_type_door_roster.py` holds thirteen and FR-001 makes it
+    fourteen. Both sentences take a count-free wording, the set written out by name in that test,
+    and the decision gains a dated History entry naming `_fifo.judge`.
+  - ***No shipped sink declares itself idempotent***: its line 15, "(SNS documents de-duplication
+    for FIFO topics only, which `SNSSink` cannot write)", is rewritten to say that a FIFO
+    `SNSSink` now exists and fails the conditions below. The decision also gains a dated History
+    entry naming a FIFO `SNSSink` against SPEC-095's three conditions:
     1. It fails the first. The topic absorbs a copy only inside its interval, and
        `spec095_fifo_window.py` shows that the engine's second round can start more than 300 s
        after the first when each call ends after botocore's five attempts at its 60-second read
@@ -579,7 +637,11 @@ These are the completion ritual's edits.
     3. It fails the third: `tests/integration/docker-compose.yml` runs no SNS service, and moto's
        SNS does not de-duplicate (FR-002).
 - **README.**
-  - The `SNSSink` row of the AWS table gains the three arguments.
+  - The `SNSSink` row of the AWS table gains the three arguments, and loses "a FIFO topic is not
+    supported yet".
+  - Three sentences that name `SQSSink` alone name both FIFO sinks: "An SQS **FIFO** message group
+    keeps its order" (README :949-950), "an `SQSSink` FIFO message held behind an earlier one is
+    never released" (:1391), and "a FIFO `SQSSink` … an id callable" (:1502).
   - A *FIFO topics* paragraph follows *FIFO queues*: the `.fifo` ARN, the defaults, that a
     resend's copy is absorbed only within the topic's 5-minute interval and, under
     `FifoThroughputScope=MessageGroup`, only with the same group, and that a callable id is stable
@@ -606,11 +668,22 @@ These are the completion ritual's edits.
     - code that points a 1.x `SNSSink` at a `.fifo` ARN and relies on every publish failing;
     - code that matches the text of an `SNSSink` loss line, which can now be the held or the
       id-callable line.
-  - Every sentence saying that no constructor signature changed is rewritten.
+  - The three sites in `docs/release-notes/v1.2.1.md` that SPEC-100 makes false:
+    - :16-18, "Five sinks gain one keyword-only argument each … `SQSSink` and `SNSSink` take
+      `max_message_bytes`", is rewritten to say that `SNSSink` also takes the three FIFO
+      arguments;
+    - :987-989, "`SQSSink` and `SNSSink` each gain one keyword-only argument", is rewritten the
+      same way;
+    - the section *`SNSSink` cannot write an SNS FIFO topic* (:932-935), "… unchanged from 1.2.0",
+      is removed, since the *Added* entry replaces it.
 - **`docs/component-inventory.md`**: a row for `sinks/_fifo.py`, and the `SQSSink` and AWS-sinks
   rows name it.
 - **The docstrings** of `SNSSink`, its `__init__`, `_round`, `_send` and `_register_drops`, and of
-  `SQSSink`'s methods that now delegate, say what they share and with whom.
+  `SQSSink`'s methods that now delegate, say what they share and with whom. The
+  `GroupIdSource` and `DedupIdSource` docstrings, wrong today, are corrected where they move to
+  `_fifo.py`: `GroupIdSource`'s (`sqs.py:71`) calls a `str` "an event key to read", but a constant
+  is the group itself (:592-593), and `DedupIdSource`'s (:74) says `None` means "a minted UUID",
+  but it means the event's `log_id` (:619).
 
 #### Acceptance Criteria:
 
@@ -620,15 +693,21 @@ These are the completion ritual's edits.
       an SQS or SNS FIFO batch.
 - [ ] §12 strikes *`SNSSink` cannot write an SNS FIFO topic*, dated and naming SPEC-100, and its
       closure carries FR-003's finding with case F's numbers.
-- [ ] The new decision file exists with fence and entry and a dated History. The four refined
+- [ ] The new decision file exists with fence and entry and a dated History. The five refined
       decisions carry dated History entries, the hold decision's "do NOT" names both FIFO sinks,
-      and the bad-argument decision's fence names the `fifo` refusal.
-- [ ] The README's `SNSSink` row and *FIFO topics* paragraph exist. No README sentence says a FIFO
-      group's order holds inside one call, that the de-duplication id is truncated, or that
-      `fifo=True` overrides a name without `.fifo`.
+      the bad-argument decision's fence names the `fifo` refusal, the type-door decision states no
+      count of doors in its fence or its body, and the idempotency decision no longer says
+      `SNSSink` cannot write a FIFO topic.
+- [ ] The README's `SNSSink` row and *FIFO topics* paragraph exist, and the row no longer says a
+      FIFO topic is not supported. No README sentence says a FIFO group's order holds inside one
+      call, that the de-duplication id is truncated, or that `fifo=True` overrides a name without
+      `.fifo`, and the three sentences at :949-950, :1391 and :1502 name both FIFO sinks.
 - [ ] The release notes carry the *Added* entry, the *Fixed* entry and the four compatibility
-      entries, the first naming each of `SQSSink`'s three refusals, and no sentence there says no
-      constructor signature changed.
+      entries, the first naming each of `SQSSink`'s three refusals. No sentence there says that
+      `SNSSink` gains only `max_message_bytes`, that `SQSSink` and `SNSSink` each gain one
+      argument, or that `SNSSink` cannot write a FIFO topic.
+- [ ] `_fifo.GroupIdSource`'s docstring says a `str` is the group itself, and
+      `_fifo.DedupIdSource`'s says `None` means the event's `log_id`.
 - [ ] This FR serves no invariant: it is the record of FR-001 to FR-006, and the promises it
       describes are theirs.
 
@@ -648,7 +727,7 @@ class Prepared(NamedTuple):           # was sqs._Prepared
     body: str
     group_id: str | None
     dedup_id: str | None
-    size: int                         # UTF-8 body + both ids on FIFO
+    size: int                         # the UTF-8 body and, on FIFO, both ids
 
 @dataclass(slots=True)
 class Entry:                          # was sqs._Entry; one per event occurrence per run
@@ -660,10 +739,15 @@ class Entry:                          # was sqs._Entry; one per event occurrence
     error: Exception | None = None
     landed: bool = False
 
-class Plan(NamedTuple):
-    prepared: list[Prepared]
-    dropped: dict[int, str]
-    refused: Exception | None
+class Plan(NamedTuple):               # was sqs._Plan (sqs.py:103-120)
+    chunks: list[list[Prepared]]      # each valid for one request, built with chunk_items
+    dropped: dict[int, str]           # position -> "oversize" | "id failure" | "unencodable"
+    refused: Exception | None         # the first id exception, when every event's raised
+    limit: int                        # the run's limit; the oversize lines name it (SPEC-096)
+
+# sqs.py keeps _Prepared, _Plan, _Entry, _bounded, _hold and _block bound to these objects.
+# The per-run cache lives in run_context().notes(<the sink>) under "prepared", "prepared_round"
+# and "limit", as SQSSink._chunks keeps it today (sqs.py:710-716).
 
 # src/log_foundry/sinks/sns.py
 class SNSSink:
@@ -685,7 +769,12 @@ def dedup_id(source: DedupIdSource, event: dict[str, object]) -> str: ...   # di
 def prepare(body: str | None, event: dict[str, object], *, fifo: bool,
             group: GroupIdSource, dedup: DedupIdSource, limit: int) -> Entry: ...
 def plan_round(owner: object, batch: list[dict[str, object]], bodies: dict[int, str],
-               prepare_one: Callable[[dict[str, object], str | None], Entry]) -> Plan: ...
+               prepare_one: Callable[[dict[str, object], str | None, int], Entry],
+               *, max_count: int, limit: int) -> Plan: ...
+    # prepare_one gets the event, its body or None, and the run's limit, as
+    # SQSSink._prepare(event, body, *, limit) does today (sqs.py:757); limit is the per-run
+    # value the caller read once into notes["limit"] (max_message_bytes, else MAX_BYTES, at
+    # most 1 MiB), and it bounds each entry's cost, each chunk's summed cost and Plan.limit.
 def hold(chunk: list[Prepared], blocked: set[str], sends: list[int], limit: int) -> list[bool]: ...
 def block(sent: list[Prepared], fates: list[Outcome], sends: list[int],
           blocked: set[str], limit: int) -> None: ...
@@ -749,10 +838,17 @@ tests/
 
 **The prototype.** `docs/audits/2026-11-14-probes/sinks/spec100_prototype.patch` applies with
 `patch -p1` to `git archive 03dbf502 src tests docs/audits/2026-11-14-probes`. It covers FR-001's
-constructor and `judge` on both sinks, FR-002's shared module and costing, FR-003's digest and FR-004's hold. It leaves out
-the build's tests and rosters, SPEC-096's `max_message_bytes` (not on `03dbf502`, so it costs
-against `MAX_BYTES`), and SPEC-093's and SPEC-095's counters. Measured on macOS with Python 3.13.1;
-the moto probes used boto3 1.44.4 and moto 5.2.5 in a scratch environment.
+constructor and `judge` on both sinks, FR-002's shared module and costing, FR-003's digest and
+FR-004's hold. It leaves out the build's tests and rosters and SPEC-093's and SPEC-095's
+counters, and it predates SPEC-096's `max_message_bytes` and the `limit` field of `_Plan`: its
+`Plan` carries `prepared` rather than `chunks` and `limit`, its `prepare_one` takes no limit, and
+it costs `SNSSink`'s entries against `self.MAX_BYTES` in place of a two-argument
+`self._bodies(pairs, context.drops(self))`. None of that matches the current tree, where
+`SNSSink._bodies(encoded, pending, limit)` takes three arguments and is handed
+`context.drops(self)` and the run's limit (`sns.py:332`, :392), and `_Plan` carries `chunks` and
+`limit`. The build ports the patch onto that code, as the Data Model and the Interface Contract
+state it. Measured on macOS with Python 3.13.1; the moto probes used boto3 1.44.4 and moto 5.2.5
+in a scratch environment.
 
 - **The suite on the prototype.** `ruff check`, `mypy --strict` over `src/log_foundry/sinks/` and
   `docstring-lint.py` are clean. The suite, run over a whole-tree export of `2db83022`, whose `src`
@@ -928,3 +1024,20 @@ SPEC-095's *Evidence* quotes the same `PublishBatchRequestEntry` sentences, read
     call refused at the base keeps its exact error and the type-door roster gains one door rather
     than two.
   - **No `log_foundry_idempotent`**, by SPEC-095's own conditions (FR-007).
+- **Re-verified against `5d0e7f68` at the build's start, 2026-11-24.** That `main` carries
+  SPEC-093 to SPEC-096, and every `file:line` now cites it. The corrections bring the spec's
+  claims to the code, and none widens its scope:
+  - FR-002 said SQS's FIFO types resolve on `sqs` only under `TYPE_CHECKING`. All six are runtime
+    names and a test imports `sqs._Plan`, so `sqs.py` keeps each old name bound to the shared
+    object, and the cache keeps its `"prepared"` key and owner for the per-round mutant test.
+  - The Data Model's `Plan` is today's `_Plan`, with `chunks` and SPEC-096's `limit`, and
+    `plan_round` and its `prepare_one` take the run's limit.
+  - FR-001 states each sink's refusal order at the base, with `judge` after all of it, adds the
+    `max_message_bytes` example and keeps the blank group's text as the base's.
+  - FR-006 names each corpus literal that moves, including the two counts of `clean` rows, and
+    where `SNSSink`'s id arguments go in `NEUTRAL`.
+  - FR-007 replaces a release-notes bullet that targeted no sentence with the three sites the spec
+    makes false, and adds the type-door decision's count, the idempotency decision's line 15,
+    three SQS-only README sentences and the two alias docstrings.
+  - FR-001 moves the typed consumer's standard-URL id call to a `.fifo` URL, and *Evidence* says
+    what the prototype predates.
