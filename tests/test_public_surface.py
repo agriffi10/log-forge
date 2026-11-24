@@ -1555,9 +1555,10 @@ def test_the_aliases_a_public_signature_names_are_exported() -> None:
     Keying on the annotation text rather than on a written list means renaming the alias
     without moving the export fails here, which is the drift this criterion exists for.
     """
-    from log_foundry.sinks import sentry, sqs
+    from log_foundry.sinks import sentry, sns, sqs
     for module, sink, aliases in (
         (sqs, sqs.SQSSink, ("GroupIdSource", "DedupIdSource")),
+        (sns, sns.SNSSink, ("GroupIdSource", "DedupIdSource")),
         (sentry, sentry.SentrySink, ("Backend",)),
     ):
         annotations = " ".join(
@@ -1640,11 +1641,13 @@ def test_the_typed_consumer_probe_covers_every_exported_name() -> None:
 
     from log_foundry.sinks import http as http_sink
     from log_foundry.sinks import sentry as sentry_sink
+    from log_foundry.sinks import sns as sns_sink
     from log_foundry.sinks import sqs as sqs_sink
 
     for module_name, exported in (
         ("log_foundry", log_foundry.__all__),
         ("log_foundry.sinks.sqs", sqs_sink.__all__),
+        ("log_foundry.sinks.sns", sns_sink.__all__),
         ("log_foundry.sinks.sentry", sentry_sink.__all__),
         ("log_foundry.sinks.http", http_sink.__all__),
     ):

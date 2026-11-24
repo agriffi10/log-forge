@@ -78,6 +78,7 @@ TREES: dict[str, dict[str, tuple[str, ...]]] = {
         "ConnectionError": ("BotoCoreError",),
         "EndpointConnectionError": ("ConnectionError",),
         "HTTPClientError": ("BotoCoreError",),
+        "ReadTimeoutError": ("HTTPClientError",),
         "ParamValidationError": ("BotoCoreError",),
         "NoCredentialsError": ("BotoCoreError",),
         "ClientError": (),

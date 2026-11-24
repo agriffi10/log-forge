@@ -854,6 +854,10 @@ ACK_GAINED: dict[str, frozenset[str]] = {
 }
 """SPEC-093 FR-003's sub-count of ``failed`` an unread or unnaming reply moves, and the names
 SPEC-094's engine adds to ``KafkaSink`` and ``GooglePubSubSink``."""
+FIFO_GAINED: dict[str, frozenset[str]] = {
+    "SNSSink": frozenset({"fifo", "message_group_id", "message_deduplication_id"}),
+}
+"""SPEC-100 FR-001: ``SNSSink`` stores the three FIFO arguments ``SQSSink`` has had since 1.x."""
 
 
 def _public(obj: object) -> set[str]:
@@ -883,6 +887,7 @@ def test_the_public_surface_grows_only_by_five_losses(
             | ENGINE_GAINED.get(name, frozenset())
             | LIMIT_GAINED.get(name, frozenset())
             | ACK_GAINED.get(name, frozenset())
+            | FIFO_GAINED.get(name, frozenset())
         ) - ENGINE_LOST.get(name, frozenset())
         assert names == expected, (name, sorted(names ^ expected))
 

@@ -35,7 +35,7 @@ _LISTED = [
     ("http.py", "HTTPSink._drop_refused"),
     ("kinesis.py", "KinesisSink._records"),
     ("firehose.py", "FirehoseSink._records"),
-    ("sns.py", "SNSSink._bodies"),
+    ("sns.py", "SNSSink._register_drops"),
     ("mongodb.py", "MongoDBSink._documents"),
     ("mongodb.py", "MongoDBSink.emit"),
     ("eventhubs.py", "AzureEventHubsSink._send_batch"),

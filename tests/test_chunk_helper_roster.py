@@ -4,7 +4,8 @@ Derived from the AST of `src/log_foundry/sinks/*.py`: a module is in the set whe
 `chunk_items` or `chunk_list`, bare or as an attribute. Text would not do: `http.py`'s docstrings
 name `chunk_items` twice, and a `grep` puts it in a set it has no place in.
 
-The set is compared exactly with the six on SPEC-071's head. A sink that inlines its chunker back
+The set is compared exactly with five: the six on SPEC-071's head, less `sns` and `sqs`, whose calls
+SPEC-100 moved into `_fifo.plan_round`, plus `_fifo`. A sink that inlines its chunker back
 leaves the set and is named; converting `HTTPSink._take` or `AzureEventHubsSink`'s
 `create_batch` loop, whose limits do not fit a fixed count and byte bound, joins it and is named.
 
@@ -21,10 +22,11 @@ _SINKS = Path(__file__).resolve().parents[1] / "src" / "log_foundry" / "sinks"
 
 _HELPERS = frozenset({"chunk_items", "chunk_list"})
 
-EXPECTED = frozenset({"_fifo", "clickhouse", "firehose", "kinesis", "postgres", "sns"})
+EXPECTED = frozenset({"_fifo", "clickhouse", "firehose", "kinesis", "postgres"})
 """The modules calling a shared chunk helper; ``http`` and ``eventhubs`` keep their own batching.
 
-SPEC-100 moved ``SQSSink``'s call into ``_fifo.plan_round``, which draws the FIFO sinks' chunks.
+SPEC-100 moved ``SQSSink``'s and ``SNSSink``'s calls into ``_fifo.plan_round``, which draws both
+sinks' chunks.
 """
 
 
@@ -64,7 +66,7 @@ def _tree() -> dict[str, str]:
     return {p.stem: p.read_text(encoding="utf-8") for p in sorted(_SINKS.glob("*.py"))}
 
 
-def test_the_chunking_modules_are_the_six() -> None:
+def test_the_chunking_modules_are_the_five() -> None:
     assert chunking_modules(_tree()) == EXPECTED
 
 

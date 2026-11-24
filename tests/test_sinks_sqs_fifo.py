@@ -6,6 +6,7 @@ test there runs on a standard queue and must keep passing byte-for-byte.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import types
@@ -228,10 +229,13 @@ def test_missing_log_id_mints_a_fresh_unshared_dedup_id() -> None:
     assert len(set(ids)) == 2, "never a value shared with another entry"
 
 
-def test_over_long_dedup_id_is_truncated() -> None:
+def test_over_long_dedup_id_is_sent_as_its_digest() -> None:
+    """SPEC-100 FR-003: a prefix let two events share one id, so the queue kept one of them."""
     client = RecordingClient()
     SQSSink(FIFO_URL, client=client).emit([_event(log_id="d" * 200)])
-    assert client.entries[0]["MessageDeduplicationId"] == "d" * MAX_ID_LEN
+    sent = client.entries[0]["MessageDeduplicationId"]
+    assert sent == hashlib.sha256(("d" * 200).encode("utf-8")).hexdigest()
+    assert len(sent) == 64 < MAX_ID_LEN
 
 
 # -- FR-004: standard queues are unaffected ---------------------------------------------

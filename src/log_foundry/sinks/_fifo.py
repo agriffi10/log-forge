@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol, cast
@@ -250,20 +251,35 @@ def dedup_id(source: DedupIdSource, event: dict[str, object]) -> str:
     fallback mints a fresh id for the same reason: a shared constant would make unrelated events
     deduplicate each other.
 
+    **An answer too long to send goes out as its digest, never as a prefix** (SPEC-100 FR-003).
+    Cutting it to its first :data:`MAX_ID_LEN` characters made two events whose answers shared
+    that prefix share one id, and the queue or topic then accepted the second and did not deliver
+    it, a silent loss. So a stripped answer longer than :data:`MAX_ID_LEN` is sent as the SHA-256
+    hex digest of its UTF-8 bytes (``surrogatepass``, so a lone surrogate digests rather than
+    raising): 64 characters AWS accepts, the same for the same stripped answer and different for
+    different ones. Two answers differing only in surrounding whitespace share a digest, as they
+    share an id when short. The group id keeps :func:`bounded`'s truncation, which merges two
+    groups and so costs ordering, never delivery.
+
     Args:
       source: The sink's ``message_deduplication_id``.
       event: The event being sent.
 
     Returns:
-      The deduplication id.
+      The deduplication id: the stripped answer when it is 1 to :data:`MAX_ID_LEN` characters,
+      its SHA-256 hex digest when it is longer, and a freshly minted id when it is blank.
 
     Raises:
-      Exception: A caller-supplied callable's own exception, which :func:`prepare` turns into a
-        drop of this one event (SPEC-058 FR-004).
+      Exception: A caller-supplied callable's own exception, or the ``AttributeError`` of an
+        answer with no ``strip``, which :func:`prepare` turns into a drop of this one event
+        (SPEC-058 FR-004).
     """
     raw = source(event) if source is not None else str(event.get("log_id", ""))
-    if raw.strip():
-        return bounded(raw, "")
+    stripped = raw.strip()
+    if len(stripped) > MAX_ID_LEN:
+        return hashlib.sha256(stripped.encode("utf-8", "surrogatepass")).hexdigest()
+    if stripped:
+        return stripped
     from log_foundry.ids import new_log_id
 
     return new_log_id()
@@ -283,6 +299,12 @@ def prepare(
     An entry is costed as its body's UTF-8 length plus, on a FIFO destination, both ids' UTF-8
     lengths (SPEC-016 FR-005), and dropped as oversize when that cost exceeds ``limit``, the
     run's effective message limit (SPEC-096 FR-002).
+
+    **The ids are costed inside the ``try`` that resolves them** (SPEC-100 FR-002). An answer
+    that resolves but cannot be costed — a ``bytes`` answer, whose ``strip`` works, or a ``str``
+    holding a lone surrogate, which UTF-8 cannot encode — is then an id failure of its own event,
+    dropped with the id-failure line, where costing it outside the ``try`` raised out of the round
+    and lost every event of it.
 
     Args:
       body: The encoded body, or ``None`` when the encode step could not encode it.
@@ -307,9 +329,9 @@ def prepare(
         try:
             gid = group_id(group, event)
             did = dedup_id(dedup, event)
+            size += len(gid.encode("utf-8")) + len(did.encode("utf-8"))
         except Exception as err:
             return Entry(drop="id failure", error=err)
-        size += len(gid.encode("utf-8")) + len(did.encode("utf-8"))
     if size > limit:
         return Entry(size=size, drop="oversize")
     return Entry(body=body, group_id=gid, dedup_id=did, size=size)

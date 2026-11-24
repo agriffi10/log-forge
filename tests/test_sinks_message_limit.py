@@ -149,15 +149,31 @@ _ONE_X = {
 }
 """Each constructor's parameters in 1.2.0, written out: name, kind and default."""
 
+_AFTER_LIMIT = {
+    SQSSink: [],
+    SNSSink: [
+        ("fifo", _KW, None),
+        ("message_group_id", _KW, None),
+        ("message_deduplication_id", _KW, None),
+    ],
+}
+"""What a later spec appended after ``max_message_bytes``: SPEC-100 FR-001's three on ``SNSSink``."""
+
 
 @pytest.mark.parametrize("cls", _CLASSES, ids=_IDS)
 def test_each_signature_ends_with_max_message_bytes_and_keeps_the_1x_parameters(cls: type) -> None:
-    """FR-001 AC1 / invariant 10: appended last, keyword-only, default None; 1.x unchanged."""
+    """FR-001 AC1 / invariant 10: appended after 1.x, keyword-only, default None; 1.x unchanged.
+
+    SPEC-100 FR-001 appended ``SNSSink``'s three FIFO arguments after it, in that order, so the
+    signature now ends with ``max_message_bytes`` only on ``SQSSink``.
+    """
     params = [
         (p.name, p.kind, p.default) for p in inspect.signature(cls.__init__).parameters.values()
     ]
-    assert params[:-1] == _ONE_X[cls]
-    assert params[-1] == ("max_message_bytes", _KW, None)
+    one_x = len(_ONE_X[cls])
+    assert params[:one_x] == _ONE_X[cls]
+    assert params[one_x] == ("max_message_bytes", _KW, None)
+    assert params[one_x + 1 :] == _AFTER_LIMIT[cls]
 
 
 @pytest.mark.parametrize("value", [1024, 1048576, 262144, None])

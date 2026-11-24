@@ -67,6 +67,8 @@ from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.otlp import OTLPSink
 from log_foundry.sinks.rabbitmq import RabbitMQSink
 from log_foundry.sinks.sentry import Backend, SentrySink
+from log_foundry.sinks.sns import DedupIdSource as SNSDedupIdSource
+from log_foundry.sinks.sns import GroupIdSource as SNSGroupIdSource
 from log_foundry.sinks.sns import SNSSink
 from log_foundry.sinks.splunk import SplunkHECSink
 from log_foundry.sinks.sqs import DedupIdSource, GroupIdSource, SQSSink
@@ -327,6 +329,13 @@ def _sinks() -> list[object]:
         SQSSink("https://sqs.invalid/q", max_message_bytes=None),
         SNSSink("arn:aws:sns:us-east-1:0:t", max_message_bytes=262144),
         SNSSink("arn:aws:sns:us-east-1:0:t", max_message_bytes=None),
+        # SPEC-100 FR-001: a FIFO topic takes the three FIFO arguments, with SNS's own aliases.
+        SNSSink(
+            "arn:aws:sns:us-east-1:0:t.fifo",
+            fifo=True,
+            message_group_id=_SNS_GROUP,
+            message_deduplication_id=_SNS_DEDUP,
+        ),
         # SPEC-093 FR-001: the TCP acknowledgement wait, a bool or None, on both socket sinks.
         SyslogSink("syslog.invalid", transport="tcp", ack_wait=False),
         SyslogSink("syslog.invalid", transport="tcp", ack_wait=None),
@@ -340,6 +349,18 @@ _BACKEND: Backend = "auto"
 _GROUP: GroupIdSource = "trace_id"
 _DEDUP: DedupIdSource = None
 
+
+def _sns_group(event: dict[str, object]) -> str:
+    return str(event["trace_id"])
+
+
+def _sns_dedup(event: dict[str, object]) -> str:
+    return str(event["log_id"])
+
+
+_SNS_GROUP: SNSGroupIdSource = _sns_group
+_SNS_DEDUP: SNSDedupIdSource = _sns_dedup
+
 # Every remaining exported name, referenced so nothing is imported and unused. `__all__` is the
 # claim; touching each name here is what makes the claim checkable.
 _NAMES: tuple[object, ...] = (
@@ -348,6 +369,7 @@ _NAMES: tuple[object, ...] = (
     _FACTORY_CONFIG, _FACTORY, _configure_a_factory,
     __version__, health, get_config, get_baggage, current_baggage_header, current_trace_context,
     read_losses, flush_sink, SinkDeliveryError, merge_headers, _BACKEND, _GROUP, _DEDUP,
+    _SNS_GROUP, _SNS_DEDUP,
     _MyEngineSink, read_deliver, Outcome, Verdict, SinkCounters, _LEDGER, _LOST,
 )
 _READERS: tuple[Callable[..., Any], ...] = (read_losses, flush_sink)
