@@ -319,7 +319,8 @@ These are the completion ritual's edits.
     also owes it, two closes overlapping".
   - **Exceptions added.** Three replace them:
     - a caller's wrapper that closes its member closes it once itself, and the library closes it
-      again after, in sequence and never overlapping;
+      again after, in sequence and never overlapping, save for the swap's unlocked graph-read
+      window §12 holds open;
     - a member ordered behind a caller's wrapper is closed only when that wrapper's `close()`
       returns, so a slow close delays the member and one that never returns leaves it unclosed;
     - a sink the library first writes through a caller's wrapper is that wrapper's to close.
