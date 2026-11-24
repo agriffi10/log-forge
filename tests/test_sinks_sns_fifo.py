@@ -723,7 +723,12 @@ def test_a_repeated_events_id_failure_is_never_handed_to_its_retried_twin(
         message_deduplication_id=_first_answer(RuntimeError("flaky"), lambda n: f"d{n}"),
         max_retries=3,
     )
-    sink.emit([event, event])
+    raised: Exception | None = None
+    try:
+        sink.emit([event, event])
+    except RuntimeError as err:
+        raised = err
+    assert raised is None, "round 2 was refused with occurrence 1's id failure"
     assert [[e["MessageDeduplicationId"] for e in call] for call in client.entries] == [
         ["d2"],
         ["d2"],
