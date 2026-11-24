@@ -2004,6 +2004,33 @@ an item leaves this list when a spec closes it, not because the arc names it.
   then `shutdown()`, print `after=200 written=201 A.closes=1`, each round's displaced `W` held
   strongly by both records. No event is lost and A is closed once; the cost is memory. **Closed
   by** no spec yet.
+- **A `KeyboardInterrupt` in `release()`'s preamble leaves a taken entry in flight for good**
+  (found by SPEC-101's last diff review; invariant 5; measured at `03a6e6b5` and at `8b509f97`,
+  identically, so not introduced by SPEC-101; unfixed under the audit scope freeze). A caller that
+  hands `release()` an entry it took has given up its own put-back before `release()` opens the
+  `try` that discharges that entry: `_close_owed` drops the sink from `undischarged` and then
+  calls `_close_taken`, or `release(..., detached=True)` for a `GRACED` entry, and
+  `_release_ordered` pops the member off its list. Between the hand-off and that `try`,
+  `release()` runs calls and a contended lock: `releasable()`, `_close_clock()` (which takes
+  `_state._owned_lock`), `_release_depth()` and `_active_keep()`. Measured with a real SIGINT: a
+  caller's wrapper whose `close()` has a helper thread hold `_owned_lock` for 1 s, and a timer
+  that sends SIGINT. In 3 of 3 runs the interrupt landed in `releasable()` under an ordered
+  member's `release()`, and the member ended neither owed nor closed, its entry in flight, so the
+  next `shutdown(timeout=1.0)` took 1.01 s. The holder's own release from `_close_owed` has the
+  same shape, so `_close_owed`'s docstring, which says its residual window "contains no call", is
+  wrong; it is left as is under the freeze. Two narrower windows are of the same class. On the
+  inline path with no taken entry, `release()` registers the `INLINE` entry before
+  `prior = _active_keep()`, a call, so an interrupt there leaves that entry in flight. And on the
+  refused and no-thread branches, from `release()`'s `finish` of the holder's entry through
+  `_release_ordered_alone`'s `take_ordered` to `_release_ordered`'s `try`, an interrupt leaves an
+  ordered member attached behind a holder that is neither owed nor in flight; that is reachable
+  only when a closer thread will not start or a forked child refuses the release. No event is
+  lost; the cost is a close never performed and a later exit that waits out its grace. **Closed
+  by** no spec yet: the structural closure makes the hand-off the first statement inside the
+  `try` that owns the discharge, with `release()` taking its pair off the caller's list once its
+  preamble is done and its `try` is open, for `_close_owed`'s `undischarged` too; the inline
+  path swaps the `register` and `_active_keep()` lines; and both refused and no-thread branches
+  put back `take_ordered(sink)` in an `except BaseException`.
 
 - **`SQSSink`'s class docstring lists none of its three FIFO attributes** (found by SPEC-100's
   completion ritual, 2026-11-24; present on `5d0e7f68`, before SPEC-100; unfixed under the audit

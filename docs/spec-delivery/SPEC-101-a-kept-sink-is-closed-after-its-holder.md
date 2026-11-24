@@ -39,6 +39,9 @@
   sink armed in the swap's unlocked graph-read window (measured), and `_written` and `_after`
   hold a sink whose type refuses a weak reference strongly until a fork, so both grow under
   repeated configures of such a wrapper (measured).
+- **A third §12 residual, found by the last diff review and present before SPEC-101:** a
+  `KeyboardInterrupt` in `release()`'s preamble, after a caller has handed it a taken entry,
+  leaves that entry in flight for good (measured with a real SIGINT).
 
 ## Verification
 
