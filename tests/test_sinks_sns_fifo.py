@@ -47,7 +47,7 @@ def _no_wait(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def boto3(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """A ``boto3`` stand-in that records every client built, so a refusal can prove it built none."""
+    """A ``boto3`` stand-in recording every client built, so a refusal can prove it built none."""
     built: list[str] = []
     monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=built.append))
     return built
@@ -74,7 +74,7 @@ def std_sink(kind: str, reply: Reply = accept, **kwargs: Any) -> tuple[Any, Clie
 
 
 def _ids_of(client: Client, kind: str, i: int) -> list[tuple[str | None, str | None]]:
-    """Every ``(MessageGroupId, MessageDeduplicationId)`` that carried event ``i``, in send order."""
+    """Every ``(MessageGroupId, MessageDeduplicationId)`` that carried event ``i``, in order."""
     key = _body_key(kind)
     return [
         (entry.get("MessageGroupId"), entry.get("MessageDeduplicationId"))
@@ -127,7 +127,7 @@ def test_a_fifo_arn_selects_fifo_and_a_standard_arn_does_not() -> None:
 
 @pytest.mark.parametrize("kind", SINKS)
 def test_fifo_true_and_false_on_a_fifo_name_construct(kind: str) -> None:
-    """FR-001 AC2 / invariant 13: ``fifo=False`` overrides a ``.fifo`` name, the recorded exception."""
+    """FR-001 AC2 / invariant 13: ``fifo=False`` overrides a ``.fifo`` name, the recorded one."""
     assert fifo_sink(kind, fifo=True)[0].fifo is True
     assert fifo_sink(kind, fifo=False)[0].fifo is False
 
@@ -179,7 +179,8 @@ def test_an_id_argument_on_a_standard_destination_is_refused_naming_it(
         cls(destination, **kwargs)
     noun, word = ("queue_url", "queue") if kind == "SQSSink" else ("topic_arn", "topic")
     assert str(info.value) == (
-        f"{kind} cannot apply {names} to a standard {word}; drop it, or use a {noun} ending in .fifo"
+        f"{kind} cannot apply {names} to a standard {word}; drop it, or use a {noun} "
+        "ending in .fifo"
     )
     assert boto3 == []
 
@@ -218,18 +219,80 @@ _BASE_REFUSALS: list[tuple[str, Callable[[], object], type[Exception], str]] = [
 ]
 
 
+_BASE_REFUSALS += [
+    (
+        "sqs-max_retries-before-destination",
+        lambda: SQSSink(None, max_retries=2.5),  # type: ignore[arg-type]
+        TypeError,
+        "SQSSink max_retries must be an integer, not float",
+    ),
+    (
+        "sns-max_message_bytes-before-destination",
+        lambda: SNSSink(None, max_message_bytes=5),  # type: ignore[arg-type]
+        ValueError,
+        "SNSSink max_message_bytes must be from 1024 to 1048576 bytes, got 5",
+    ),
+    (
+        "sqs-group-before-destination",
+        lambda: SQSSink(None, message_group_id=5),  # type: ignore[arg-type]
+        TypeError,
+        "SQSSink message_group_id must be a str, a callable or None, not int",
+    ),
+]
+
+
 @pytest.mark.parametrize(
     ("case", "build", "kind", "text"), _BASE_REFUSALS, ids=[c[0] for c in _BASE_REFUSALS]
 )
 def test_a_call_refused_at_the_base_keeps_its_exact_error(
     boto3: list[str], case: str, build: Callable[[], object], kind: type[Exception], text: str
 ) -> None:
-    """FR-001 AC7: ``judge`` runs after every earlier refusal, so a two-fault call reads as before."""
+    """FR-001 AC7: ``judge`` runs after every earlier refusal; a two-fault call reads as before."""
     with pytest.raises(kind) as info:
         build()
     assert type(info.value) is kind
     assert str(info.value) == text
     assert boto3 == []
+
+
+_DESTINATIONS: list[tuple[str, object, str]] = [
+    ("none", None, "NoneType"),
+    ("bytes", b"arn:aws:sns:r:1:t.fifo", "bytes"),
+    ("int", 5, "int"),
+]
+
+
+@pytest.mark.parametrize("injected", [True, False], ids=["client", "no-client"])
+@pytest.mark.parametrize(
+    ("case", "destination", "stored"), _DESTINATIONS, ids=[c[0] for c in _DESTINATIONS]
+)
+@pytest.mark.parametrize("kind", SINKS)
+def test_a_destination_that_is_not_a_str_is_refused_naming_it(
+    boto3: list[str], kind: str, case: str, destination: object, stored: str, injected: bool
+) -> None:
+    """FR-001 / invariant 13: ``SNSSink(None, client=c)`` raised an unnamed ``AttributeError``."""
+    cls: Any = SQSSink if kind == "SQSSink" else SNSSink
+    noun = "queue_url" if kind == "SQSSink" else "topic_arn"
+    with pytest.raises(TypeError) as info:
+        if injected:
+            cls(destination, client=Client())
+        else:
+            cls(destination)
+    assert str(info.value) == f"{kind} {noun} must be a str, not {stored}"
+    assert boto3 == []
+
+
+@pytest.mark.parametrize("kind", SINKS)
+def test_a_str_subclass_destination_is_read_without_its_own_endswith(kind: str) -> None:
+    """FR-001: the suffix is read through ``str.endswith``, so a subclass's own never runs."""
+
+    class Name(str):
+        def endswith(self, *args: Any) -> bool:
+            raise AssertionError("the destination's own endswith ran")
+
+    destination = Name(FIFO_URL if kind == "SQSSink" else FIFO_ARN)
+    cls: Any = SQSSink if kind == "SQSSink" else SNSSink
+    assert cls(destination, client=Client()).fifo is True
 
 
 def test_a_str_subclass_group_is_sent_as_its_str_without_its_own_strip() -> None:
@@ -363,8 +426,16 @@ def test_an_id_failure_and_an_oversized_event_settle_with_no_call(
     ), lines
 
 
+class _Strips:
+    """An answer that is not a ``str`` but whose ``strip`` returns one, as a ``str`` would."""
+
+    def strip(self) -> str:
+        return "ok"
+
+
 _UNCOSTABLE = [
-    ("bytes", b"abc", "AttributeError"),
+    ("bytes", b"abc", "TypeError"),
+    ("object-with-strip", _Strips(), "TypeError"),
     ("lone-surrogate", "ok\ud800", "UnicodeEncodeError"),
 ]
 
@@ -380,7 +451,12 @@ def test_an_id_answer_that_cannot_be_costed_drops_only_its_event(
     which: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """FR-002 AC5 / invariant 2: it raised at the costing, outside the ``try``, and lost the round."""
+    """FR-002 AC5 / invariant 2: an answer not a ``str``, or that cannot be costed, costs its event.
+
+    A ``bytes`` answer raised at the costing, outside the ``try``, and lost the round; an object
+    whose ``strip`` returned a ``str`` was sent as that ``str`` (SPEC-100's diff review). Each is
+    now asked its type, and a lone surrogate fails its costing inside the ``try``.
+    """
 
     def source(event: dict[str, object]) -> Any:
         return answer if event["i"] == 0 else f"ok{event['i']}"
@@ -396,6 +472,28 @@ def test_an_id_answer_that_cannot_be_costed_drops_only_its_event(
     assert lost(capsys.readouterr().err) == [
         f"log-foundry: lost 1 event(s); {kind}, a FIFO id callable raised {error}"
     ]
+
+
+class _LoudStr(str):
+    """A ``str`` subclass whose own ``strip`` raises, so a call of it is visible."""
+
+    def strip(self, chars: str | None = None) -> str:
+        raise AssertionError("the answer's own strip ran")
+
+
+@pytest.mark.parametrize("kind", SINKS)
+def test_a_str_subclass_answer_is_sent_as_its_str_without_its_own_strip(kind: str) -> None:
+    """FR-002: a ``str`` subclass is an id, stripped through ``str.strip`` and sent plain."""
+    sink, client = fifo_sink(
+        kind,
+        message_group_id=lambda e: _LoudStr(" g "),
+        message_deduplication_id=lambda e: _LoudStr(" d "),
+    )
+    sink.emit(events(1))
+    [entry] = client.entries[0]
+    assert (entry["MessageGroupId"], entry["MessageDeduplicationId"]) == ("g", "d")
+    assert type(entry["MessageGroupId"]) is str and type(entry["MessageDeduplicationId"]) is str
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
 @pytest.mark.parametrize("kind", SINKS)
@@ -705,7 +803,7 @@ def test_a_call_missing_its_group_is_rejected_at_the_first_attempt(
 def test_a_dedup_id_refused_as_a_sender_fault_is_counted_once_and_returns(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """FR-005 AC2: a ``.fifo``-named standard topic refuses each entry's ids as the caller's fault."""
+    """FR-005 AC2: a ``.fifo``-named standard topic refuses each entry's ids as a sender fault."""
 
     def standard(entries: list[dict[str, Any]], call: int) -> Any:
         return {

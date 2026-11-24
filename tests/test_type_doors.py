@@ -476,7 +476,7 @@ def test_a_subclass_of_sns_is_named_in_its_fifo_refusals(boto3: list[str]) -> No
 def test_a_fifo_claiming_bool_is_refused_without_running_its_getter(
     boto3: list[str], cls: type
 ) -> None:
-    """SPEC-100 FR-001: ``fifo`` is asked its type, so a ``__class__`` claiming ``bool`` never runs."""
+    """SPEC-100 FR-001: ``fifo`` is asked its type; a ``__class__`` claiming ``bool`` never runs."""
     destination = "https://q.fifo" if cls is SQSSink else "arn:aws:sns:r:1:t.fifo"
     for make, stored in ((lambda: _claims(bool), "Claims"), (_raises, "Raises")):
         _Counted.calls = 0

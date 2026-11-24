@@ -27,12 +27,7 @@ from log_foundry.sinks._retry import exact_int, floor_count
 from log_foundry.sinks._rounds import (
     Called,
     KeyedReply,
-    Lost,
-    entry_ids,
-    mark_sent,
     read_keyed,
-    sends_of,
-    settle_keyed,
 )
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
@@ -168,7 +163,8 @@ class SQSSink:
             messages may cost together, or ``None`` for :attr:`MAX_BYTES` (SPEC-096 FR-001). Pass
             the queue's ``MaximumMessageSize``, in bytes: ``1048576`` for a queue created at the
             service default. It is judged after every argument a 1.x call could pass, before the
-            FIFO arguments' :func:`~log_foundry.sinks._fifo.judge` and any client is built, read through ``exact_int``, so a ``bool`` or ``int`` subclass is judged and
+            FIFO arguments' :func:`~log_foundry.sinks._fifo.judge` and any client is built, read
+            through ``exact_int``, so a ``bool`` or ``int`` subclass is judged and
             stored as the exact ``int`` it holds, and refused outside 1,024 to 1,048,576, the
             range a queue's own limit takes, rather than floored, since a new argument has no
             working configuration to keep.
@@ -349,17 +345,17 @@ class SQSSink:
         The drops :meth:`_chunks` decides are ``DROPPED`` and their lines registered ``SETTLED``,
         so they are counted and announced only when ``emit`` returns — on the engine, only when
         the run settles. When every event's id callable raised, the round is a refusal carrying
-        the first exception. Otherwise each chunk is sent once through :meth:`_send`, its FIFO
-        holds decided at send time by :func:`~log_foundry.sinks._fifo.hold` and
-        :func:`~log_foundry.sinks._fifo.block`, which ``SNSSink`` shares and both call through the
-        module (SPEC-100 FR-004), in every round but the run's last
+        the first exception. Otherwise :func:`~log_foundry.sinks._fifo.send_round`, the one
+        round loop ``SNSSink`` runs too (SPEC-100 FR-004), sends each chunk once through
+        :meth:`_send`, its FIFO holds decided at send time in every round but the run's last
         (:attr:`RunContext.last`), where every send is final and so nothing is held: a held
         message then follows its predecessor's final send in the same round, chunks going out in
         batch order, as 1.x sent it after giving up on that predecessor (SPEC-074 Q4). Each
         entry's outcome is set from the reply: a sender fault ``REJECTED`` and marked a final
         rejection with 1.x's line, any other failed entry ``RETRYABLE``, an unreadable reply
         ``UNKNOWN`` with one line, and a raise ``RETRYABLE`` or ``REJECTED`` as
-        ``_retryable_error`` answers.
+        ``_retryable_error`` answers. Each landed occurrence is marked in the run's cache, so a
+        later round never resends a landed occurrence's ids.
 
         Args:
           batch: The events this round is offered.
@@ -379,61 +375,17 @@ class SQSSink:
         self._register_drops(batch, plan)
         for position in plan.dropped:
             fates[position] = Outcome.DROPPED
-        entries = cast("list[_fifo.Entry | None]", context.notes(self)["prepared_round"])
-        lost = Lost(self)
-        final: list[int] = []
-        blocked: set[str] = set()
-        limit = self.max_retries + 1
-        name = "SQSSink"
-        holding = self.fifo and not context.last
-        for chunk in plan.chunks:
-            held = (
-                _fifo.hold(
-                    chunk, blocked, [sends_of(self, batch[item.position]) for item in chunk], limit
-                )
-                if holding
-                else [False] * len(chunk)
-            )
-            sending = [item for item, hold in zip(chunk, held, strict=True) if not hold]
-            waiting = [batch[item.position] for item, hold in zip(chunk, held, strict=True) if hold]
-            lost.add(
-                waiting,
-                when=When.LAST,
-                key="held",
-                line=lambda n, count: _diag.lost(
-                    "message",
-                    count,
-                    f"{name}, {n} attempt(s), held behind an earlier message of its FIFO group",
-                ),
-            )
-            if not sending:
-                continue
-            carried = [batch[item.position] for item in sending]
-            mark_sent(self, carried)
-            sent = self._send(sending, entry_ids(self, carried))
-            landed = settle_keyed(
-                self,
-                positions=[item.position for item in sending],
-                carried=carried,
-                error=sent.error,
-                retryable=sent.retryable,
-                reply=sent.result,
-                call="send_message_batch",
-                name="SQSSink",
-                fates=fates,
-                final=final,
-                lost=lost,
-            )
-            for position in landed:
-                cached = entries[position]
-                if cached is not None:
-                    cached.landed = True
-            if holding:
-                _fifo.block(
-                    sending, fates, [sends_of(self, event) for event in carried], blocked, limit
-                )
-        lost.register()
-        context.final_rejections(final)
+        _fifo.send_round(
+            self,
+            batch,
+            plan,
+            fates,
+            fifo=self.fifo,
+            max_retries=self.max_retries,
+            send=self._send,
+            call="send_message_batch",
+            name="SQSSink",
+        )
         return Verdict(outcomes=tuple(fates))
 
     def _register_drops(self, batch: list[dict[str, object]], plan: _fifo.Plan) -> None:
@@ -492,7 +444,7 @@ class SQSSink:
         """
 
     def _group_id(self, event: dict[str, object]) -> str:
-        """Resolves one event's ``MessageGroupId`` through :func:`~log_foundry.sinks._fifo.group_id`.
+        """Resolves one event's ``MessageGroupId`` through ``_fifo.group_id``.
 
         **Nothing in the sink calls this any more** (SPEC-100 FR-002): :meth:`_prepare` hands
         ``message_group_id`` itself to :func:`~log_foundry.sinks._fifo.prepare`, which resolves

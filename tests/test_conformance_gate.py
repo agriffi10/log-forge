@@ -1126,7 +1126,7 @@ def test_the_register_holds_the_totals_of_fr_004() -> None:
 
 
 def test_each_sns_fifo_row_reads_as_its_sqs_fifo_row() -> None:
-    """SPEC-100 FR-006: ``SNSSink[fifo]`` runs ``SQSSink[fifo]``'s faults and reads as it, row by row.
+    """SPEC-100 FR-006: ``SNSSink[fifo]`` runs ``SQSSink[fifo]``'s faults and reads as it.
 
     Derived from the two variants' fault lists rather than seven written verdicts, so a fault one
     variant gains, or a verdict one variant changes, reddens here; the pin and the departure each

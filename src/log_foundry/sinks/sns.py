@@ -17,12 +17,7 @@ from log_foundry.sinks._retry import exact_int, floor_count
 from log_foundry.sinks._rounds import (
     Called,
     KeyedReply,
-    Lost,
-    entry_ids,
-    mark_sent,
     read_keyed,
-    sends_of,
-    settle_keyed,
 )
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
@@ -369,22 +364,23 @@ class SNSSink:
         the entry in this sink's run notes, so every resend carries the first send's ids, and
         chunks the rest within the count and byte limits. When every event's id callable raised,
         the round is a refusal carrying the first exception. The drops are registered by
-        :meth:`_register_drops`, and each chunk is published once through :meth:`_send`, its
-        reply settled by the keyed rule SQS shares — a sender fault ``REJECTED`` and a final
-        rejection, any other failed entry ``RETRYABLE``, an unreadable reply ``UNKNOWN``, a raise
-        ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
+        :meth:`_register_drops`.
 
-        **A FIFO group is held as ``SQSSink`` holds one** (SPEC-100 FR-004), through the same
-        :func:`~log_foundry.sinks._fifo.hold` and :func:`~log_foundry.sinks._fifo.block`, called
-        through the module so one reading of the rule binds both sinks. On a FIFO topic, in every
-        round but the run's last (:attr:`RunContext.last`), a message waits, ``RETRYABLE`` and
-        unsent, while an earlier message of its group sent in an earlier call has neither landed
-        nor used its ``max_retries + 1`` sends; in the last round nothing is held, so a held
-        message follows its predecessor's final send. The hold keeps a later *call* from
-        overtaking an earlier message of its group; what the topic does with a call's later
-        entries when an earlier one fails is the topic's. A message a run leaves held is counted
-        ``failed`` with the line ``SNSSink, <n> attempt(s), held behind an earlier message of its
-        FIFO group``. A standard topic holds nothing.
+        **The round loop is the one ``SQSSink`` runs** (SPEC-100 FR-004):
+        :func:`~log_foundry.sinks._fifo.send_round` publishes each chunk once through
+        :meth:`_send`, settles its reply by the keyed rule SQS shares — a sender fault
+        ``REJECTED`` and a final rejection, any other failed entry ``RETRYABLE``, an unreadable
+        reply ``UNKNOWN``, a raise ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers
+        — marks each landed occurrence in the run's cache, and on a FIFO topic holds a group. In
+        every round but the run's last a message waits, ``RETRYABLE`` and unsent, while an
+        earlier message of its group sent in an earlier call has neither landed nor used its
+        ``max_retries + 1`` sends; in the last round nothing is held, so a held message follows
+        its predecessor's final send. The hold keeps a later *call* from overtaking an earlier
+        message of its group; what the topic does with a call's later entries when an earlier
+        one fails is the topic's. A message a run leaves held is counted ``failed`` with the
+        line ``SNSSink, <n> attempt(s), held behind an earlier message of its FIFO group``. A
+        standard topic holds nothing. This method passes only what is this sink's own: the
+        client call, its API's name and the class name its lines carry.
 
         Args:
           batch: The events this round is offered.
@@ -406,61 +402,17 @@ class SNSSink:
         self._register_drops(batch, plan)
         for position in plan.dropped:
             fates[position] = Outcome.DROPPED
-        entries = cast("list[_fifo.Entry | None]", context.notes(self)["prepared_round"])
-        lost = Lost(self)
-        final: list[int] = []
-        blocked: set[str] = set()
-        sends = self.max_retries + 1
-        name = "SNSSink"
-        holding = self.fifo and not context.last
-        for chunk in plan.chunks:
-            held = (
-                _fifo.hold(
-                    chunk, blocked, [sends_of(self, batch[item.position]) for item in chunk], sends
-                )
-                if holding
-                else [False] * len(chunk)
-            )
-            sending = [item for item, hold in zip(chunk, held, strict=True) if not hold]
-            waiting = [batch[item.position] for item, hold in zip(chunk, held, strict=True) if hold]
-            lost.add(
-                waiting,
-                when=When.LAST,
-                key="held",
-                line=lambda n, count: _diag.lost(
-                    "message",
-                    count,
-                    f"{name}, {n} attempt(s), held behind an earlier message of its FIFO group",
-                ),
-            )
-            if not sending:
-                continue
-            carried = [batch[item.position] for item in sending]
-            mark_sent(self, carried)
-            sent = self._send(sending, entry_ids(self, carried))
-            landed = settle_keyed(
-                self,
-                positions=[item.position for item in sending],
-                carried=carried,
-                error=sent.error,
-                retryable=sent.retryable,
-                reply=sent.result,
-                call="publish_batch",
-                name="SNSSink",
-                fates=fates,
-                final=final,
-                lost=lost,
-            )
-            for position in landed:
-                cached = entries[position]
-                if cached is not None:
-                    cached.landed = True
-            if holding:
-                _fifo.block(
-                    sending, fates, [sends_of(self, event) for event in carried], blocked, sends
-                )
-        lost.register()
-        context.final_rejections(final)
+        _fifo.send_round(
+            self,
+            batch,
+            plan,
+            fates,
+            fifo=self.fifo,
+            max_retries=self.max_retries,
+            send=self._send,
+            call="publish_batch",
+            name="SNSSink",
+        )
         return Verdict(outcomes=tuple(fates))
 
     def _prepare(self, event: dict[str, object], body: str | None, *, limit: int) -> _fifo.Entry:

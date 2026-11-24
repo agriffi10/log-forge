@@ -32,6 +32,8 @@ QUEUES = ("SQSSink", "SNSSink")
 STREAMS = ("KinesisSink", "FirehoseSink")
 ALL = QUEUES + STREAMS
 FIFO = "https://sqs/q.fifo"
+FIFO_OF = {"SQSSink": FIFO, "SNSSink": "arn:aws:sns:r:1:t.fifo"}
+"""Each FIFO sink's FIFO destination; SPEC-100 runs every FIFO test here on both (invariant 6)."""
 
 
 @pytest.fixture(autouse=True)
@@ -86,7 +88,7 @@ def build(kind: str, reply: Reply = accept, **kwargs: Any) -> tuple[Any, Client]
     if kind == "SQSSink":
         sink: Any = SQSSink(kwargs.pop("url", "https://sqs/q"), client=client, **kwargs)
     elif kind == "SNSSink":
-        sink = SNSSink("arn", client=client, **kwargs)
+        sink = SNSSink(kwargs.pop("url", "arn"), client=client, **kwargs)
     elif kind == "KinesisSink":
         sink = KinesisSink("s", client=client, **kwargs)
     else:
@@ -275,18 +277,18 @@ def test_a_malformed_failed_is_counted_once_and_never_resent(
     assert len(lines) == 1 and "could not adjudicate" in lines[0], lines
 
 
-# --- SQS FIFO keeps message-group order -------------------------------------------------------
+# --- a FIFO group keeps its order, on SQS and, since SPEC-100, SNS ----------------------------
 
 
 def _grouped(groups: str) -> list[dict[str, object]]:
     return [{"i": i, "log_id": f"l{i}", "g": g} for i, g in enumerate(groups)]
 
 
-def _fifo(reply: Reply, **kwargs: Any) -> tuple[SQSSink, Client]:
-    return build(  # type: ignore[return-value]
-        "SQSSink",
+def _fifo(kind: str, reply: Reply, **kwargs: Any) -> tuple[Any, Client]:
+    return build(
+        kind,
         reply,
-        url=FIFO,
+        url=FIFO_OF[kind],
         message_group_id=lambda e: str(e["g"]),
         **kwargs,
     )
@@ -296,38 +298,38 @@ def _order(client: Client) -> list[list[int]]:
     return [[e["i"] for e in call] for call in client.calls]
 
 
-def test_a_one_group_fifo_batch_on_a_healthy_client_is_one_call() -> None:
-    sink, client = _fifo(accept, max_retries=3)
+@pytest.mark.parametrize("kind", QUEUES)
+def test_a_one_group_fifo_batch_on_a_healthy_client_is_one_call(kind: str) -> None:
+    sink, client = _fifo(kind, accept, max_retries=3)
     sink.emit(_grouped("AAAAA"))
     assert _order(client) == [[0, 1, 2, 3, 4]]
 
 
-def test_a_fifo_group_keeps_its_order_across_chunks() -> None:
-    def reply(entries: list[dict[str, Any]], call: int) -> Any:
-        if call == 1:
-            return {"Failed": [{"Id": entries[0]["Id"], "SenderFault": False, "Code": "T"}]}
-        return {"Failed": []}
+def _first_entry_fails_once(entries: list[dict[str, Any]], call: int) -> Any:
+    if call == 1:
+        return {"Failed": [{"Id": entries[0]["Id"], "SenderFault": False, "Code": "T"}]}
+    return {"Failed": []}
 
-    sink, client = _fifo(reply, max_retries=3, chunk=2)
+
+@pytest.mark.parametrize("kind", QUEUES)
+def test_a_fifo_group_keeps_its_order_across_chunks(kind: str) -> None:
+    sink, client = _fifo(kind, _first_entry_fails_once, max_retries=3, chunk=2)
     sink.emit(_grouped("ACAB"))
     assert _order(client) == [[0, 1], [3], [0], [2]], (
         "A2 waits until A0 lands; B is sent in round one; no A overtakes an earlier A"
     )
 
 
-def test_a_standard_queue_holds_nothing() -> None:
-    def reply(entries: list[dict[str, Any]], call: int) -> Any:
-        if call == 1:
-            return {"Failed": [{"Id": entries[0]["Id"], "SenderFault": False, "Code": "T"}]}
-        return {"Failed": []}
-
-    sink, client = build("SQSSink", reply, max_retries=3, chunk=2)
+@pytest.mark.parametrize("kind", QUEUES)
+def test_a_standard_queue_holds_nothing(kind: str) -> None:
+    sink, client = build(kind, _first_entry_fails_once, max_retries=3, chunk=2)
     sink.emit(_grouped("ACAB"))
     assert _order(client) == [[0, 1], [2, 3], [0]]
 
 
-def test_an_always_failing_event_frees_its_group_on_its_last_send() -> None:
-    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] == 0), max_retries=3, chunk=2)
+@pytest.mark.parametrize("kind", QUEUES)
+def test_an_always_failing_event_frees_its_group_on_its_last_send(kind: str) -> None:
+    sink, client = _fifo(kind, failing(kind, lambda e: e["i"] == 0), max_retries=3, chunk=2)
     sink.emit(_grouped("ACAB"))
     assert _order(client) == [[0, 1], [3], [0], [0], [0, 2]], (
         "A2 is first sent in the round of A0's fourth send, after A0, and lands"
@@ -335,25 +337,36 @@ def test_an_always_failing_event_frees_its_group_on_its_last_send() -> None:
     assert sink.failed == 1
 
 
-def _rounds(client: Client, sink: SQSSink) -> list[tuple[int, int]]:
+def _rounds(kind: str, client: Client, sink: Any) -> list[tuple[int, int]]:
     """Wraps the client so each entry sent is recorded as ``(round, i)``, in send order."""
     seen: list[tuple[int, int]] = []
-    send = client.send_message_batch
+    key = "MessageBody" if kind == "SQSSink" else "Message"
 
-    def recording(*, QueueUrl: str, Entries: list[dict[str, Any]]) -> Any:
+    def record(entries: list[dict[str, Any]]) -> None:
         number = _engine.run_context().round
-        seen.extend((number, json.loads(e["MessageBody"])["i"]) for e in Entries)
-        return send(QueueUrl=QueueUrl, Entries=Entries)
+        seen.extend((number, json.loads(e[key])["i"]) for e in entries)
 
-    sink.client = type("C", (), {"send_message_batch": staticmethod(recording)})()
+    def send_message_batch(*, QueueUrl: str, Entries: list[dict[str, Any]]) -> Any:
+        record(Entries)
+        return client.send_message_batch(QueueUrl=QueueUrl, Entries=Entries)
+
+    def publish_batch(*, TopicArn: str, PublishBatchRequestEntries: list[dict[str, Any]]) -> Any:
+        record(PublishBatchRequestEntries)
+        return client.publish_batch(
+            TopicArn=TopicArn, PublishBatchRequestEntries=PublishBatchRequestEntries
+        )
+
+    method = send_message_batch if kind == "SQSSink" else publish_batch
+    sink.client = type("C", (), {method.__name__: staticmethod(method)})()
     return seen
 
 
+@pytest.mark.parametrize("kind", QUEUES)
 def test_the_last_round_sends_a_held_event_after_its_predecessors_final_send(
-    capsys: pytest.CaptureFixture[str],
+    kind: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1)), max_retries=3, chunk=1)
-    seen = _rounds(client, sink)
+    sink, client = _fifo(kind, failing(kind, lambda e: e["i"] in (0, 1)), max_retries=3, chunk=1)
+    seen = _rounds(kind, client, sink)
     sink.emit(_grouped("AAA"))
     assert seen == [(1, 0), (2, 0), (3, 0), (4, 0), (4, 1), (4, 2)], (
         "A1 is first sent on A0's last send; A2, held behind A1 until then, follows A1's final "
@@ -364,10 +377,30 @@ def test_the_last_round_sends_a_held_event_after_its_predecessors_final_send(
     assert not any("held behind" in line for line in err), err
 
 
+@pytest.mark.parametrize("kind", QUEUES)
+def test_the_last_round_releases_a_held_call_behind_an_always_failing_one(kind: str) -> None:
+    """SPEC-100 diff review: a once-failing A1 and the second call wait for the last round.
+
+    Twelve events of one group: A0 fails on every send, A1 fails only in the first call. The
+    hold keeps A1, A10 and A11 behind A0 until the run's last round, where nothing is held, so
+    all four go out in one call after A0's three earlier sends, and only A0 is lost. Holding in
+    the last round too would strand A1, A10 and A11, counting three failed.
+    """
+    sink, client = _fifo(
+        kind,
+        failing(kind, lambda e: e["i"] == 0 or (e["i"] == 1 and len(client.calls) == 1)),
+        max_retries=3,
+    )
+    sink.emit([{"i": i, "log_id": f"l{i}", "g": "A"} for i in range(12)])
+    assert _order(client) == [list(range(10)), [0], [0], [0, 1, 10, 11]]
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+
+
+@pytest.mark.parametrize("kind", QUEUES)
 @pytest.mark.parametrize("path", ["worker", "run_delivery"])
-def test_no_round_before_the_last_sends_a_held_event(path: str) -> None:
-    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1, 2)), max_retries=3, chunk=1)
-    seen = _rounds(client, sink)
+def test_no_round_before_the_last_sends_a_held_event(path: str, kind: str) -> None:
+    sink, client = _fifo(kind, failing(kind, lambda e: e["i"] in (0, 1, 2)), max_retries=3, chunk=1)
+    seen = _rounds(kind, client, sink)
     if path == "worker":
         through_worker(sink, _grouped("AAAA"), retries=1)
     else:
@@ -380,10 +413,11 @@ def test_no_round_before_the_last_sends_a_held_event(path: str) -> None:
     assert [j for r, j in seen if r == 8] == [0, 1, 2, 3], "the last round keeps batch order"
 
 
+@pytest.mark.parametrize("kind", QUEUES)
 def test_a_run_ending_before_its_last_round_counts_a_held_event_with_its_own_line(
-    capsys: pytest.CaptureFixture[str],
+    kind: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] == 0), max_retries=3, chunk=1)
+    sink, client = _fifo(kind, failing(kind, lambda e: e["i"] == 0), max_retries=3, chunk=1)
     _engine.run_delivery(
         sink, _grouped("AAA"), worker_retries=0, stop=None, decline=lambda _longest: True
     )
@@ -391,14 +425,15 @@ def test_a_run_ending_before_its_last_round_counts_a_held_event_with_its_own_lin
     assert client.sent(1) == client.sent(2) == 0
     assert sink.failed == 3
     assert (
-        "log-foundry: lost 2 message(s); SQSSink, 0 attempt(s), held behind an earlier message of its FIFO group"
-        in lost(capsys.readouterr().err)
-    )
+        f"log-foundry: lost 2 message(s); {kind}, 0 attempt(s), held behind an earlier message of "
+        "its FIFO group"
+    ) in lost(capsys.readouterr().err)
 
 
-def test_a_forwarded_deliver_takes_last_from_the_outer_runs_budget() -> None:
-    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1)), max_retries=3, chunk=1)
-    seen = _rounds(client, sink)
+@pytest.mark.parametrize("kind", QUEUES)
+def test_a_forwarded_deliver_takes_last_from_the_outer_runs_budget(kind: str) -> None:
+    sink, client = _fifo(kind, failing(kind, lambda e: e["i"] in (0, 1)), max_retries=3, chunk=1)
+    seen = _rounds(kind, client, sink)
 
     class Wrapper:
         max_retries = 0
@@ -414,7 +449,8 @@ def test_a_forwarded_deliver_takes_last_from_the_outer_runs_budget() -> None:
 
     delivery = _engine.run_delivery(Wrapper(), _grouped("AAA"), worker_retries=0, stop=None)
     assert seen == [(1, 0), (1, 1), (1, 2)], (
-        "the outer run's one round is its last, though SQS's own max_retries would hold A1 and A2"
+        f"the outer run's one round is its last, though {kind}'s own max_retries would hold A1 "
+        "and A2"
     )
     assert delivery is not None and not delivery.failed
 
@@ -549,21 +585,22 @@ def test_the_encode_cache_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> N
     assert calls > 4
 
 
-# --- SQS FIFO id callables --------------------------------------------------------------------
+# --- FIFO id callables, on SQS and, since SPEC-100, SNS --------------------------------------
 
 
-def test_an_id_failure_and_an_unencodable_event_alone_settle() -> None:
+@pytest.mark.parametrize("kind", QUEUES)
+def test_an_id_failure_and_an_unencodable_event_alone_settle(kind: str) -> None:
     def group(event: dict[str, object]) -> str:
         if event["i"] == 0:
             raise KeyError("g")
         return "g"
 
-    sink, client = build("SQSSink", url=FIFO, message_group_id=group)
+    sink, client = build(kind, url=FIFO_OF[kind], message_group_id=group)
     batch: list[dict[str, object]] = [{"i": 0}, {"i": 1, "blob": b"raw"}]
     sink.emit(batch)
     assert client.calls == []
     assert sink.losses() == SinkLosses(dropped=2, failed=0)
-    sink2, _ = build("SQSSink", url=FIFO, message_group_id=group)
+    sink2, _ = build(kind, url=FIFO_OF[kind], message_group_id=group)
     worker = through_worker(sink2, [{"i": 0}, {"i": 1, "blob": b"raw"}])
     assert worker.failed_batches == 0
 
@@ -582,19 +619,23 @@ def _counting_ids() -> tuple[dict[str, list[object]], Callable[..., str], Callab
     return seen, group, dedup
 
 
-def _ids_run() -> tuple[dict[str, list[object]], Client]:
+def _body(entry: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(entry.get("MessageBody", entry.get("Message", "{}")))
+
+
+def _ids_run(kind: str) -> tuple[dict[str, list[object]], Client]:
     seen, group, dedup = _counting_ids()
 
     def reply(entries: list[dict[str, Any]], call: int) -> Any:
         if call <= 2:
-            failed = [e for e in entries if json.loads(e["MessageBody"])["i"] == 1]
+            failed = [e for e in entries if _body(e)["i"] == 1]
             return {"Failed": [{"Id": e["Id"], "SenderFault": False, "Code": "T"} for e in failed]}
         return {"Failed": []}
 
     sink, client = build(
-        "SQSSink",
+        kind,
         reply,
-        url=FIFO,
+        url=FIFO_OF[kind],
         message_group_id=group,
         message_deduplication_id=dedup,
         max_retries=3,
@@ -608,31 +649,35 @@ def _carried_ids(client: Client, i: int) -> list[tuple[str, str]]:
         (entry["MessageGroupId"], entry["MessageDeduplicationId"])
         for call in client.entries
         for entry in call
-        if json.loads(entry["MessageBody"])["i"] == i
+        if _body(entry)["i"] == i
     ]
 
 
-def test_fifo_ids_are_resolved_once_per_run() -> None:
-    seen, client = _ids_run()
+@pytest.mark.parametrize("kind", QUEUES)
+def test_fifo_ids_are_resolved_once_per_run(kind: str) -> None:
+    seen, client = _ids_run(kind)
     assert sorted(seen["group"]) == [0, 1, 2] and sorted(seen["dedup"]) == [0, 1, 2]
     resent = _carried_ids(client, 1)
     assert len(resent) == 3 and len(set(resent)) == 1, "every resend carries the first send's ids"
 
 
-def test_the_per_round_id_mutant_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
-    real = SQSSink._chunks
+@pytest.mark.parametrize("kind", QUEUES)
+def test_the_per_round_id_mutant_is_caught(kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    cls: Any = SQSSink if kind == "SQSSink" else SNSSink
+    real = cls._round
 
-    def per_round(self: SQSSink, batch: list[dict[str, object]]) -> Any:
+    def per_round(self: Any, batch: list[dict[str, object]]) -> Any:
         _engine.run_context().notes(self).pop("prepared", None)
         return real(self, batch)
 
-    monkeypatch.setattr(SQSSink, "_chunks", per_round)
-    seen, client = _ids_run()
+    monkeypatch.setattr(cls, "_round", per_round)
+    seen, client = _ids_run(kind)
     assert len(seen["dedup"]) > 3
     assert len(set(_carried_ids(client, 1))) > 1
 
 
-def test_a_repeated_event_never_resends_a_landed_occurrences_ids() -> None:
+@pytest.mark.parametrize("kind", QUEUES)
+def test_a_repeated_event_never_resends_a_landed_occurrences_ids(kind: str) -> None:
     """M1: the same event twice; its first occurrence lands, the second is resent with its own."""
     event: dict[str, object] = {"i": 0, "log_id": "same"}
 
@@ -642,7 +687,7 @@ def test_a_repeated_event_never_resends_a_landed_occurrences_ids() -> None:
         return {"Failed": []}
 
     sink, client = build(
-        "SQSSink", reply, url=FIFO, message_group_id="g", message_deduplication_id=lambda e: ""
+        kind, reply, url=FIFO_OF[kind], message_group_id="g", message_deduplication_id=lambda e: ""
     )
     sink.emit([event, event])
     first, second = client.entries[0]
@@ -683,9 +728,10 @@ def _all_raise() -> tuple[list[KeyError], Callable[[dict[str, object]], str]]:
     return raised, group
 
 
-def test_every_id_callable_raising_is_a_refusal_through_emit() -> None:
+@pytest.mark.parametrize("kind", QUEUES)
+def test_every_id_callable_raising_is_a_refusal_through_emit(kind: str) -> None:
     raised, group = _all_raise()
-    sink, client = build("SQSSink", url=FIFO, message_group_id=group, max_retries=3)
+    sink, client = build(kind, url=FIFO_OF[kind], message_group_id=group, max_retries=3)
     with pytest.raises(KeyError) as info:
         sink.emit(events(3))
     assert info.value is raised[0]
@@ -694,15 +740,17 @@ def test_every_id_callable_raising_is_a_refusal_through_emit() -> None:
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
+@pytest.mark.parametrize("kind", QUEUES)
 def test_every_id_callable_raising_is_one_deliver_and_one_failed_batch(
-    monkeypatch: pytest.MonkeyPatch,
+    kind: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _raised, group = _all_raise()
-    sink, _ = build("SQSSink", url=FIFO, message_group_id=group, max_retries=3)
+    sink, _ = build(kind, url=FIFO_OF[kind], message_group_id=group, max_retries=3)
     rounds: list[int] = []
-    real = SQSSink.deliver
+    cls: Any = type(sink)
+    real = cls.deliver
     monkeypatch.setattr(
-        SQSSink, "deliver", lambda self, batch: (rounds.append(1), real(self, batch))[1]
+        cls, "deliver", lambda self, batch: (rounds.append(1), real(self, batch))[1]
     )
     worker = through_worker(sink, events(3))
     assert len(rounds) == 1
@@ -710,9 +758,10 @@ def test_every_id_callable_raising_is_one_deliver_and_one_failed_batch(
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
-def test_every_id_callable_raising_is_one_orphan_loss() -> None:
+@pytest.mark.parametrize("kind", QUEUES)
+def test_every_id_callable_raising_is_one_orphan_loss(kind: str) -> None:
     raised, group = _all_raise()
-    sink, _ = build("SQSSink", url=FIFO, message_group_id=group, max_retries=3)
+    sink, _ = build(kind, url=FIFO_OF[kind], message_group_id=group, max_retries=3)
     log_foundry.configure(service="t", sink=sink)
     before = log_foundry.health().orphan_lost
     log_foundry.info("orphan")

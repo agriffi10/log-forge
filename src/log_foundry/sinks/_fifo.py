@@ -1,17 +1,21 @@
-"""The FIFO ids, the per-run entry cache and the group hold that SQSSink and SNSSink share."""
+"""The FIFO ids, entry cache and round loop with its group hold, shared by SQSSink and SNSSink."""
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import NamedTuple, Protocol, cast
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast
 
 from log_foundry import _diag
 from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._chunk import chunk_items
-from log_foundry.sinks._engine import run_context
+from log_foundry.sinks._engine import When, run_context
+from log_foundry.sinks._rounds import Lost, entry_ids, mark_sent, sends_of, settle_keyed
 from log_foundry.sinks.verdict import Outcome
+
+if TYPE_CHECKING:
+    from log_foundry.sinks._rounds import Called, KeyedReply
 
 DEFAULT_GROUP_ID = "log-foundry"
 """Fallback group for an event carrying no usable ``trace_id`` — never send an empty group id."""
@@ -123,17 +127,28 @@ class PrepareOne(Protocol):
 
 
 def judge(
-    owner: str, kind: str, name: str, destination: str, fifo: object, group: object, dedup: object
+    owner: str,
+    kind: str,
+    name: str,
+    destination: object,
+    fifo: object,
+    group: object,
+    dedup: object,
 ) -> bool:
     """Judges the three FIFO arguments against the destination and returns the sink's type.
 
     Both FIFO sinks call this once in their constructor, after every refusal the constructor made
     before SPEC-100 and before any client is built, so a call refused there keeps its exact error
     (SPEC-100 FR-001). **The types are judged first, then the values**: the id sources' types,
-    as :func:`~log_foundry.sinks._args.require_callable` asks them, then ``fifo``'s; then a blank
-    constant group, ``fifo=True`` without the suffix, and an id argument on a standard
-    destination. On ``SQSSink`` the first and third were already asked by its constructor, so
-    here they cannot fire there.
+    as :func:`~log_foundry.sinks._args.require_callable` asks them, then ``fifo``'s, then the
+    destination's; then a blank constant group, ``fifo=True`` without the suffix, and an id
+    argument on a standard destination. On ``SQSSink`` the id sources' types and the blank group
+    were already asked by its constructor, so here they cannot fire there.
+
+    The destination must be a ``str`` or a ``str`` subclass, asked of its type: a ``None`` or a
+    ``bytes`` URL or ARN was read with ``.endswith`` and raised an ``AttributeError`` naming no
+    argument, or built a sink that could never send. Its suffix is read through
+    ``str.endswith``, so a ``str`` subclass's own ``endswith`` never runs.
 
     ``fifo`` is asked its type, never its truth or its ``__class__`` (SPEC-071 FR-005): anything
     but a ``bool`` or ``None`` is refused, and since ``bool`` cannot be subclassed only ``True``
@@ -158,8 +173,9 @@ def judge(
       destination's name ends in ``.fifo``.
 
     Raises:
-      TypeError: For an id source outside its declared type, with ``require_callable``'s text, or
-        a ``fifo`` that is neither a ``bool`` nor ``None``, naming its real type.
+      TypeError: For an id source outside its declared type, with ``require_callable``'s text, a
+        ``fifo`` that is neither a ``bool`` nor ``None``, or a destination that is not a ``str``,
+        each naming the real type: ``<owner> <name> must be a str, not <type>`` for the last.
       ValueError: For a blank constant group id, ``fifo=True`` on a name not ending in ``.fifo``,
         or an id argument passed to a sink that is not FIFO, naming each such argument.
     """
@@ -174,7 +190,12 @@ def judge(
         raise ValueError(
             "message_group_id must be a non-empty string; pass None to group by trace_id"
         )
-    suffixed = destination.endswith(".fifo")
+    if not issubclass(type(destination), str):
+        raise TypeError(
+            f"{owner} {name} must be a str, not "
+            f"{_diag._STR_STR(_diag._STORED_NAME(type(destination)))}"
+        )
+    suffixed = str.endswith(cast("str", destination), ".fifo")
     if fifo is True and not suffixed:
         raise ValueError(
             f"{owner} fifo=True needs a {name} ending in .fifo: AWS requires every FIFO {kind} "
@@ -195,11 +216,39 @@ def judge(
     return is_fifo
 
 
+def answer(raw: object, kind: str) -> str:
+    """Returns an id callable's answer when its type is a ``str`` or ``str`` subclass.
+
+    The answer is asked its type, never its value or its ``__class__`` (SPEC-100 FR-002): an
+    object whose own ``strip`` returned a ``str`` was otherwise sent as that ``str``, and one
+    whose ``strip`` worked but whose result could not be costed lost its round. Any other type is
+    an id failure of its own event. A ``str`` subclass passes, and is stripped later through
+    ``str.strip``, so its own methods never run.
+
+    Args:
+      raw: What the callable answered.
+      kind: ``"group"`` or ``"deduplication"``, for the message.
+
+    Returns:
+      The answer, typed as a ``str``.
+
+    Raises:
+      TypeError: When the answer's type is not a ``str`` subclass, naming the id; :func:`prepare`
+        turns it into a drop of this one event, the line naming ``TypeError``.
+    """
+    if not issubclass(type(raw), str):
+        raise TypeError(f"a FIFO {kind} id callable must answer a str")
+    return cast("str", raw)
+
+
 def bounded(raw: str, fallback: str) -> str:
     """Normalizes a derived group id, falling back when blank and truncating when over-long.
 
+    It strips through ``str.strip``, so a ``str`` subclass's own ``strip`` never runs and the id
+    is a plain ``str``.
+
     Args:
-      raw: The derived id.
+      raw: The derived id, a ``str`` or ``str`` subclass (:func:`answer` has asked its type).
       fallback: What a blank id becomes.
 
     Returns:
@@ -208,7 +257,7 @@ def bounded(raw: str, fallback: str) -> str:
     Raises:
       None.
     """
-    cleaned = raw.strip()
+    cleaned = str.strip(raw)
     if not cleaned:
         return fallback
     return cleaned[:MAX_ID_LEN]
@@ -220,8 +269,10 @@ def group_id(source: GroupIdSource, event: dict[str, object]) -> str:
     A constant is used as given, a callable is asked, and otherwise the event's own ``trace_id``
     groups it. The constant is told apart by its real type and read through ``str.__str__``
     (SPEC-071 FR-005), so a callable whose ``__class__`` claims ``str`` is still asked, and a
-    ``str`` subclass's own ``strip`` never runs per event. Every route is bounded, so a caller's
-    callable returning an empty string cannot put an empty parameter on the wire.
+    ``str`` subclass's own ``strip`` never runs per event. A callable's answer must be a ``str``
+    or ``str`` subclass, asked of its type by :func:`answer` (SPEC-100 FR-002). Every route is
+    bounded, so a caller's callable returning an empty string cannot put an empty parameter on
+    the wire.
 
     Args:
       source: The sink's ``message_group_id``.
@@ -231,13 +282,14 @@ def group_id(source: GroupIdSource, event: dict[str, object]) -> str:
       The group id.
 
     Raises:
-      Exception: A caller-supplied callable's own exception, which :func:`prepare` turns into a
-        drop of this one event (SPEC-058 FR-004).
+      Exception: A caller-supplied callable's own exception, or :func:`answer`'s ``TypeError``
+        for an answer that is not a ``str``, which :func:`prepare` turns into a drop of this one
+        event (SPEC-058 FR-004).
     """
     if issubclass(type(source), str):
         raw = _diag._STR_STR(cast("str", source))
     elif source is not None:
-        raw = cast("Callable[[dict[str, object]], str]", source)(event)
+        raw = answer(cast("Callable[[dict[str, object]], object]", source)(event), "group")
     else:
         raw = str(event.get("trace_id", ""))
     return bounded(raw, DEFAULT_GROUP_ID)
@@ -270,12 +322,15 @@ def dedup_id(source: DedupIdSource, event: dict[str, object]) -> str:
       its SHA-256 hex digest when it is longer, and a freshly minted id when it is blank.
 
     Raises:
-      Exception: A caller-supplied callable's own exception, or the ``AttributeError`` of an
-        answer with no ``strip``, which :func:`prepare` turns into a drop of this one event
-        (SPEC-058 FR-004).
+      Exception: A caller-supplied callable's own exception, or :func:`answer`'s ``TypeError``
+        for an answer that is not a ``str``, which :func:`prepare` turns into a drop of this one
+        event (SPEC-058 FR-004).
     """
-    raw = source(event) if source is not None else str(event.get("log_id", ""))
-    stripped = raw.strip()
+    if source is not None:
+        raw = answer(cast("Callable[[dict[str, object]], object]", source)(event), "deduplication")
+    else:
+        raw = str(event.get("log_id", ""))
+    stripped = str.strip(raw)
     if len(stripped) > MAX_ID_LEN:
         return hashlib.sha256(stripped.encode("utf-8", "surrogatepass")).hexdigest()
     if stripped:
@@ -482,3 +537,110 @@ def block(
     for item, count in zip(sent, sends, strict=True):
         if fates[item.position] is not Outcome.ACCEPTED and count < limit:
             blocked.add(item.group_id or "")
+
+
+def send_round(
+    owner: object,
+    batch: list[dict[str, object]],
+    plan: Plan,
+    fates: list[Outcome],
+    *,
+    fifo: bool,
+    max_retries: int,
+    send: Callable[[list[Prepared], list[str]], Called[KeyedReply]],
+    call: str,
+    name: str,
+) -> None:
+    """Sends a round's chunks once each, holding a FIFO group, and settles every reply.
+
+    This is the one copy of the round loop ``SQSSink`` and ``SNSSink`` share (SPEC-100 FR-004),
+    so the FIFO half of it — the hold, the held line, the landed marks and the blocks — cannot
+    diverge between the twins. Each sink keeps only what is its own: the plan's encode step, its
+    drop lines, the client call ``send`` makes and the names its lines carry.
+
+    **The hold is decided at send time, in every round but the run's last**
+    (:attr:`RunContext.last`). On a FIFO destination, :func:`hold` keeps a message unsent and
+    ``RETRYABLE`` while an earlier message of its group, sent in an earlier call, has neither
+    landed nor used its ``max_retries + 1`` sends, and :func:`block` marks each group whose sent
+    message did neither. In the last round every send is final, so nothing is held: a held
+    message follows its predecessor's final send in the same round, chunks going out in batch
+    order, as 1.x sent it after giving up on that predecessor (SPEC-074 Q4). A message a run
+    leaves held is counted ``failed`` with the line ``<name>, <n> attempt(s), held behind an
+    earlier message of its FIFO group``. Both are called through this module's globals, so a
+    patch of ``_fifo.hold`` reaches both sinks. A standard destination holds nothing.
+
+    **Each landed occurrence is marked in the run's cache**, through ``"prepared_round"``, so a
+    later round of the same event object takes the next unlanded occurrence's entry and never
+    resends a landed occurrence's ids (SPEC-074 FR-002). Each reply is settled by
+    :func:`~log_foundry.sinks._rounds.settle_keyed`: a sender fault ``REJECTED`` and a final
+    rejection, any other failed entry ``RETRYABLE``, an unreadable reply ``UNKNOWN``, and a raise
+    ``RETRYABLE`` or ``REJECTED`` as the sink's ``_retryable_error`` answered.
+
+    Args:
+      owner: The sink, whose run notes hold the round's entries and whose send counts are read.
+      batch: The events the round was handed.
+      plan: The round's plan, from :func:`plan_round`.
+      fates: The round's outcomes, by position, its drops already ``DROPPED``; updated in place.
+      fifo: Whether the destination is FIFO, so its groups are held.
+      max_retries: The sink's ``max_retries``; a message's sends are bounded by one more.
+      send: The sink's ``_send``, which makes one client call for a chunk and reads its reply.
+      call: The API's name, for the unread-reply line.
+      name: The shipped class name every line carries.
+
+    Returns:
+      None.
+
+    Raises:
+      None. A ``BaseException`` from the client propagates.
+    """
+    context = run_context()
+    entries = cast("list[Entry | None]", context.notes(owner)["prepared_round"])
+    lost = Lost(owner)
+    final: list[int] = []
+    blocked: set[str] = set()
+    limit = max_retries + 1
+    holding = fifo and not context.last
+    for chunk in plan.chunks:
+        held = (
+            hold(chunk, blocked, [sends_of(owner, batch[item.position]) for item in chunk], limit)
+            if holding
+            else [False] * len(chunk)
+        )
+        sending = [item for item, waits in zip(chunk, held, strict=True) if not waits]
+        waiting = [batch[item.position] for item, waits in zip(chunk, held, strict=True) if waits]
+        lost.add(
+            waiting,
+            when=When.LAST,
+            key="held",
+            line=lambda n, count: _diag.lost(
+                "message",
+                count,
+                f"{name}, {n} attempt(s), held behind an earlier message of its FIFO group",
+            ),
+        )
+        if not sending:
+            continue
+        carried = [batch[item.position] for item in sending]
+        mark_sent(owner, carried)
+        sent = send(sending, entry_ids(owner, carried))
+        landed = settle_keyed(
+            owner,
+            positions=[item.position for item in sending],
+            carried=carried,
+            error=sent.error,
+            retryable=sent.retryable,
+            reply=sent.result,
+            call=call,
+            name=name,
+            fates=fates,
+            final=final,
+            lost=lost,
+        )
+        for position in landed:
+            cached = entries[position]
+            if cached is not None:
+                cached.landed = True
+        if holding:
+            block(sending, fates, [sends_of(owner, event) for event in carried], blocked, limit)
+    lost.register()
+    context.final_rejections(final)

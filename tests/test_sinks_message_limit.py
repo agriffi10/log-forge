@@ -157,7 +157,7 @@ _AFTER_LIMIT = {
         ("message_deduplication_id", _KW, None),
     ],
 }
-"""What a later spec appended after ``max_message_bytes``: SPEC-100 FR-001's three on ``SNSSink``."""
+"""What a later spec appended after ``max_message_bytes``: SPEC-100's three on ``SNSSink``."""
 
 
 @pytest.mark.parametrize("cls", _CLASSES, ids=_IDS)
