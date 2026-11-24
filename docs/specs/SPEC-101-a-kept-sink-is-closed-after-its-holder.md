@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-101
 title: "A Kept Sink Behind a Caller's Wrapper Is Closed After That Wrapper, Never Beside It"
 description: "Has the library close a sink it wrote to, wherever a caller's wrapper holds it, after each close of that wrapper the library makes, so a wrapper that leaves its member alone no longer leaves the member closed by nobody, a wrapper that closes its member gives it a second close in sequence rather than two at once, and the model test learns to tell a wrapper's close from the library's."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-042, SPEC-054, SPEC-076, SPEC-081, SPEC-086, SPEC-087, SPEC-097, SPEC-098]
 arc: audit-2026-11-14
 arc_order: 17
@@ -257,7 +257,7 @@ The sequential driver of `tests/test_invariants_model.py` installs a fresh recor
 `current` is the configured sink. A wrapper is installed only when that sink is a recorder the
 library has already written to. Otherwise the step installs a fresh recorder. The draw comes from
 a second random stream keyed on the seed, so every seed's list of steps is unchanged. `Leaves` and
-`Mine` live beside the recorder.
+`Mine` live beside the recorder, in `tests/test_invariants_model.py`.
 
 `Mine.close()` sets a thread-local mark around its close of its member. The recorder records each
 close's mark in a new `Closes.by_wrapper` field, which defaults to empty so SPEC-085's cells,
@@ -424,7 +424,7 @@ def _order_after(taken: Sequence[Sink]) -> dict[int, Sink]: ...
 ```
 
 ```python
-# tests/model_sinks.py
+# tests/test_invariants_model.py
 class Leaves: ...   # emit forwards; close() leaves the member alone
 class Mine: ...     # emit forwards; close() marks its thread, closes the member, unmarks
 ```
@@ -434,9 +434,8 @@ class Mine: ...     # emit forwards; close() marks its thread, closes the member
 ```
 src/log_foundry/_lifecycle.py           # the two records, the after-holder close, the take order
 tests/test_after_holder_close.py        # new: FR-001 to FR-003
-tests/model_sinks.py                    # Leaves and Mine
 tests/model_oracles.py                  # Closes.by_wrapper; check_repeat reads it
-tests/test_invariants_model.py          # the configure step's install draw
+tests/test_invariants_model.py          # Leaves, Mine and the configure step's install draw
 tests/test_shared_sink_swap.py          # three tests rewritten to FR-001's counts
 ```
 
@@ -595,6 +594,12 @@ tree.
   - the four caller's-wrapper forward rows and the two hoarding rows read `closes=2 overlaps=0
     refused=0` where they assert 1.
 
+Re-run on 2026-11-24 on `5d0e7f68` (`origin/main` carrying SPEC-097 and SPEC-098):
+`leaves_remaining_holder.py` printed `A.closes=0 A.closed_while_inside=0 A.closes_while_parked=0
+A.refused=0 A.events=5 B.closes=1`, `spec101_interrupt.py` closed A never (`A.at_entry=[]`), and
+`spec101_sequences.py` read the base column in every row it ran, the unconfirmed `Mine` row
+included at `A.closes=2 overlaps=1`. So the base column holds on the tree this spec is built on.
+
 ## Revision history
 
 - **Authored on 2026-11-17 against `a38bd80c`**, from `architecture.md` §12's item and its
@@ -625,3 +630,6 @@ tree.
     Data Model, and the criterion that named `check_closed`, which the driver never calls, now
     names the driver's own assertion.
   - **The suite figures are corrected** as stated under *Evidence*.
+- **Checked against `5d0e7f68` before the build, 2026-11-24.** `Leaves` and `Mine` move to
+  `tests/test_invariants_model.py`, beside the recorder the sequential driver installs; the base
+  column was re-measured and holds.
