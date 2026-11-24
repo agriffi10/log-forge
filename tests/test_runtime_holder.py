@@ -169,7 +169,7 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_CloseRegistry.members_of", "self._lock"): 1,
             ("_CloseRegistry.take_ordered", "self._lock"): 1,
             ("_release_after", "_state._lock"): 1,
-            ("_release_ordered", "_state._lock"): 1,
+            ("_put_back_rest", "_state._lock"): 1,
         }
     ),
     "worker.py": collections.Counter(
@@ -232,11 +232,14 @@ caller already holds, which is the order that section already took the leaf in t
 the leaf alone, and none calls ``finish`` or ``put_back`` while holding it. Two take
 ``_state._lock`` with nothing held: ``_release_after`` reads whether the record owes each
 persistent member or a close of it is in flight, only when the holder has persistent members, and
-``_release_ordered`` puts back the ordered members not yet closed after a member's close raised
-a ``BaseException``. ``_release_after`` runs only inside an inline release, which no caller makes
-under ``_state._lock``. ``_release_ordered`` is reached there too, and also from the swap's stale
-take, under ``_state._lock``, when a detached release is refused or gets no thread; that lock is
-re-entrant, so the section re-enters it and takes nothing new. So the lock order does not move."""
+``_put_back_rest`` puts back the ordered members a caller took and did not hand off, after an
+interrupt: a member's close raising a ``BaseException`` in ``_release_ordered``, or one landing in
+``_release_after`` or in ``release``'s own ``finally`` before the members were handed off.
+``_release_after`` runs only inside an inline release, which no caller makes under
+``_state._lock``, and ``release``'s ``finally`` reaches the site only after such a release.
+``_release_ordered`` is reached there too, and also from the swap's stale take, under
+``_state._lock``, when a detached release is refused or gets no thread; that lock is re-entrant,
+so the section re-enters it and takes nothing new. So the lock order does not move."""
 
 
 def _tree(name: str) -> ast.Module:

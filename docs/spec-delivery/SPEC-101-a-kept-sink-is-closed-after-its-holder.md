@@ -53,6 +53,16 @@ Measured on the built branch, Python 3.13 on macOS:
   Mine row of the FR-002 tests fail on an overlap; an ordered attach replacing the persistent one
   fails `test_a_member_ordered_once_stays_attached` (Leaves `[3]` for `[3, 4]`); the
   `_release_ordered_alone` call removed leaves `{'closed': 0, 'in_flight': 1}` in the forked child.
+- **The system-frame diff review's interrupt windows, fixed:** an interrupt after the holder's
+  close and before its ordered member's hand-off (at `_release_after`'s entry, after
+  `members_of`, inside the persistent read) left the member owed by nobody and in flight, and the
+  next `shutdown()` spent the whole grace; `release()`'s own `finally` and `_release_after`'s
+  handler now put it back (`_put_back_rest`), and `members_of` fills the caller's list. Mutants,
+  each run once over `tests/test_after_holder_close.py`: either half of the put-back removed
+  fails its own windows on "the ordered member was put back"; the thread propagation in `attach`
+  removed, the gauge tests read 1 for 2; the `GRACED` rule copy removed, the shutdown's gauge test
+  reads 1; the thread-start fallback removed, the ordered entry stays in flight; the closer
+  thread's own attach removed, both `Leaves` gauge rows read 1.
 - **Install draws:** `Leaves` in 21 of 24 seeds, `Mine` in 16; every seed's step digest unchanged.
 - **Probes:** `leaves_remaining_holder.py` prints `A.closes=1 A.closed_while_inside=0
   A.closes_while_parked=0 A.refused=0 A.events=5 B.closes=1`; `spec101_slow_holder.py` slow

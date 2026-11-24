@@ -888,3 +888,203 @@ def test_a_detached_stop_closes_the_member_after_its_holder(wrapper: str) -> Non
     expected = [True, False] if wrapper == "Mine" else [False]
     assert a.by_wrapper == expected and a.overlaps == 0, a
     assert a.threads[-1] == holder.closed_by[-1], (a.threads, holder.closed_by)
+
+
+# -- FR-003: an interrupt after the holder's close, before its ordered members are handed off ----
+
+
+def _interrupt_after_close(
+    monkeypatch: pytest.MonkeyPatch, window: str, holder: object, a: Rec
+) -> list[int]:
+    """Raises ``KeyboardInterrupt`` once, in the holder's release, at the named window.
+
+    ``entry`` is ``_release_after``'s entry, before the ordered members leave the record; the fix
+    for it is ``release``'s own ``finally``. ``members`` is just after ``members_of`` has taken
+    them, and ``skip`` inside the persistent read's ``_state._lock`` section, which a holder that
+    is persistent and ordered at once always reaches; the fix for both is ``_release_after``'s
+    handler. Returns the list the injection marks when it fires.
+    """
+    fired: list[int] = []
+    if window == "entry":
+        real_after = _lifecycle._release_after
+
+        def at_entry(h: Any, keep: Any) -> None:
+            if h is holder and not fired:
+                fired.append(1)
+                raise KeyboardInterrupt("at _release_after's entry")
+            real_after(h, keep)
+
+        monkeypatch.setattr(_lifecycle, "_release_after", at_entry)
+    elif window == "members":
+        real_members = _lifecycle._CloseRegistry.members_of
+
+        def members_of(self: Any, h: Any, ordered: Any) -> Any:
+            persistent = real_members(self, h, ordered)
+            if h is holder and not fired:
+                fired.append(1)
+                raise KeyboardInterrupt("after members_of took the ordered members")
+            return persistent
+
+        monkeypatch.setattr(_lifecycle._CloseRegistry, "members_of", members_of)
+    else:
+        real_owes = _lifecycle._CloseRegistry.owes
+
+        def owes(self: Any, sink: Any) -> bool:
+            if sink is a and not fired and sys._getframe(1).f_code.co_name == "_release_after":
+                fired.append(1)
+                raise KeyboardInterrupt("inside the persistent read")
+            return real_owes(self, sink)
+
+        monkeypatch.setattr(_lifecycle._CloseRegistry, "owes", owes)
+    return fired
+
+
+@pytest.mark.parametrize("window", ["entry", "members", "skip"])
+@pytest.mark.parametrize("wrapper", ["Leaves", "Mine"])
+def test_an_interrupt_after_the_holders_close_puts_its_ordered_member_back(
+    wrapper: str, window: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-003: an interrupt after the holder's close and before A is handed off leaves A owed.
+
+    An unconfirmed ``configure(W(A))`` makes A persistent and ordered behind W at once. The
+    holder's inline close returns, and an interrupt lands at one window before A's release. On
+    ``8b509f97`` each left A owed by nobody and in flight forever, and the next ``shutdown()``
+    spent the whole grace waiting on it (1.00 s against ``timeout=1.0``). Now A is owed with
+    nothing in flight, and the next ``shutdown()`` closes it at once: behind ``Leaves`` once,
+    behind ``Mine`` once more after the wrapper's own. The 2.0 s grace is twice the bound.
+    """
+    a = Rec("A")
+    log_foundry.configure(service="after-close", sink=a)
+    _write("spans")
+    holder = Mine(a) if wrapper == "Mine" else Leaves(a)
+    _unconfirmed(monkeypatch, a, holder)
+    _write("spans")
+    closes = _lifecycle._state._closes
+    assert closes.owes(a) and closes.owes(holder), "the premise: the take takes both"
+    fired = _interrupt_after_close(monkeypatch, window, holder, a)
+    with pytest.raises(KeyboardInterrupt):
+        log_foundry.shutdown(timeout=5.0)
+    monkeypatch.undo()
+    own = [True] if wrapper == "Mine" else []
+    assert fired and a.by_wrapper == own, (fired, a)
+    assert closes.owes(a), "the ordered member was put back"
+    assert closes.in_flight_ids() == set(), "no entry is left for nobody to discharge"
+    started = time.monotonic()
+    log_foundry.shutdown(timeout=5.0)
+    took = time.monotonic() - started
+    join_graced()
+    assert a.by_wrapper == [*own, False] and a.overlaps == 0, a
+    assert took < 1.0, f"the next shutdown waited on a close nobody performs: {took:.2f}s"
+
+
+# -- The gauge: a member ordered behind a GRACED holder is counted with the holder's thread ------
+
+
+def _count_while_parked(a: Rec, call: Callable[[], None]) -> int:
+    """Runs ``call`` on a thread, reads ``closing_sinks`` while A's close is parked, then frees it."""
+    a.gate = threading.Event()
+    runner = threading.Thread(target=call, name="parked-call")
+    runner.start()
+    try:
+        assert _wait(lambda: a.closing == 1), a
+        return log_foundry.health().closing_sinks
+    finally:
+        a.gate.set()
+        runner.join(GATE)
+        assert not runner.is_alive()
+
+
+@pytest.mark.parametrize("wrapper", ["Mine", "Leaves"])
+def test_a_swaps_ordered_member_is_counted_while_it_closes(
+    wrapper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap's stale take orders A behind W; while A's close is parked, both are counted.
+
+    W's detached thread performs both closes, and A's entry carries that thread: behind ``Mine``
+    the starter's attach reaches it while ``Mine.close()`` is parked in A, and behind ``Leaves``,
+    whose ``close()`` returns at once, the thread's own attach does, before its release takes A.
+    With A's entry left threadless the gauge reads 1.
+    """
+    from test_shared_sink_swap import _straddle
+
+    a, b = Rec("A"), Rec("B")
+    log_foundry.configure(service="gauge-swap", sink=a)
+    log_foundry.info("one")
+    holder = Mine(a) if wrapper == "Mine" else Leaves(a)
+    _straddle(monkeypatch, a, holder)
+    counted = _count_while_parked(a, lambda: log_foundry.configure(sink=b))
+    join_graced()
+    assert counted == 2, counted
+    expected = [True, False] if wrapper == "Mine" else [False]
+    assert a.by_wrapper == expected and a.overlaps == 0, a
+
+
+@pytest.mark.parametrize("wrapper", ["Mine", "Leaves"])
+def test_a_member_ordered_behind_a_graced_holder_is_graced_too(
+    wrapper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The shutdown's take: W is ``GRACED`` and A, taken ``JOINED``, takes W's rule with its order.
+
+    The straddle leaves A owed as a root beneath W with no worker; a span then delivers through W,
+    and an unconfirmed ``configure(C)`` leaves W held unfenced, so the shutdown takes W ``GRACED``
+    and A ``JOINED``. A is ordered behind W and closed on W's thread. While its close is parked
+    the gauge counts W and A; with A left ``JOINED`` it counts W alone.
+    """
+    from test_shared_sink_swap import _straddle
+
+    a, c = Rec("A"), Rec("C")
+    log_foundry.configure(service="gauge-stop", sink=a)
+    log_foundry.info("one")
+    holder = Mine(a) if wrapper == "Mine" else Leaves(a)
+    _straddle(monkeypatch, a, holder)
+    _write("spans")
+    _unconfirmed(monkeypatch, a, c)
+    closes = _lifecycle._state._closes
+    assert closes.owes(a) and closes.owes(holder), "the premise: both owed"
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None and worker.holds_unfenced(holder), "the premise: W is unfenced"
+    assert not worker.holds_unfenced(a), "the premise: A is not"
+    counted = _count_while_parked(a, lambda: log_foundry.shutdown(timeout=5.0))
+    join_graced()
+    assert counted == 2, counted
+    expected = [True, False] if wrapper == "Mine" else [False]
+    assert a.by_wrapper == expected and a.overlaps == 0, a
+
+
+# -- The thread-start fallback: a holder given no thread releases its ordered member alone -------
+
+
+@pytest.mark.parametrize("wrapper", ["Mine", "Leaves"])
+def test_a_holder_given_no_thread_releases_its_ordered_member_alone(
+    wrapper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap's stale take orders A behind W, and W's closer thread will not start.
+
+    W is left open, as a swap that cannot spawn a closer leaves its sink, and the member ordered
+    behind it is released on its own, on a thread of its own, so its entry is discharged and A is
+    closed once, by the library. Without that release A's entry stays in flight for good.
+    """
+    from test_shared_sink_swap import _straddle
+
+    a, b = Rec("A"), Rec("B")
+    log_foundry.configure(service="no-thread", sink=a)
+    log_foundry.info("one")
+    holder = Mine(a) if wrapper == "Mine" else Leaves(a)
+    _straddle(monkeypatch, a, holder)
+    refused: list[str] = []
+    real_start = threading.Thread.start
+
+    def start(self: threading.Thread) -> None:
+        if self.name == "log-foundry-sink-close" and not refused:
+            refused.append(self.name)
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    log_foundry.configure(sink=b)
+    monkeypatch.undo()
+    join_graced()
+    closes = _lifecycle._state._closes
+    assert refused, "the premise: the holder's closer did not start"
+    assert closes.in_flight_ids() == set(), "the ordered member's entry was discharged"
+    assert a.by_wrapper == [False] and a.overlaps == 0, a

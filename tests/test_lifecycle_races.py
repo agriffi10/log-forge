@@ -912,8 +912,10 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "which the guard passed over, so a later call closes it once nothing holds it "
             "(SPEC-087 FR-003). Since SPEC-101 it also puts back, transitively, each member "
             "ordered behind a sink it puts back, and each ordered member not yet closed when "
-            "another member's close raised a BaseException (`_release_ordered`), every entry "
-            "discharged once (FR-003)"
+            "another member's close raised a BaseException (`_release_ordered`) or an interrupt "
+            "landed after the holder's close before they were handed off (`_release_after`, "
+            "`release`'s own finally), through `_put_back_rest`, every entry discharged once "
+            "(FR-003)"
         ),
     }
     found = set(_orphan_record_sites()[0])

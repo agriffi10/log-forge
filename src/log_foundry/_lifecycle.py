@@ -580,30 +580,36 @@ class _CloseRegistry:
             if not entry[1]:
                 del self._after[id(holder)]
 
-    def members_of(self, holder: object) -> tuple[list[Sink], list[tuple[Sink, _Close]]]:
+    def members_of(self, holder: object, ordered: list[tuple[Sink, _Close]]) -> list[Sink]:
         """Returns *holder*'s live persistent members and takes its ordered ones, in one section.
 
         The ordered members leave the record here, so of two releases of one holder only one
         closes them, and each entry is discharged once. The persistent ones stay. With no holder
         attached at all it costs one dictionary read and no lock.
 
+        **The ordered members are added to the caller's own list**, in the statement after the
+        record drops them and with no call between, rather than returned: an interrupt landing
+        after this returns, before a returned value is bound, would lose every taken entry, and
+        the caller's list is what :func:`_release_after` puts back from.
+
         Args:
           holder: The sink whose close has just returned or raised.
+          ordered: The caller's list, which receives each ordered member with its taken entry.
 
         Returns:
-          The persistent members still alive, and each ordered member with its taken entry.
+          The persistent members still alive.
 
         Raises:
           None.
         """
         if not self._after:
-            return [], []
+            return []
         with self._lock:
             entry = self._after.get(id(holder))
             if entry is None or _referent(entry[0]) is not holder:
-                return [], []
+                return []
             persistent: list[Sink] = []
-            ordered: list[tuple[Sink, _Close]] = []
+            taken: list[tuple[Sink, _Close]] = []
             kept: list[_Member] = []
             for m in entry[1]:
                 member = m.referent()
@@ -612,11 +618,12 @@ class _CloseRegistry:
                         persistent.append(member)
                         kept.append(m)
                 elif member is not None:
-                    ordered.append((member, m.closing))
+                    taken.append((member, m.closing))
             entry[1][:] = kept
+            ordered.extend(taken)
             if not kept:
                 del self._after[id(holder)]
-            return persistent, ordered
+            return persistent
 
     def take_ordered(self, holder: object) -> list[tuple[Sink, _Close]]:
         """Takes *holder*'s ordered members, leaving its persistent ones attached (SPEC-101).
@@ -851,8 +858,13 @@ class _CloseRegistry:
 
         **The holder's ordered members get the thread too** (SPEC-101), in the same section, when
         the caller names the holder: each is closed on that thread after the holder, so the
-        graced wait and ``health().closing_sinks`` see its close as they see the holder's. A
-        member the thread has already taken is not reached, and needs nothing more.
+        graced wait and ``health().closing_sinks`` see its close as they see the holder's. The
+        starter calls this once the thread has started, and the thread calls it again first
+        thing (:func:`_close_guarded`), before its release can take a member out of the record:
+        a holder whose ``close()`` returns at once would otherwise have its members taken before
+        the starter's call reached them, leaving their entries with no thread to count. A thread
+        already on an entry is not added a second time, so whichever call comes second adds
+        nothing.
 
         Args:
           close: The entry the thread discharges.
@@ -866,11 +878,12 @@ class _CloseRegistry:
           None.
         """
         with self._lock:
-            close.threads = [*close.threads, thread]
+            if thread not in close.threads:
+                close.threads = [*close.threads, thread]
             entry = None if holder is None else self._after.get(id(holder))
             if entry is not None and _referent(entry[0]) is holder:
                 for m in entry[1]:
-                    if m.closing is not None:
+                    if m.closing is not None and thread not in m.closing.threads:
                         m.closing.threads = [*m.closing.threads, thread]
 
     def bystanders(self, mine: set[int]) -> list[_Close]:
@@ -3005,7 +3018,11 @@ def release(
     wrapper that should close it (:func:`_attach_skipped`). A take's release that performs no
     close, refused by :func:`releasable` or given no thread, releases the members ordered behind
     the sink on their own (:func:`_release_ordered_alone`), so each of their entries is
-    discharged.
+    discharged. An interrupt that reaches this release's own ``finally`` before
+    :func:`_release_after` took the ordered members — one landing as it is entered, say — leaves
+    them in the record, so that ``finally`` puts back whatever is still ordered behind the sink,
+    each entry discharged, before it discharges the sink's own (:func:`_put_back_rest`). After a
+    normal close nothing is left there, and the read costs one dictionary lookup.
 
     Args:
       sink: The sink to close.
@@ -3073,7 +3090,10 @@ def release(
         _state._releasing_here.depth = depth
         _state._releasing_here.keep = prior
         try:
-            _state._closes.finish(sink, registration)
+            try:
+                _put_back_rest(_state._closes.take_ordered(sink))
+            finally:
+                _state._closes.finish(sink, registration)
         finally:
             _settle_close(sink, epoch, repin=depth == 0)
     return None
@@ -3931,18 +3951,51 @@ def _put_back_ordered(pairs: Sequence[tuple[Sink, _Close]]) -> None:
         stack.extend(_state._closes.take_ordered(sink))
 
 
+def _put_back_rest(pairs: list[tuple[Sink, _Close]]) -> None:
+    """Puts back the ordered members a caller took and did not hand to a release (SPEC-101).
+
+    The list is emptied **before** the put-back, so of the two handlers that may reach one list
+    for one interrupt — :func:`_release_ordered`'s and :func:`_release_after`'s — only the first
+    puts anything back, and no entry is discharged twice. A second interrupt landing inside the
+    put-back would leave the rest unreturned rather than discharge an entry twice, which is the
+    safer of the two: a second discharge could set the event of a close another participant is
+    still performing. ``_state._lock`` is taken only when something is left, and it is re-entrant,
+    so a caller already holding it, the swap's stale take, takes nothing new.
+
+    Args:
+      pairs: The caller's list of taken ordered members not yet handed to a release.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    rest = pairs[:]
+    pairs.clear()
+    if rest:
+        with _state._lock:
+            _put_back_ordered(rest)
+
+
 def _release_ordered(
-    pairs: Sequence[tuple[Sink, _Close]], keep: _Keep | None, *, detached: bool
+    pairs: list[tuple[Sink, _Close]], keep: _Keep | None, *, detached: bool
 ) -> None:
     """Releases ordered members in sequence, each with its taken entry (SPEC-101).
 
     An ``Exception`` from a member's close is absorbed with one ``_diag`` line, and the next is
     still closed. A ``BaseException`` reaches the caller, as an inline close's does (SPEC-025),
     once every member not yet released is put back with its entry discharged
-    (:func:`_put_back_ordered`), so it is owed when the call returns with no close of it in flight.
+    (:func:`_put_back_rest`), so it is owed when the call returns with no close of it in flight.
+
+    **It consumes the caller's list**, each member leaving it as it is handed to its release, so
+    the list holds exactly the members not yet handed off however the call leaves: an interrupt
+    landing as this is entered, before its ``try`` opens, leaves the list whole for
+    :func:`_release_after`'s own handler to put back. :func:`_release_ordered_alone` has no such
+    handler, so that window stays open on its route.
 
     Args:
-      pairs: The ordered members and their entries.
+      pairs: The ordered members and their entries, emptied as each is released.
       keep: The deciding call's keep, handed on to each release.
       detached: Whether each member is released on a thread of its own.
 
@@ -3952,19 +4005,15 @@ def _release_ordered(
     Raises:
       BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` a member's close raised.
     """
-    done = 0
     try:
-        for member, closing in pairs:
-            done += 1
+        while pairs:
+            member, closing = pairs.pop(0)
             try:
                 release(member, detached=detached, closing=closing, keeping=keep)
             except Exception as exc:
                 _diag.absorbed(_AFTER_HOLDER, exc, "it may still hold its resources")
     except BaseException:
-        rest = pairs[done:]
-        if rest:
-            with _state._lock:
-                _put_back_ordered(rest)
+        _put_back_rest(pairs)
         raise
 
 
@@ -4008,6 +4057,16 @@ def _release_after(holder: Sink, keep: _Keep | None) -> None:
     claimed. The library does not ask whether the holder closed the member itself, because it
     cannot see that: a caller's wrapper that does gets a second close, in sequence.
 
+    **An interrupt from the take of the ordered members to their release puts them back.** They
+    leave the record at :meth:`_CloseRegistry.members_of` and are not handed off until
+    :func:`_release_ordered`, and between the two sits the persistent read, whose
+    ``_state._lock`` section an interrupt can land in whenever the holder is persistent and
+    ordered at once — an unconfirmed swap into a caller's wrapper over the sink it displaced is
+    exactly that. So one handler covers the take, the read and the hand-off, and puts back with
+    its entry discharged every member still in the list (:func:`_put_back_rest`); measured before
+    it, one interrupt there left the member owed by nobody and in flight forever, and every later
+    ``shutdown()`` spent the whole grace waiting on it.
+
     Args:
       holder: The sink whose close has just returned or raised.
       keep: The release's keep, or ``None`` outside every decision.
@@ -4019,18 +4078,23 @@ def _release_after(holder: Sink, keep: _Keep | None) -> None:
       BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` a member's close raised, after the
         ordered members not yet closed are put back. An ``Exception`` is absorbed.
     """
-    persistent, ordered = _state._closes.members_of(holder)
-    if keep is None:
-        persistent = []
-    if not persistent and not ordered:
-        return
-    skip: set[int] = set()
-    if persistent:
-        with _state._lock:
-            for member in persistent:
-                if _state._closes.owes(member) or _state._closes.in_flight(member):
-                    skip.add(id(member))
-    _release_ordered(ordered, keep, detached=False)
+    ordered: list[tuple[Sink, _Close]] = []
+    try:
+        persistent = _state._closes.members_of(holder, ordered)
+        if keep is None:
+            persistent = []
+        if not persistent and not ordered:
+            return
+        skip: set[int] = set()
+        if persistent:
+            with _state._lock:
+                for member in persistent:
+                    if _state._closes.owes(member) or _state._closes.in_flight(member):
+                        skip.add(id(member))
+        _release_ordered(ordered, keep, detached=False)
+    except BaseException:
+        _put_back_rest(ordered)
+        raise
     for member in persistent:
         if id(member) in skip:
             continue
@@ -4129,6 +4193,12 @@ def _close_guarded(sink: Sink, closing: _Close, keeping: _Keep | None = None) ->
     itself. It goes back through :func:`release` rather than calling ``close()`` itself, so the
     thread body is one of the eight callers rather than a ninth close (SPEC-042 FR-002).
 
+    The thread first attaches itself to its entry and to the entry of each member ordered behind
+    the sink (:meth:`_CloseRegistry.attach`, SPEC-101), before its release can take those members:
+    a holder whose ``close()`` returns at once has them taken before the starter's own attach
+    runs, and a member's entry with no thread is neither counted by ``health().closing_sinks``
+    nor waited on by the shutdown's graced wait in its own right.
+
     Args:
       sink: The sink to close.
       closing: The in-flight entry the close discharges.
@@ -4140,6 +4210,7 @@ def _close_guarded(sink: Sink, closing: _Close, keeping: _Keep | None = None) ->
     Raises:
       None.
     """
+    _state._closes.attach(closing, threading.current_thread(), sink)
     try:
         release(sink, closing=closing, keeping=keeping)
     except Exception as exc:
