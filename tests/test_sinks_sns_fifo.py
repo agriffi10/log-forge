@@ -675,9 +675,11 @@ def test_a_lone_surrogate_answer_over_the_limit_is_sent_as_its_digest(kind: str)
     """FR-003: the digest encodes with ``surrogatepass``; a lone surrogate digests, not raises."""
     answer = "s" * 150 + "\ud800"
     expected = hashlib.sha256(answer.encode("utf-8", "surrogatepass")).hexdigest()
-    sink, client = fifo_sink(kind, message_deduplication_id=lambda e: answer)
-    sink.emit(events(1))
-    assert client.entries[0][0]["MessageDeduplicationId"] == expected
+    sink, client = fifo_sink(
+        kind, message_deduplication_id=lambda e: answer if e["i"] == 0 else "ok"
+    )
+    sink.emit(events(2))
+    assert [e["MessageDeduplicationId"] for e in client.entries[0]] == [expected, "ok"]
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
