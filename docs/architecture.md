@@ -486,6 +486,10 @@ sender faults included — `SQSSink._send` and, since SPEC-070, `SNSSink._send` 
 > SQS batch whose every id callable raised are refusals counted by their catcher alone; an SQS FIFO
 > group keeps its order for `max_retries + 1` sends and holds nothing in a run's last round. Decisions: *A sink round resends only what
 > failed, and an SQS FIFO group keeps its order* and *No shipped sink declares itself idempotent*.
+>
+> **Widened to SNS FIFO topics by SPEC-100:** a FIFO `SNSSink` holds a group's later message and
+> drops an event whose id callable raised exactly as `SQSSink` does, through `sinks/_fifo.py`, the
+> one module the two FIFO sinks share; the hold decision above names both.
 
 SPEC-070 widens the first two of the original three cases. An **SNS sender fault** joins the SQS
 one — the same required `SenderFault` field, read through the same `sinks/_classify.sender_fault`,
@@ -1889,15 +1893,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   answered "Lost, flush falsy (Recommended)". **Closed by** the engine reading such an event
   `UNKNOWN`, at the cost that a destination which times out every reply no longer fails its
   batches.
-- **`SNSSink` cannot write an SNS FIFO topic** (SPEC-095, Out of Scope; invariant 7). `SNSSink`
-  sends no `MessageGroupId`: each entry is an `Id` and a `Message` alone (`sinks/sns.py:495-501`
-  at `3da245a9`), and SNS refuses a FIFO publish without one:
-  "You must associate a non-empty MessageGroupId with a message. If you do not provide a
-  MessageGroupId, the action fails" (SNS `PublishBatchRequestEntry`, read on 2026-11-16). So every
-  batch to a FIFO topic is refused, and the topic's de-duplication on `MessageDeduplicationId`
-  is out of reach. Asked whether SPEC-095 should add it, Andrew answered "Follow-up spec
-  (Recommended)" on 2026-11-16. **Closed by** the follow-up spec of the 2026-11-14 audit arc that
-  adds the topic's group and de-duplication ids, drafted as SPEC-100.
+- ~~**`SNSSink` cannot write an SNS FIFO topic**~~ → **closed by SPEC-100** (2026-11-24); struck and moved under *Resolved*.
 - ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~ → **closed by SPEC-095**; struck and moved under *Resolved*.
 - ~~**An AWS batch reply that names no failure is read as full delivery**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
 - ~~**`SentrySink`'s SDK backend counts an event the SDK discarded as sent**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
@@ -2029,8 +2025,42 @@ an item leaves this list when a spec closes it, not because the arc names it.
   **Closed by** reading a raise from getting the channel as not landed (`reached=False`), held by
   a test whose channel open raises.
 
+- **`SQSSink`'s class docstring lists none of its three FIFO attributes** (found by SPEC-100's
+  completion ritual, 2026-11-24; present on `5d0e7f68`, before SPEC-100; unfixed under the audit
+  scope freeze; it serves no invariant, since the rule is CLAUDE.md's docstring convention). `SQSSink.__init__` stores `fifo`, `message_group_id` and
+  `message_deduplication_id` as public attributes, and the class docstring's `Attributes:` names
+  `MAX_BYTES`, `max_message_bytes`, `log_foundry_counters`, `dropped_oversized` and
+  `dropped_unadjudicated` only, while `SNSSink`'s, written by SPEC-100, lists the three. CLAUDE.md
+  asks a class for `Attributes:` naming its public attributes, and `docstring-lint.py` does not
+  check that half. **Closed by** adding the three to `SQSSink`'s `Attributes:`, worded as
+  `SNSSink`'s are, with "queue" for "topic".
+
 ### Resolved
 
+- ~~**`SNSSink` cannot write an SNS FIFO topic**~~ (SPEC-095, Out of Scope; invariant 7). `SNSSink`
+  sends no `MessageGroupId`: each entry is an `Id` and a `Message` alone (`sinks/sns.py:495-501`
+  at `3da245a9`), and SNS refuses a FIFO publish without one:
+  "You must associate a non-empty MessageGroupId with a message. If you do not provide a
+  MessageGroupId, the action fails" (SNS `PublishBatchRequestEntry`, read on 2026-11-16). So every
+  batch to a FIFO topic is refused, and the topic's de-duplication on `MessageDeduplicationId`
+  is out of reach. Asked whether SPEC-095 should add it, Andrew answered "Follow-up spec
+  (Recommended)" on 2026-11-16. **Closed by** the follow-up spec of the 2026-11-14 audit arc that
+  adds the topic's group and de-duplication ids, drafted as SPEC-100.
+  → **closed by SPEC-100** (2026-11-24): `SNSSink` takes `fifo`, `message_group_id` and
+  `message_deduplication_id`, and a `.fifo` topic ARN selects FIFO behaviour. Each entry then
+  carries a `MessageGroupId`, the event's `trace_id` by default, and a `MessageDeduplicationId`,
+  its `log_id` by default, both resolved once per run and resent unchanged, costed against the
+  message limit, and a later message of a group is held behind an earlier one as `SQSSink` holds
+  it, all through `sinks/_fifo.py`, the one module both FIFO sinks use. Re-run at `b145f9a2` with
+  moto (`spec100_moto_shapes.py` case A), both `emit`s to a FIFO topic returned with nothing
+  lost. **The spec found and closed a silent loss on `SQSSink` too** (FR-003): a
+  de-duplication id longer than 128 characters was cut to its first 128, so two events whose ids
+  shared that prefix went out under one id and the queue did not deliver the second. Case F, two
+  events whose callable answered 200 characters sharing the first 128, read on `03dbf502`: the
+  FIFO queue held 1 of 2, the sink counted `SinkLosses(dropped=0, failed=0)` and wrote no line. On
+  `b145f9a2` the over-long id is sent as the SHA-256 hex digest of the stripped answer, and the
+  queue held 2 of 2 with `SinkLosses(dropped=0, failed=0, resent=0)`. A FIFO `SNSSink` still
+  declares no idempotency (*No shipped sink declares itself idempotent*).
 - ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~
   (found during SPEC-095's build; invariants 2 and 11). `_engine._run` commits a run's
   `resent_events` and its resend line in the same `Deferral` as its `failed_events` and

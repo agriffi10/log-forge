@@ -79,7 +79,8 @@ by SPEC-058: five losses are counted but never retried by the sink — an unadju
 response (since SPEC-070, a Kinesis or Firehose failed count its coded records contradict among
 them), an SQS or SNS sender fault (SNS since SPEC-070), an oversized event (SPEC-018, SPEC-016,
 SPEC-017), a wrapper's or
-an SQS id callable's per-event failure when its siblings were delivered, and an event a sink
+an SQS or SNS FIFO id callable's per-event failure when its siblings were delivered (SNS since
+SPEC-100, through the module the two FIFO sinks share), and an event a sink
 cannot encode — first an unrenderable HTTP event (SPEC-058), and since SPEC-069 an event any
 record-building sink's encode step refuses — because a retry would re-deliver what landed beside
 them, or fail the same way.
@@ -243,7 +244,7 @@ roster derived from the tree) and `tests/test_sinks_mongodb_resend.py` (a duplic
 `tests/test_conformance.py` that every shipped sink, per constructor variant, under each fault of
 its acknowledgement class and on the worker path only, leaves what its fake backend holds matching
 what it reported, event by event for the variants whose judged sink runs the delivery engine
-(41 of 53 at SPEC-092, 45 of 55 since SPEC-093 and SPEC-094) and per batch for those whose judged
+(41 of 53 at SPEC-092, 45 of 55 at SPEC-093 and SPEC-094, 46 of 56 since SPEC-100) and per batch for those whose judged
 sink offers no `deliver`, with a line for every batch that
 lost or left an event ambiguous and SPEC-088's ledger balanced, except the rows pinned to §12
 open items and the permitted departures (SPEC-092); `tests/test_socket_close_corpus.py` and
@@ -611,8 +612,10 @@ record-building sink, each event counted `dropped`; since SPEC-073 also an HTTP 
 chunk's request cannot be built — a `_body`, `_prepare` or `_apply_auth` that raises, or a
 `Request` that cannot be built — each event counted `dropped` on `_unrenderable`; `NATSSink` and `SentrySink`, the declared
 exceptions, still count such an event `failed` and raise for a batch of nothing else), a wrapper
-batch of one failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized
-or unencodable event (SPEC-058, SPEC-069), and an SQS or SNS batch rejected wholly as sender faults
+batch of one failure and otherwise deliberate drops, an SQS or SNS FIFO batch of an id failure and
+an oversized or unencodable event (SPEC-058, SPEC-069; SNS since SPEC-100, whose FIFO `SNSSink`
+given one event whose id callable raises and one oversized event returns with both counted in
+`dropped` and nothing sent), and an SQS or SNS batch rejected wholly as sender faults
 (SPEC-016 for SQS, SPEC-070 FR-003 for SNS). Nothing in such a batch is helped by a retry, which is
 the test this page's rule turns on. So a `_bulk` server answering every POST with a `2xx` the sink
 cannot adjudicate — a body it cannot read or that is not an object, since SPEC-093 an object
@@ -739,7 +742,7 @@ announced, the calls each shipped sink marks, and `MongoDBSink`'s duplicate `_id
 resend read as delivery, SPEC-095), and `tests/test_conformance.py` (every shipped sink, per
 constructor variant and on the worker path only, reporting landed only what its fake backend holds and lost only what it does
 not, per event for the variants whose judged sink runs the delivery engine (41 of 53 at SPEC-092,
-45 of 55 since SPEC-093 and SPEC-094) and per batch for those that offer no `deliver`, with an
+45 of 55 at SPEC-093 and SPEC-094, 46 of 56 since SPEC-100) and per batch for those that offer no `deliver`, with an
 outcome it could not know read as ambiguous and refused
 where the call was knowable, except the rows pinned to §12 open items and the permitted
 departures, SPEC-092), and `tests/test_sentry_discard.py` (a batch with a discard and nothing sent
@@ -952,7 +955,11 @@ the Sentry DSN and an argument the selected backend cannot consume, and floored 
 SPEC-066 refused a non-`int` at every `int` floor and range check in a sink constructor and the
 worker, and a `max_retry_after` that is not an `int` or `float`, judged before any client is
 built, and gave `flush()` and `shutdown()` a verdict for their `timeout` — `inf` waits unbounded,
-a NaN or non-number is refused at the call).
+a NaN or non-number is refused at the call; SPEC-100 refused, on `SQSSink` and `SNSSink`, a `fifo`
+that is not a `bool` or `None` with `TypeError`, and with `ValueError` `fifo=True` on a queue URL
+or topic ARN not ending in `.fifo` and a `message_group_id` or `message_deduplication_id` on a sink
+that is not FIFO, each before any client is built, through one judgement both sinks call,
+`sinks/_fifo.judge`).
 
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
@@ -970,6 +977,9 @@ cannot see are accepted and recurse (`architecture.md` §13, the sink-loop item)
 `GooglePubSubSink`'s `max_pending` is accepted, validated and floored and, since SPEC-094, bounds
 nothing, because each round gives every future its verdict and none awaits one between emits; it is
 frozen 1.x surface, so it is kept rather than refused, and its docstring says it has no effect.
+`fifo=False` on a queue URL or topic ARN ending in `.fifo` is accepted on `SQSSink` and `SNSSink`,
+because AWS requires every FIFO name to end so but does not say a standard name cannot; on a real
+FIFO destination its every send fails, counted and announced (SPEC-016 FR-006, SPEC-100 FR-001).
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and, since SPEC-065, the four payload ceilings (a
 non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.py` for what
@@ -989,6 +999,10 @@ sinks' `auth` and the seven callable arguments, and `tests/test_type_door_roster
 the doors from the AST and fails naming one that asks the value rather than its type;
 `tests/test_socket_ack_check.py` and `tests/test_rabbitmq_confirm.py` for `ack_wait` and `confirm`
 refused when not a `bool`, and `ack_wait` for UDP or beside `url=` (SPEC-093);
+`tests/test_sinks_sns_fifo.py` and `tests/test_sinks_sqs_fifo.py` for `fifo=True` without the
+`.fifo` suffix refused and `fifo=False` on a `.fifo` name accepted, the first file and
+`tests/test_sinks_sqs_id_failures.py` for an id argument on a standard destination refused, and
+`tests/test_type_doors.py` for a `fifo` that is not a `bool`, each on both FIFO sinks (SPEC-100);
 `tests/test_sinks_args.py` for the build options refused beside an injected client, and
 `tests/test_injected_client_roster.py`, which derives each constructor's build options and fails
 naming one ignored beside it; `tests/test_extras_sites.py` for a missing extra refused at the

@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "An argument door asks the type, never the value"
-description: "an argument door — `configure()`'s stamps and ceilings, the `_retry` validators, `OTLPSink`'s endpoint, `_args.require_callable` — tests `issubclass(type(v), T)`, never `isinstance`, and names the type as `_diag._STR_STR(_diag._STORED_NAME(type(v)))`, never `type(v).__name__`, so no `__class__` or metaclass `__name__` the caller wrote runs and the message names the argument and the real class. The only `isinstance` on a door's parameter is `decorator._refuse_unusable`'s two kept proxy tests, held as an exact multiset; `@trace`'s half is SPEC-080's decision in `trace-model`. A guard holds the doors as an exact set of ten. (SPEC-071)"
+description: "an argument door — `configure()`'s stamps and ceilings, the `_retry` validators, `OTLPSink`'s endpoint, `_args.require_callable`, `_fifo.judge` — tests `issubclass(type(v), T)`, never `isinstance`, and names the type as `_diag._STR_STR(_diag._STORED_NAME(type(v)))`, never `type(v).__name__`, so no `__class__` or metaclass `__name__` the caller wrote runs and the message names the argument and the real class. The only `isinstance` on a door's parameter is `decorator._refuse_unusable`'s two kept proxy tests, held as an exact multiset; `@trace`'s half is SPEC-080's decision in `trace-model`. A guard holds the doors as an exact set, written out by name in `tests/test_type_door_roster.py`. (SPEC-071, SPEC-100)"
 ---
 
 **A door that refuses an argument by its type decides the type by asking `type`, never the
@@ -9,7 +9,7 @@ value.** `isinstance(v, T)` falls back to reading `v`'s own `__class__` when the
 fails, and `type(v).__name__` consults a metaclass `__name__` property, so both run code the caller
 supplied and both can lie. Invariant 13 promises a bad argument is refused where it is written,
 with the argument named. Probed at `4fbfd60`, a lying value broke the "named" half at every one of
-the seven doors this decision covers: `configure(service=x)` with `x`'s `__class__` property
+the doors this decision covered then: `configure(service=x)` with `x`'s `__class__` property
 returning `str` raised `descriptor '__str__' requires a 'str' object but received a 'Claims'`,
 which does not name `service`; a raising `__class__` raised its own exception out of every door;
 and a metaclass `__name__` property returning `"str"` gave `service must be a str, got str`. Every
@@ -50,13 +50,15 @@ Basic auth only when it yields two real `str`, its `__iter__` run once, at const
 copied the same way, so no `str`-subclass method runs on a request. A one-shot iterable `auth`,
 which this spec left passing construction and failing every `emit`, is now unpacked once at
 construction (*`auth` beside an `Authorization` header is refused, never resolved by precedence*).
-`SQSSink`'s constant group id is told apart by real type and read through `str.__str__`, at the
-constructor and per event, so a callable claiming `str` is still asked and a `str` subclass's own
+The FIFO sinks' constant group id is told apart by real type and read through `str.__str__`, at the
+constructor and per event (`sinks/_fifo.judge` and `_fifo.group_id`, since SPEC-100 for both
+`SQSSink` and `SNSSink`), so a callable claiming `str` is still asked and a `str` subclass's own
 `strip` never runs.
 
 **The guard.** `tests/test_type_door_roster.py` derives from the AST of `src/log_foundry/**/*.py`.
 A door is a function raising a `TypeError` that names, through the stored name, the type of one of
-its parameters other than `self` or `cls`; the derived set must equal ten written out by name, so a
+its parameters other than `self` or `cls`; the derived set must equal the set written out by name in
+that test, `EXPECTED_DOORS`, so a
 door removed, renamed or inlined back reddens by name and a new one is a visible edit. It reports a
 `raise TypeError` formatting `type(x).__name__` or `x.__class__.__name__` for a non-`self` `x`,
 with no exemption: the two raises once exempt, `sanitize._coerce_unbounded` and
@@ -92,6 +94,15 @@ door without adding it to the guard's pinned set; or give the guard an exemption
 multiset. (SPEC-071, invariants 13 and 6)
 
 ## History
+
+### 2026-11-24
+
+- **Refined** by SPEC-100 FR-001. `sinks/_fifo.judge`, the one judgement of `SQSSink`'s and
+  `SNSSink`'s FIFO arguments, is a door: it refuses a `fifo` that is not a `bool` or `None` with
+  `issubclass(type(fifo), bool)` and names the type through the stored name, so the guard's pinned
+  set gains it. The fence and the guard paragraph stated the set's size, a number the test had
+  already outgrown; both now name the set by where it is written out, with no count, since a
+  count goes stale at every new door and the set itself is what the guard compares.
 
 ### 2026-11-15
 

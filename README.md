@@ -947,13 +947,14 @@ adjudicate is also counted on `.dropped_unadjudicated`, which on `SQSSink` and `
 Each makes **one call per chunk per round**: a chunk that failed retryably is re-sent in the next
 round, after the round's later chunks, and only the entries that failed are re-sent — so one entry
 that keeps failing costs only itself, within `max_retries + 1` rounds of your own for each of the
-worker's attempts. An SQS **FIFO** message group keeps its order for `max_retries + 1` sends of an
-earlier message, as before.
+worker's attempts. A **FIFO** message group, on an SQS FIFO queue or an SNS FIFO topic, keeps a
+later call from overtaking an earlier message of the group for that message's `max_retries + 1`
+sends, as `SQSSink` did before.
 
 | Sink | Import from | Configure |
 |---|---|---|
 | `SQSSink` | `log_foundry.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3, fifo=None, message_group_id=None, message_deduplication_id=None, max_message_bytes=None)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages. Standard **and** FIFO queues |
-| `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3, max_message_bytes=None)` — standard topics; a FIFO topic is not supported yet, since the sink sends no `MessageGroupId`, which SNS requires there |
+| `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3, max_message_bytes=None, fifo=None, message_group_id=None, message_deduplication_id=None)` — standard **and** FIFO topics |
 | `KinesisSink` | `log_foundry.sinks.kinesis` | `KinesisSink(stream_name, *, partition_key_field="trace_id", max_retries=3)` |
 | `FirehoseSink` | `log_foundry.sinks.firehose` | `FirehoseSink(delivery_stream, *, max_retries=3)` |
 
@@ -1003,6 +1004,13 @@ by default for the same reason.) The **`MessageDeduplicationId`** defaults to th
 already a per-event UUID, so SQS's five-minute deduplication window never collapses two distinct
 records.
 
+A **de-duplication id longer than 128 characters**, which only your own callable can produce, is
+sent as the SHA-256 hex digest of the id with surrounding whitespace stripped: 64 characters,
+different for different ids, so two events whose ids share their first 128 characters are never
+sent under one id and discarded as duplicates. An id of up to 128 characters is sent as it is, and
+a blank one is replaced by a fresh random id. The group id is cut to its first 128 characters,
+which can merge two groups but never loses an event.
+
 Override the group with a constant or a callable:
 
 ```python
@@ -1015,14 +1023,20 @@ SQSSink(queue_url=FIFO_URL,
         message_group_id=lambda e: str(e["fields"].get("tenant_id") or e["trace_id"]))
 ```
 
-Pass `fifo=True` or `fifo=False` to override the URL-based detection. Standard queues are entirely
-unaffected — their messages carry neither parameter.
+`fifo=False` overrides the detection for a standard queue whose name happens to end in `.fifo`.
+`fifo=True` is accepted only on a URL that ends in `.fifo`, since AWS requires the suffix on every
+FIFO queue, and anything other than `True`, `False` or `None` is refused. Standard queues are
+entirely unaffected — their messages carry neither parameter — and passing `message_group_id` or
+`message_deduplication_id` for a standard queue is refused when the sink is built, rather than
+ignored. The same rules hold for `SNSSink` and topic ARNs.
 
 Two things worth knowing:
 
 - **Ordering holds for the sink's own retries, and is best-effort past them.** A message is held
-  back while an earlier message of its group is still being retried within `max_retries + 1`
-  sends; once that one has used its sends, a later message may land first. Holding a group for
+  back from a later call while an earlier message of its group is still being retried within
+  `max_retries + 1` sends; once that one has used its sends, a later message may land first.
+  Inside one call the order is the service's: if an earlier entry of a call fails, what happens
+  to that call's later entries of its group is up to the service, and they may land ahead of it. Holding a group for
   the worker's whole budget would trade log delivery for ordering you can rebuild from
   `timestamp`, so the sink doesn't. The delivery's last round holds nothing, so a waiting message
   is sent right after the earlier one's final send. A delivery the worker ends early, or a direct
@@ -1030,6 +1044,29 @@ Two things worth knowing:
   group.
 - **FIFO queues cap throughput** at 300 messages/second (3,000 with batching), or higher in
   high-throughput mode. That's queue-side configuration, not something the library sets.
+
+##### FIFO topics
+
+`SNSSink` writes SNS FIFO topics the same way. A topic ARN ending in `.fifo` switches it into FIFO
+mode, and each message then carries a `MessageGroupId`, the event's `trace_id` by default, and a
+`MessageDeduplicationId`, the event's `log_id` by default. `message_group_id` and
+`message_deduplication_id` take the same constants and callables as on `SQSSink`, and a later
+message of a group is held behind an earlier one exactly as above:
+
+```python
+from log_foundry.sinks.sns import SNSSink
+SNSSink(topic_arn="arn:aws:sns:us-east-1:123456789012:logs.fifo")
+```
+
+Each message's two ids are worked out once per delivery and sent unchanged on every retry, so when
+a reply is lost and the sink sends a message again, the topic can discard the copy. It does that
+only within its de-duplication interval, 5 minutes at least, and, when the topic's
+`FifoThroughputScope` is `MessageGroup`, only for a copy with the same group id as well. A callable
+id is asked once per event per delivery, so it stays the same across the library's own retries,
+but not across a batch you send again yourself, or that a `MultiSink` around the sink sends again:
+each `emit` asks it afresh, so a callable that answers differently each time gives the copy a new
+id, and the topic keeps both. The default `log_id` is the same every time. Both ids count toward
+the message limit, beside the body. The sink still counts every such resend in `.resent`.
 
 #### Queue & stream
 
@@ -1387,8 +1424,8 @@ class MyBatchSink:
 - `read_deliver(sink)` returns a sink's bound `deliver` when the library would use it and `None`
   otherwise, for a wrapper that wants to know. Nothing changes for a sink that does not add it.
 - **A direct `deliver(batch)` call outside the library's delivery is one attempt with no memory.**
-  A loop of your own calling it sees a sink's still-failing or held line on every call, and an
-  `SQSSink` FIFO message held behind an earlier one is never released. To get the retries, call
+  A loop of your own calling it sees a sink's still-failing or held line on every call, and a
+  FIFO `SQSSink` or `SNSSink` message held behind an earlier one is never released. To get the retries, call
   `emit_via_deliver(sink, batch)` instead.
 
 ### Flushing and shutdown
@@ -1499,7 +1536,7 @@ refusal may be backpressure one layer further out than the worker's, or a miscon
 stderr line carries the exception type that distinguishes them. Every one of these drops is
 counted only when the sink's `emit` returns, so a batch the worker retries counts each drop once,
 and one it abandons is counted by the worker alone. And `TransformSink`,
-`FilteringSink`, a FIFO `SQSSink` and the HTTP sinks count an event that your own code — the
+`FilteringSink`, a FIFO `SQSSink` or `SNSSink` and the HTTP sinks count an event that your own code — the
 transform, the predicate, an id callable — or the sink's render failed on, dropped alone so the
 rest of its batch is still delivered, and every other sink that builds a record per event does
 the same for an event it cannot encode (`NATSSink` and `SentrySink` count that one in `failed`
@@ -1517,8 +1554,8 @@ batch given up on for good.
 `sink.resent` is not a loss. It counts the events a shipped sink's delivery engine sent again after
 a send that may have landed them — a timeout, a dropped connection or a `5xx` after the request
 left — so each may be held twice at the destination, and a consumer can de-duplicate on the
-event's `log_id`. It is an upper bound for those resends: a FIFO queue inside its de-duplication
-interval, or a client that retried inside the call and never landed anything, adds no copy but is
+event's `log_id`. It is an upper bound for those resends: a FIFO queue or topic inside its
+de-duplication interval, or a client that retried inside the call and never landed anything, adds no copy but is
 counted. It does not see every copy, though. A client library's own retries inside a call that
 then returned, an entry a reply names as failed after an earlier attempt inside the same call had
 landed it, the worker resending a whole batch to a sink with no `deliver`, and a `PostgresSink` on
