@@ -404,7 +404,7 @@ def test_a_callable_or_none_is_still_accepted_where_optional(boto3: list[str], v
     FilteringSink(MemorySink(), predicate=value)
     HTTPSink(URL, opener=value)
     CallbackSink(lambda batch: None, on_close=value)
-    SQSSink("https://q", message_group_id=value, message_deduplication_id=value)
+    SQSSink("https://q.fifo", message_group_id=value, message_deduplication_id=value)
 
 
 @pytest.mark.parametrize("value", [lambda e: e, _Call()], ids=["lambda", "class"])

@@ -22,7 +22,7 @@ from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_faul
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._fifo import DedupIdSource, GroupIdSource, plan_round
+from log_foundry.sinks._fifo import DedupIdSource, GroupIdSource, judge, plan_round
 from log_foundry.sinks._retry import exact_int, floor_count
 from log_foundry.sinks._rounds import (
     Called,
@@ -157,18 +157,18 @@ class SQSSink:
             ``max_retries + 1`` sends of a message. Anything but an ``int`` is refused
             with ``TypeError`` (SPEC-066 FR-001), before any client is built; a ``bool`` or
             ``int`` subclass is read as the ``int`` it holds.
-          fifo: Overrides the queue type. AWS requires every FIFO queue name to end in
-            ``.fifo``, so the suffix is a contract rather than a guess, but an explicit flag
-            still wins.
-          message_group_id: A constant or a callable deriving the group, or ``None`` to group by
-            ``trace_id``.
+          fifo: ``True``, ``False`` or ``None`` for the queue URL's ``.fifo`` suffix. AWS requires
+            every FIFO queue name to end in ``.fifo``, so ``fifo=True`` on a URL without it is
+            refused, and ``fifo=False`` overrides a ``.fifo`` name (SPEC-100 FR-001).
+          message_group_id: The group itself as a ``str``, a callable deriving it, or ``None`` to
+            group by ``trace_id``; on a FIFO queue only.
           message_deduplication_id: A callable deriving the dedup id, or ``None`` to use the
-            event's ``log_id``.
+            event's ``log_id``; on a FIFO queue only.
           max_message_bytes: The most bytes one message may cost, and the most a request's
             messages may cost together, or ``None`` for :attr:`MAX_BYTES` (SPEC-096 FR-001). Pass
             the queue's ``MaximumMessageSize``, in bytes: ``1048576`` for a queue created at the
-            service default. It is judged after every other argument and before any client is
-            built, read through ``exact_int``, so a ``bool`` or ``int`` subclass is judged and
+            service default. It is judged after every argument a 1.x call could pass, before the
+            FIFO arguments' :func:`~log_foundry.sinks._fifo.judge` and any client is built, read through ``exact_int``, so a ``bool`` or ``int`` subclass is judged and
             stored as the exact ``int`` it holds, and refused outside 1,024 to 1,048,576, the
             range a queue's own limit takes, rather than floored, since a new argument has no
             working configuration to keep.
@@ -181,10 +181,13 @@ class SQSSink:
             is not a ``str``, a callable or ``None``, or ``message_deduplication_id`` is neither
             callable nor ``None`` (SPEC-071 FR-005). Both are judged on a standard queue too,
             which never reads either: the value is outside the declared type. Also if
-            ``max_message_bytes`` is neither ``None`` nor an ``int`` (SPEC-096).
+            ``max_message_bytes`` is neither ``None`` nor an ``int`` (SPEC-096), or ``fifo`` is
+            neither a ``bool`` nor ``None`` (SPEC-100 FR-001), where 1.x read it by truthiness.
           ValueError: If a constant group id is blank, or if ``max_message_bytes`` holds a number
             below 1,024 or above 1,048,576; the message names the exact number, an integer too
-            long to print as ``<int: ~N digits>``.
+            long to print as ``<int: ~N digits>``. Also, through ``_fifo.judge`` (SPEC-100
+            FR-001), if ``fifo=True`` names a URL not ending in ``.fifo``, or an id argument is
+            passed to a queue that is not FIFO, which 1.x ignored.
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
         owner = _diag.type_name(self)
@@ -205,12 +208,15 @@ class SQSSink:
                     f"SQSSink max_message_bytes must be from {_LIMIT_FLOOR} to "
                     f"{_SERVICE_MAX_BYTES} bytes, got {_int_text(max_message_bytes)}"
                 )
+        is_fifo = judge(
+            owner, "queue", "queue_url", queue_url, fifo, message_group_id, message_deduplication_id
+        )
         if client is None:
             client = import_extra("boto3", "aws").client("sqs")
         self.queue_url = queue_url
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
+        self.fifo = is_fifo
         self.message_group_id = message_group_id
         self.message_deduplication_id = message_deduplication_id
         self.max_message_bytes = max_message_bytes

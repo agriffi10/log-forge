@@ -17,10 +17,10 @@ A *door* is a function raising a `TypeError` that names the type of one of its p
    rewritten earlier test, or a second copy of an exempt one, is still reported. A read of
    `p.__class__` anywhere in a door's body (`if not value.__class__ is int:`) is reported too,
    since it asks the value what it is by another spelling.
-3. The derived set of doors equals, exactly, the thirteen written out below (the ten of `2368ade3`,
-   SPEC-072's `_engine.emit_via_deliver` and SPEC-079's `_sink_arg.require_sink` and
-   `config._require_factory`): a door removed, renamed or inlined back reddens by
-   name, and a new one is a visible edit.
+3. The derived set of doors equals, exactly, the fourteen written out below (the ten of
+   `2368ade3`, SPEC-072's `_engine.emit_via_deliver`, SPEC-079's `_sink_arg.require_sink` and
+   `config._require_factory`, and SPEC-100's `sinks._fifo.judge`): a door removed, renamed or
+   inlined back reddens by name, and a new one is a visible edit.
 
 **What it does not see**, each a deliberate edge its corpus asserts silence on: a type named by a
 helper (`raise TypeError(_type_name(value))`), a message held in a local and raised later, a
@@ -59,10 +59,12 @@ EXPECTED_DOORS = frozenset(
         "sinks._engine.emit_via_deliver",
         "_sink_arg.require_sink",
         "config._require_factory",
+        "sinks._fifo.judge",
     }
 )
-"""The thirteen doors: SPEC-080's two, SPEC-071's seven, ``require_callable``, SPEC-072's adapter,
-and SPEC-079's two, ``_sink_arg.require_sink`` and ``config._require_factory``.
+"""The fourteen doors: SPEC-080's two, SPEC-071's seven, ``require_callable``, SPEC-072's adapter,
+SPEC-079's two, ``_sink_arg.require_sink`` and ``config._require_factory``, and SPEC-100's
+``_fifo.judge``, which refuses a ``fifo`` that is not a ``bool`` by its stored type name.
 
 ``emit_via_deliver`` names ``type(sink)`` in its two ``TypeError`` messages, and routes ``batch`` on
 its real type through ``_snapshot``, so it contributes both kinds of plant to the sweep below.

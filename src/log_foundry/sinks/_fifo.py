@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import NamedTuple, Protocol, cast
 
 from log_foundry import _diag
+from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._engine import run_context
 from log_foundry.sinks.verdict import Outcome
@@ -118,6 +119,79 @@ class PrepareOne(Protocol):
         Raises:
           None. A ``BaseException`` from a caller's callable propagates.
         """
+
+
+def judge(
+    owner: str, kind: str, name: str, destination: str, fifo: object, group: object, dedup: object
+) -> bool:
+    """Judges the three FIFO arguments against the destination and returns the sink's type.
+
+    Both FIFO sinks call this once in their constructor, after every refusal the constructor made
+    before SPEC-100 and before any client is built, so a call refused there keeps its exact error
+    (SPEC-100 FR-001). **The types are judged first, then the values**: the id sources' types,
+    as :func:`~log_foundry.sinks._args.require_callable` asks them, then ``fifo``'s; then a blank
+    constant group, ``fifo=True`` without the suffix, and an id argument on a standard
+    destination. On ``SQSSink`` the first and third were already asked by its constructor, so
+    here they cannot fire there.
+
+    ``fifo`` is asked its type, never its truth or its ``__class__`` (SPEC-071 FR-005): anything
+    but a ``bool`` or ``None`` is refused, and since ``bool`` cannot be subclassed only ``True``
+    and ``False`` pass. ``fifo=True`` on a name not ending in ``.fifo`` is refused because AWS
+    requires every FIFO queue and topic name to end so, so that sink could never deliver.
+    ``fifo=False`` on a ``.fifo`` name is accepted, since AWS does not say a standard name cannot
+    end so (invariant 13's recorded exception). An id argument on a sink that is not FIFO is
+    refused, since a standard destination never reads it and accepting it would ignore an
+    argument because another was given (invariant 13).
+
+    Args:
+      owner: The constructing class's name, for the messages.
+      kind: ``"queue"`` or ``"topic"``, for the messages.
+      name: The destination's keyword, ``"queue_url"`` or ``"topic_arn"``, for the messages.
+      destination: The queue URL or topic ARN.
+      fifo: ``fifo`` as passed.
+      group: ``message_group_id`` as passed.
+      dedup: ``message_deduplication_id`` as passed.
+
+    Returns:
+      Whether the sink is FIFO: ``fifo`` when it is a ``bool``, otherwise whether the
+      destination's name ends in ``.fifo``.
+
+    Raises:
+      TypeError: For an id source outside its declared type, with ``require_callable``'s text, or
+        a ``fifo`` that is neither a ``bool`` nor ``None``, naming its real type.
+      ValueError: For a blank constant group id, ``fifo=True`` on a name not ending in ``.fifo``,
+        or an id argument passed to a sink that is not FIFO, naming each such argument.
+    """
+    require_callable(group, "message_group_id", owner, text=True)
+    require_callable(dedup, "message_deduplication_id", owner)
+    if fifo is not None and not issubclass(type(fifo), bool):
+        raise TypeError(
+            f"{owner} fifo must be a bool or None, not "
+            f"{_diag._STR_STR(_diag._STORED_NAME(type(fifo)))}"
+        )
+    if issubclass(type(group), str) and not _diag._STR_STR(cast("str", group)).strip():
+        raise ValueError(
+            "message_group_id must be a non-empty string; pass None to group by trace_id"
+        )
+    suffixed = destination.endswith(".fifo")
+    if fifo is True and not suffixed:
+        raise ValueError(
+            f"{owner} fifo=True needs a {name} ending in .fifo: AWS requires every FIFO {kind} "
+            "name to end so"
+        )
+    is_fifo = suffixed if fifo is None else fifo is True
+    if not is_fifo:
+        names = [
+            arg
+            for arg, value in (("message_group_id", group), ("message_deduplication_id", dedup))
+            if value is not None
+        ]
+        if names:
+            raise ValueError(
+                f"{owner} cannot apply {', '.join(names)} to a standard {kind}; drop it, or use "
+                f"a {name} ending in .fifo"
+            )
+    return is_fifo
 
 
 def bounded(raw: str, fallback: str) -> str:

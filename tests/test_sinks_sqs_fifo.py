@@ -7,6 +7,8 @@ test there runs on a standard queue and must keep passing byte-for-byte.
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 import pytest
 
@@ -61,8 +63,17 @@ def test_standard_url_is_not_fifo() -> None:
     assert SQSSink(STD_URL, client=RecordingClient()).fifo is False
 
 
-def test_explicit_fifo_true_forces_it_on_a_plain_url() -> None:
-    assert SQSSink(STD_URL, client=RecordingClient(), fifo=True).fifo is True
+def test_explicit_fifo_true_on_a_plain_url_is_refused_before_any_client(monkeypatch) -> None:
+    """SPEC-100 FR-001: ``fifo=True`` no longer forces FIFO on a name AWS cannot make FIFO."""
+    built: list[str] = []
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=built.append))
+    with pytest.raises(ValueError) as info:
+        SQSSink(STD_URL, fifo=True)
+    assert str(info.value) == (
+        "SQSSink fifo=True needs a queue_url ending in .fifo: AWS requires every FIFO queue "
+        "name to end so"
+    )
+    assert built == []
 
 
 def test_explicit_fifo_false_forces_it_off_on_a_fifo_url() -> None:

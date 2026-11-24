@@ -318,7 +318,10 @@ def _sinks() -> list[object]:
         OTLPSink("https://example.invalid/v1/logs", **platform),
         OTLPSink(),
         SentrySink("https://public@example.invalid/1", backend=_BACKEND),
-        SQSSink("https://sqs.invalid/q", message_group_id=_GROUP, message_deduplication_id=_DEDUP),
+        # SPEC-100 FR-001: the id arguments go to a FIFO queue; a standard one refuses them.
+        SQSSink(
+            "https://sqs.invalid/q.fifo", message_group_id=_GROUP, message_deduplication_id=_DEDUP
+        ),
         # SPEC-096 FR-001: the message limit, an int or None, on both AWS queue sinks.
         SQSSink("https://sqs.invalid/q", max_message_bytes=262144),
         SQSSink("https://sqs.invalid/q", max_message_bytes=None),
