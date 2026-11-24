@@ -21,6 +21,7 @@ from log_foundry.sinks._rounds import (
     entry_ids,
     mark_sent,
     read_keyed,
+    sends_of,
     settle_keyed,
 )
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
@@ -72,16 +73,29 @@ class SNSSink:
     because the client is the caller's to release or the SDK's to reap, so a batch emitted
     afterwards still reaches the topic.
 
-
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
     destination has the batch, so nothing is queued locally between emits.
 
     **Its message limit is the caller's to set** (SPEC-096). Each run of ``emit`` reads one limit,
     used for every decision of every round of that run: ``max_message_bytes`` when it is not
     ``None``, otherwise :attr:`MAX_BYTES`, and then the smaller of that and the 1,048,576 bytes
-    any topic allows. A message whose UTF-8 body costs more is dropped, counted in
-    ``dropped_oversized`` and announced naming the limit, and a request's bodies together cost at
-    most the same limit, in UTF-8 bytes, as the topic itself counts them.
+    any topic allows. A message whose cost — its UTF-8 body and, on a FIFO topic, both ids — is
+    more is dropped, counted in ``dropped_oversized`` and announced naming the limit, and a
+    request's messages together cost at most the same limit, in UTF-8 bytes.
+
+    **Both topic types are supported** (SPEC-100), through ``sinks/_fifo.py``, the one mechanism
+    ``SQSSink`` uses for a FIFO queue, so the two FIFO sinks cannot diverge (invariant 6). A
+    ``.fifo`` topic ARN selects FIFO behaviour, which ``fifo=`` overrides. On a FIFO topic every
+    entry carries a ``MessageGroupId``, the event's ``trace_id`` by default, so a trace keeps its
+    order while traces travel in parallel, and a ``MessageDeduplicationId``, the event's
+    ``log_id`` by default, SPEC-095's idempotency key. Both are resolved once per run and every
+    resend carries them unchanged, so the topic can absorb a copy a lost reply caused for as long
+    as its de-duplication interval lasts; a de-duplication id too long to send goes out as its
+    SHA-256 digest (SPEC-100 FR-003). A later message of a group is held behind an earlier one as
+    ``SQSSink`` holds it (:meth:`_round`). A standard topic's entries carry ``Id`` and
+    ``Message`` and nothing else, as in 1.x. The sink still declares no idempotency: a resend
+    outside the topic's interval, or across a caller's own whole-batch resend with an unstable
+    id, is not absorbed.
 
     Attributes:
       MAX_BYTES: The message limit when ``max_message_bytes`` is ``None``, 262,144 bytes, 1.x's
@@ -92,6 +106,11 @@ class SNSSink:
       max_message_bytes: The message limit the caller passed, an exact ``int`` from 1,024 to
         1,048,576, or ``None`` for :attr:`MAX_BYTES`. It should be the topic's own
         ``MaximumMessageSize``: a larger value sends requests the topic refuses whole.
+      fifo: Whether the topic is FIFO, decided once at construction (SPEC-100 FR-001).
+      message_group_id: The group source the caller passed: a constant, a callable, or ``None``
+        for each event's ``trace_id``.
+      message_deduplication_id: The de-duplication source the caller passed: a callable, or
+        ``None`` for each event's ``log_id``.
       log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
       dropped_oversized: Events dropped for exceeding the message limit, counted only by a run
         that settled.
@@ -355,6 +374,18 @@ class SNSSink:
         rejection, any other failed entry ``RETRYABLE``, an unreadable reply ``UNKNOWN``, a raise
         ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
 
+        **A FIFO group is held as ``SQSSink`` holds one** (SPEC-100 FR-004), through the same
+        :func:`~log_foundry.sinks._fifo.hold` and :func:`~log_foundry.sinks._fifo.block`, called
+        through the module so one reading of the rule binds both sinks. On a FIFO topic, in every
+        round but the run's last (:attr:`RunContext.last`), a message waits, ``RETRYABLE`` and
+        unsent, while an earlier message of its group sent in an earlier call has neither landed
+        nor used its ``max_retries + 1`` sends; in the last round nothing is held, so a held
+        message follows its predecessor's final send. The hold keeps a later *call* from
+        overtaking an earlier message of its group; what the topic does with a call's later
+        entries when an earlier one fails is the topic's. A message a run leaves held is counted
+        ``failed`` with the line ``SNSSink, <n> attempt(s), held behind an earlier message of its
+        FIFO group``. A standard topic holds nothing.
+
         Args:
           batch: The events this round is offered.
 
@@ -378,13 +409,38 @@ class SNSSink:
         entries = cast("list[_fifo.Entry | None]", context.notes(self)["prepared_round"])
         lost = Lost(self)
         final: list[int] = []
+        blocked: set[str] = set()
+        sends = self.max_retries + 1
+        name = "SNSSink"
+        holding = self.fifo and not context.last
         for chunk in plan.chunks:
-            carried = [batch[item.position] for item in chunk]
+            held = (
+                _fifo.hold(
+                    chunk, blocked, [sends_of(self, batch[item.position]) for item in chunk], sends
+                )
+                if holding
+                else [False] * len(chunk)
+            )
+            sending = [item for item, hold in zip(chunk, held, strict=True) if not hold]
+            waiting = [batch[item.position] for item, hold in zip(chunk, held, strict=True) if hold]
+            lost.add(
+                waiting,
+                when=When.LAST,
+                key="held",
+                line=lambda n, count: _diag.lost(
+                    "message",
+                    count,
+                    f"{name}, {n} attempt(s), held behind an earlier message of its FIFO group",
+                ),
+            )
+            if not sending:
+                continue
+            carried = [batch[item.position] for item in sending]
             mark_sent(self, carried)
-            sent = self._send(chunk, entry_ids(self, carried))
+            sent = self._send(sending, entry_ids(self, carried))
             landed = settle_keyed(
                 self,
-                positions=[item.position for item in chunk],
+                positions=[item.position for item in sending],
                 carried=carried,
                 error=sent.error,
                 retryable=sent.retryable,
@@ -399,6 +455,10 @@ class SNSSink:
                 cached = entries[position]
                 if cached is not None:
                     cached.landed = True
+            if holding:
+                _fifo.block(
+                    sending, fates, [sends_of(self, event) for event in carried], blocked, sends
+                )
         lost.register()
         context.final_rejections(final)
         return Verdict(outcomes=tuple(fates))

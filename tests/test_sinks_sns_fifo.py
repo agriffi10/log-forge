@@ -569,3 +569,228 @@ def test_sns_fifo_raises_a_sink_delivery_error_when_nothing_lands() -> None:
     with pytest.raises(SinkDeliveryError):
         sink.emit(events(2))
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
+
+
+# --- FR-004: a FIFO group's later message waits behind an earlier one ------------------------
+
+
+class _Landing:
+    """A reply that fails chosen sends and records, in order, every entry that landed.
+
+    Attributes:
+      landed: Each landed event's ``i``, in the order the service accepted it.
+    """
+
+    def __init__(self, kind: str, fails: Callable[[int, int], bool]) -> None:
+        self.key = _body_key(kind)
+        self.fails = fails
+        self.landed: list[int] = []
+
+    def __call__(self, entries: list[dict[str, Any]], call: int) -> Any:
+        failed = []
+        for entry in entries:
+            i = json.loads(entry[self.key])["i"]
+            if self.fails(call, i):
+                failed.append({"Id": entry["Id"], "SenderFault": False, "Code": "T"})
+            else:
+                self.landed.append(i)
+        return {"Failed": failed}
+
+
+def _twelve() -> list[dict[str, object]]:
+    return [{"i": i, "log_id": f"l{i}", "trace_id": "t"} for i in range(12)]
+
+
+def _order(client: Client) -> list[list[int]]:
+    return [[e["i"] for e in call] for call in client.calls]
+
+
+@pytest.mark.parametrize("kind", SINKS)
+def test_twelve_events_of_one_group_land_the_second_call_after_the_failed_one(kind: str) -> None:
+    """FR-004 AC1 / invariant 2: the second call's two events wait until the failed first lands."""
+    reply = _Landing(kind, lambda call, i: call == 1 and i == 0)
+    sink, client = fifo_sink(kind, reply, message_group_id="A", max_retries=3)
+    sink.emit(_twelve())
+    assert _order(client) == [list(range(10)), [0], [10, 11]]
+    assert reply.landed == [*range(1, 10), 0, 10, 11], (
+        "a01-a09 share the failed entry's call and land first, as the service took them; the "
+        "hold keeps a10 and a11, a later call, behind a00"
+    )
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+def test_an_always_failing_first_entry_holds_the_second_call_until_the_last_round(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-004 AC3 / invariant 11: a10 and a11 go out with a00's final send, a00 counted once."""
+    reply = _Landing("SNSSink", lambda call, i: i == 0)
+    sink, client = fifo_sink("SNSSink", reply, message_group_id="A", max_retries=3)
+    sink.emit(_twelve())
+    assert _order(client) == [list(range(10)), [0], [0], [0, 10, 11]]
+    assert reply.landed == [*range(1, 10), 10, 11]
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+    assert lost(capsys.readouterr().err) == [
+        "log-foundry: lost 1 message(s); SNSSink, still failing after 4 attempt(s); abandoned"
+    ]
+
+
+def test_a_declined_run_counts_a_held_message_with_its_own_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-004 AC4 / invariant 11: a run the worker ends early names what it left held."""
+    reply = _Landing("SNSSink", lambda call, i: i == 0)
+    sink, client = fifo_sink("SNSSink", reply, message_group_id="A", max_retries=3)
+    _engine.run_delivery(
+        sink, _twelve(), worker_retries=0, stop=None, decline=lambda _longest: True
+    )
+    assert _order(client) == [list(range(10))], "the decline ends the run after round one"
+    assert sink.failed == 3
+    held = [line for line in lost(capsys.readouterr().err) if "held behind" in line]
+    assert held == [
+        (
+            "log-foundry: lost 2 message(s); SNSSink, 0 attempt(s), held behind an earlier "
+            "message of its FIFO group"
+        )
+    ]
+
+
+def test_a_standard_topic_holds_nothing() -> None:
+    """FR-004 AC5 / invariant 6: no group, no hold; the second call goes out in round one."""
+    reply = _Landing("SNSSink", lambda call, i: call == 1 and i == 0)
+    sink, client = std_sink("SNSSink", reply, max_retries=3)
+    sink.emit(_twelve())
+    assert _order(client) == [list(range(10)), [10, 11], [0]]
+    assert reply.landed == [*range(1, 12), 0]
+
+
+# --- FR-005: every FIFO refusal is read by the rules already in place -------------------------
+
+
+class _Refusing:
+    """A FIFO topic stand-in that raises ``InvalidParameter`` for a call missing a group id.
+
+    Attributes:
+      calls: Every call's entries.
+    """
+
+    def __init__(self, error: Callable[[], Exception]) -> None:
+        self.error = error
+        self.calls: list[list[dict[str, Any]]] = []
+
+    def publish_batch(
+        self, *, TopicArn: str, PublishBatchRequestEntries: list[dict[str, Any]]
+    ) -> Any:
+        self.calls.append([dict(e) for e in PublishBatchRequestEntries])
+        if any("MessageGroupId" not in e for e in PublishBatchRequestEntries):
+            raise self.error()
+        return {"Successful": [{"Id": e["Id"]} for e in PublishBatchRequestEntries], "Failed": []}
+
+
+def test_a_call_missing_its_group_is_rejected_at_the_first_attempt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-005 AC1 / invariant 13: ``fifo=False`` on a FIFO topic sends no group, and is refused."""
+    botocore = standins.install(monkeypatch, standins.BOTOCORE)
+    topic = _Refusing(lambda: standins.client_error(botocore, 400, "InvalidParameter"))
+    sink = SNSSink(FIFO_ARN, client=topic, fifo=False)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(events(3))
+    assert len(topic.calls) == 1, "a parameter every attempt carries unchanged is not retried"
+    assert sink.losses() == SinkLosses(dropped=0, failed=3, resent=0)
+    assert lost(capsys.readouterr().err) == [
+        "log-foundry: lost 3 message(s); SNSSink, 1 attempt(s), ClientError"
+    ]
+
+
+def test_a_dedup_id_refused_as_a_sender_fault_is_counted_once_and_returns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-005 AC2: a ``.fifo``-named standard topic refuses each entry's ids as the caller's fault."""
+
+    def standard(entries: list[dict[str, Any]], call: int) -> Any:
+        return {
+            "Successful": [],
+            "Failed": [
+                {"Id": e["Id"], "SenderFault": True, "Code": "InvalidParameter"}
+                for e in entries
+                if "MessageDeduplicationId" in e
+            ],
+        }
+
+    sink, client = fifo_sink("SNSSink", standard, max_retries=3)
+    sink.emit(events(3))
+    assert len(client.calls) == 1, "a sender fault is never resent"
+    assert sink.losses() == SinkLosses(dropped=0, failed=3, resent=0)
+    assert lost(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 3 message(s); SNSSink, rejected as invalid (first code: "
+            "InvalidParameter); not retried"
+        )
+    ]
+
+
+_ANSWERS: list[tuple[str, object]] = [
+    ("blank", "   "),
+    ("none", None),
+    ("int", 5),
+    ("bytes", b"abc"),
+    ("long", "z" * 200),
+]
+
+
+@pytest.mark.parametrize("which", ["group", "dedup", "both"])
+@pytest.mark.parametrize(("case", "answer"), _ANSWERS, ids=[c[0] for c in _ANSWERS])
+@pytest.mark.parametrize("kind", SINKS)
+def test_no_answer_sends_one_fifo_id_without_the_other(
+    kind: str, case: str, answer: object, which: str
+) -> None:
+    """FR-005 AC3 / invariant 2: an entry carries both FIFO ids or neither, whatever the answer."""
+
+    def source(event: dict[str, object]) -> Any:
+        return answer if event["i"] == 0 else f"ok{event['i']}"
+
+    kwargs: dict[str, Any] = {}
+    if which in ("group", "both"):
+        kwargs["message_group_id"] = source
+    if which in ("dedup", "both"):
+        kwargs["message_deduplication_id"] = source
+    sink, client = fifo_sink(kind, **kwargs)
+    sink.emit(events(2))
+    sent = [entry for call in client.entries for entry in call]
+    assert sent, "the good event is always sent"
+    for entry in sent:
+        assert ("MessageGroupId" in entry) == ("MessageDeduplicationId" in entry), entry
+        assert "MessageGroupId" in entry, "a FIFO topic's entry carries both"
+
+
+def test_a_throttled_call_resends_identical_ids_and_counts_resent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-005 AC4 / invariant 7: a raise may follow an attempt botocore retried and landed."""
+    botocore = standins.install(monkeypatch, standins.BOTOCORE)
+
+    def reply(entries: list[dict[str, Any]], call: int) -> Any:
+        if call == 1:
+            raise standins.client_error(botocore, 400, "ThrottlingException")
+        return {"Failed": []}
+
+    _asked, group, dedup = _counting()
+    sink, client = fifo_sink(
+        "SNSSink", reply, message_group_id=group, message_deduplication_id=dedup
+    )
+    sink.emit(events(2))
+    assert len(client.entries) == 2
+    for i in range(2):
+        first, resend = _ids_of(client, "SNSSink", i)
+        assert resend == first
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=2)
+
+
+def test_a_failed_entry_resends_and_counts_no_resent() -> None:
+    """FR-005 AC4: a ``Failed`` entry is the service's word that the attempt did not land."""
+    sink, client = fifo_sink("SNSSink", _fail_first_entry_of_first_call)
+    sink.emit(events(2))
+    assert _order(client) == [[0, 1], [0]]
+    first, resend = _ids_of(client, "SNSSink", 0)
+    assert resend == first
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=0)

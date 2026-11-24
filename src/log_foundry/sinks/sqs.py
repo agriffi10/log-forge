@@ -350,7 +350,9 @@ class SQSSink:
         so they are counted and announced only when ``emit`` returns — on the engine, only when
         the run settles. When every event's id callable raised, the round is a refusal carrying
         the first exception. Otherwise each chunk is sent once through :meth:`_send`, its FIFO
-        holds decided at send time (:func:`_hold`) in every round but the run's last
+        holds decided at send time by :func:`~log_foundry.sinks._fifo.hold` and
+        :func:`~log_foundry.sinks._fifo.block`, which ``SNSSink`` shares and both call through the
+        module (SPEC-100 FR-004), in every round but the run's last
         (:attr:`RunContext.last`), where every send is final and so nothing is held: a held
         message then follows its predecessor's final send in the same round, chunks going out in
         batch order, as 1.x sent it after giving up on that predecessor (SPEC-074 Q4). Each
