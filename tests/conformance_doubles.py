@@ -273,13 +273,14 @@ class SQSClient:
 
 
 class SNSClient:
-    """`publish_batch`, answered as SQS's batch call is."""
+    """`publish_batch`, answered as SQS's batch call is, with a FIFO topic's de-duplication."""
 
-    def __init__(self, backend: Backend) -> None:
-        """Keeps the row's backend.
+    def __init__(self, backend: Backend, *, fifo: bool = False) -> None:
+        """Keeps the backend, and a FIFO topic's de-duplication ids when `fifo` (SPEC-100).
 
         Args:
           backend: The row's backend.
+          fifo: Whether the topic de-duplicates.
 
         Returns:
           None.
@@ -288,6 +289,8 @@ class SNSClient:
           None.
         """
         self.backend = backend
+        self.fifo = fifo
+        self.dedup: set[str] = set()
 
     def publish_batch(self, *, TopicArn: str, PublishBatchRequestEntries: list[Any]) -> Any:
         """One batch call, answered as SQS's batch call is.
@@ -302,12 +305,30 @@ class SNSClient:
         Raises:
           Exception: botocore's refusal or timeout, as the fault script says.
         """
-        return _keyed(
-            self.backend,
-            PublishBatchRequestEntries,
-            "Message",
-            lambda es: [self.backend.take(tokens(e["Message"])) for e in es],
-        )
+        return _keyed(self.backend, PublishBatchRequestEntries, "Message", self._store)
+
+    def _store(self, entries: list[dict[str, Any]]) -> None:
+        """Takes each entry, once per de-duplication id on a FIFO topic, as `SQSClient` does.
+
+        AWS says a FIFO topic accepts a message whose de-duplication id it has seen within the
+        interval and does not deliver it; this double keeps the first copy for the row's life.
+
+        Args:
+          entries: The entries the call took.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for entry in entries:
+            key = entry.get("MessageDeduplicationId")
+            if self.fifo and key is not None:
+                if key in self.dedup:
+                    continue
+                self.dedup.add(key)
+            self.backend.take(tokens(entry["Message"]))
 
 
 def _keyed(
@@ -2717,6 +2738,26 @@ def _sqs(variant: Variant, backend: Backend, monkeypatch: pytest.MonkeyPatch) ->
     return sink, sink
 
 
+def _sns(variant: Variant, backend: Backend, monkeypatch: pytest.MonkeyPatch) -> Built:
+    """`SNSSink`, on a FIFO ARN with a de-duplicating double when its pick says `fifo` (SPEC-100).
+
+    Args:
+      variant: The row's variant, whose `fifo` pick is passed to the constructor.
+      backend: The row's backend.
+      monkeypatch: The row's patch, unused.
+
+    Returns:
+      The sink, twice.
+
+    Raises:
+      None.
+    """
+    fifo = bool(variant.picks["fifo"])
+    arn = "arn:aws:sns:r:1:t.fifo" if fifo else "arn:aws:sns:r:1:t"
+    sink = _sink_class("sns.SNSSink")(arn, client=SNSClient(backend, fifo=fifo), fifo=fifo)
+    return sink, sink
+
+
 def _socket_seams(backend: Backend, monkeypatch: pytest.MonkeyPatch, transport: str) -> None:
     """Patches the socket a socket-mode sink builds to the row's double.
 
@@ -3225,7 +3266,7 @@ def _factory(variant: Variant, backend: Backend, monkeypatch: pytest.MonkeyPatch
 
 BUILDERS: dict[str, Builder] = {
     "sqs": _sqs,
-    "sns": _injected("sns.SNSSink", SNSClient, "client", "arn:aws:sns:r:1:t"),
+    "sns": _sns,
     "mongodb": _injected(
         "mongodb.MongoDBSink", MongoClient, "client", database="d", collection="c"
     ),

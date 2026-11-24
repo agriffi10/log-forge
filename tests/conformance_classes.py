@@ -217,7 +217,8 @@ _CONFIRMED_ADDS: Mapping[Fault, str] = {
 VARIANTS: tuple[Variant, ...] = (
     _v("SQSSink", "standard", "keyed-reply", "sqs", picks={"fifo": False}),
     _v("SQSSink", "fifo", "keyed-reply", "sqs", picks={"fifo": True}),
-    _v("SNSSink", "", "keyed-reply", "sns"),
+    _v("SNSSink", "standard", "keyed-reply", "sns", picks={"fifo": False}),
+    _v("SNSSink", "fifo", "keyed-reply", "sns", picks={"fifo": True}),
     _v("MongoDBSink", "", "keyed-reply", "mongodb"),
     _v("KinesisSink", "", "positional-reply", "kinesis"),
     _v("FirehoseSink", "", "positional-reply", "firehose"),
@@ -550,7 +551,15 @@ PARAMETERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "RedisListSink": ("key", "client", "url", "max_retries", "maxlen"),
         "RedisStreamsSink": ("stream", "client", "url", "max_retries", "maxlen"),
         "RotatingFileSink": ("path", "max_bytes", "backup_count", "when", "interval"),
-        "SNSSink": ("topic_arn", "client", "max_retries", "max_message_bytes"),
+        "SNSSink": (
+            "topic_arn",
+            "client",
+            "max_retries",
+            "max_message_bytes",
+            "fifo",
+            "message_group_id",
+            "message_deduplication_id",
+        ),
         "SQLiteSink": ("database", "table", "connection", "create_table"),
         "SQSSink": (
             "queue_url",
@@ -697,7 +706,16 @@ NEUTRAL: Mapping[str, frozenset[str]] = MappingProxyType(
         "RedisListSink": frozenset({"client", "key", "max_retries", "maxlen", "url"}),
         "RedisStreamsSink": frozenset({"client", "max_retries", "maxlen", "stream", "url"}),
         "RotatingFileSink": frozenset({"backup_count", "interval", "max_bytes", "path", "when"}),
-        "SNSSink": frozenset({"client", "max_message_bytes", "max_retries", "topic_arn"}),
+        "SNSSink": frozenset(
+            {
+                "client",
+                "max_message_bytes",
+                "max_retries",
+                "message_deduplication_id",
+                "message_group_id",
+                "topic_arn",
+            }
+        ),
         "SQLiteSink": frozenset({"create_table", "database", "table"}),
         "SQSSink": frozenset(
             {
