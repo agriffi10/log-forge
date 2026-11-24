@@ -63,7 +63,8 @@ hex string minted once at assembly and carried unchanged in every body every sin
 |---|---|---|
 | `SQSSink`, FIFO queue | `MessageDeduplicationId`, already `log_id`, for 5 minutes | counts the resend; the engine does not bound a resend to the interval |
 | `SQSSink`, standard queue | nothing; SQS tells consumers to be idempotent | counts; the consumer de-duplicates on the body's `log_id` |
-| `SNSSink` | FIFO topics only, which `SNSSink` cannot write | counts |
+| `SNSSink`, FIFO topic (since SPEC-100) | `MessageDeduplicationId`, `log_id` by default, for the topic's interval, a "5 minute minimum" | counts the resend; the engine does not bound a resend to the interval |
+| `SNSSink`, standard topic | nothing | counts |
 | `KinesisSink`, `FirehoseSink` | nothing; AWS says to embed a primary key and handle duplicates at the destination | counts; `log_id` is that key |
 | HTTP family, `OTLPSink` | none set; `OTLPSink` sends `log_id` as `log.record.uid` | counts |
 | `ElasticsearchSink`, `OpenSearchSink` | an action line's `_id`, which these sinks do not send | counts |
@@ -117,7 +118,7 @@ private, so a third-party engine sink's resends are not counted either.
 
 **What stays open.** An event a send may have landed, and that no later send landed, keeps its last
 round's fate and is counted lost: Andrew answered "Lost, flush falsy (Recommended)" on 2026-11-16.
-`architecture.md` §12 holds it, with SNS FIFO topics, which `SNSSink` cannot write.
+`architecture.md` §12 holds it. (It also held SNS FIFO topics, which `SNSSink` could not write until SPEC-100 closed that item.)
 
 **Do NOT** add a key to the wire (a message attribute, header or document field) for a destination
 that does not de-duplicate on it; do NOT turn off a client's internal retries to make its raises
@@ -125,6 +126,10 @@ countable; do NOT count a resend a sink can show never left; do NOT write the re
 `_diag.resent`.
 
 ## History
+
+### 2026-11-24
+
+- **Updated** by SPEC-100: `SNSSink` writes SNS FIFO topics, with the event's `log_id` as its default `MessageDeduplicationId`, so the key table gives the FIFO topic its own row and the "what stays open" paragraph no longer lists SNS FIFO topics. The rule is unchanged.
 
 ### 2026-11-20
 

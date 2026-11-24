@@ -67,9 +67,13 @@ def _row(row_id: str) -> cc.Row:
 # The declaration (FR-001).
 
 
-def test_the_variants_are_the_55_of_fr_001_and_spec_093_each_in_one_of_the_ten_classes() -> None:
-    """FR-001: 53 variants, and SPEC-093 FR-005's two confirmed RabbitMQ ones, with unique ids."""
-    assert len(cc.VARIANTS) == 55
+def test_the_variants_are_the_56_of_fr_001_and_spec_093_each_in_one_of_the_ten_classes() -> None:
+    """FR-001: 53 variants, SPEC-093 FR-005's two confirmed RabbitMQ ones, and SPEC-100's FIFO SNS.
+
+    SPEC-100 FR-006 splits ``SNSSink`` into ``SNSSink[standard]`` and ``SNSSink[fifo]``, as
+    ``SQSSink`` is split, so it adds one variant; the ids stay unique.
+    """
+    assert len(cc.VARIANTS) == 56
     assert cc.ACK_CLASSES == (
         "keyed-reply",
         "positional-reply",
@@ -144,7 +148,7 @@ def test_the_parameters_are_the_sources_and_each_is_a_pick_or_neutral() -> None:
     assert cc.coverage_faults(cc.PARAMETERS, cc.VARIANTS, cc.NEUTRAL) == []
     assert set(cc.NEUTRAL) == set(cc.PARAMETERS)
     assert len(cc.PARAMETERS) == 39
-    assert sum(len(names) for names in cc.PARAMETERS.values()) == 173
+    assert sum(len(names) for names in cc.PARAMETERS.values()) == 176
     if "max_message_bytes" in cc.PARAMETERS["SQSSink"]:
         assert "max_message_bytes" in cc.NEUTRAL["SQSSink"]
     if "max_message_bytes" in cc.PARAMETERS["SNSSink"]:
@@ -227,7 +231,7 @@ def _first_rows() -> list[cc.Row]:
 def test_every_builder_builds_the_class_its_entry_names_and_abstract_is_only_a_base() -> None:
     """FR-001: each builder's class has its entry's name; `ABSTRACT` is built only as a base."""
     built = {row.variant.id: cb.run_row(row).built for row in _first_rows()}
-    assert len(built) == 55
+    assert len(built) == 56
     wrong = {vid: cls.__name__ for vid, cls in built.items() if cls.__name__ != vid.split("[")[0]}
     assert not wrong, wrong
     for name in cc.ABSTRACT:
@@ -238,19 +242,22 @@ def test_every_builder_builds_the_class_its_entry_names_and_abstract_is_only_a_b
 # The rows (FR-002).
 
 
-def test_the_corpus_generates_the_268_rows_of_fr_002_and_spec_093() -> None:
-    """FR-002: 256 rows, by class as the spec's Evidence counts them, and SPEC-093 FR-005's 12.
+def test_the_corpus_generates_the_275_rows_of_fr_002_and_spec_093() -> None:
+    """FR-002: 256 rows, by class as the spec's Evidence counts them, SPEC-093 FR-005's 12, and 7.
+
+    The last seven are SPEC-100 FR-006's ``SNSSink[fifo]``, which runs ``keyed-reply``'s seven
+    faults beside the renamed ``SNSSink[standard]``.
 
     Each variant's faults are its class's, then its `adds`, less its skips, and no skip names a
     fault the class does not run. The two confirmed RabbitMQ variants each add two faults to
     `per-event-ack`'s four, which makes `per-event-ack` 20 rows.
     """
     table = cc.rows()
-    assert len(table) == 268
-    assert len({row.id for row in table}) == 268
+    assert len(table) == 275
+    assert len({row.id for row in table}) == 275
     by_class = collections.Counter(row.variant.ack for row in table)
     assert by_class == {
-        "keyed-reply": 28,
+        "keyed-reply": 35,
         "positional-reply": 35,
         "request-reply": 60,
         "transactional": 16,
@@ -289,7 +296,7 @@ def test_every_clean_row_but_nullsinks_holds_each_event_exactly_once() -> None:
             continue
         assert held == [1] * len(result.events), (row.id, held)
         checked += 1
-    assert checked == 52
+    assert checked == 53
 
 
 def _dial_by_name() -> None:
@@ -1014,7 +1021,7 @@ def test_duplicate_firing_at_one_copy_turns_every_green_clean_row_red(
         for row in cc.rows()
         if row.fault == "clean" and cp.pin_of(row.id) is None and cp.departure_of(row.id) is None
     ]
-    assert len(green_clean) == 52
+    assert len(green_clean) == 53
     quiet = [row.id for row in green_clean if "duplicate" not in cb.run_row(row).verdict]
     assert not quiet, quiet
 
@@ -1103,16 +1110,61 @@ def test_the_register_holds_the_totals_of_fr_004() -> None:
     pass, of 256. SPEC-095 FR-004 brought it to 11 pins over 22 rows, 12 departures over 31 and
     203 that must pass. SPEC-093 FR-005 and SPEC-094 FR-003, landing after it, add twelve rows and
     remove seven pins over 16 rows, and add two departures over 3: 268 rows, 4 pins over 6 rows
-    and three items, 14 departures over 34 rows, and 228 that must pass.
+    and three items, 14 departures over 34 rows, and 228 that must pass. SPEC-100 FR-006 then adds
+    ``SNSSink[fifo]``'s seven rows, no pin and no departure: two of them join
+    ``aws-client-retries``, as ``SQSSink[fifo]``'s do, and five must pass, which makes 275 rows,
+    36 departure rows and 233 that must pass.
     """
     assert len(cp.PINS) == 4
     assert len(cp.DEPARTURES) == 14
     pinned = [row for pin in cp.PINS for row in pin.rows]
     departing = [row for d in cp.DEPARTURES for row in d.rows]
     assert len(pinned) == 6
-    assert len(departing) == 34
-    assert len(cc.rows()) - len(pinned) - len(departing) == 228
+    assert len(departing) == 36
+    assert len(cc.rows()) - len(pinned) - len(departing) == 233
     assert len({pin.item for pin in cp.PINS}) == 3
+
+
+def test_each_sns_fifo_row_reads_as_its_sqs_fifo_row() -> None:
+    """SPEC-100 FR-006: ``SNSSink[fifo]`` runs ``SQSSink[fifo]``'s faults and reads as it.
+
+    Derived from the two variants' fault lists rather than seven written verdicts, so a fault one
+    variant gains, or a verdict one variant changes, reddens here; the pin and the departure each
+    row is held by must agree too.
+    """
+    sns_fifo = cc.variant_named("SNSSink[fifo]")
+    sqs_fifo = cc.variant_named("SQSSink[fifo]")
+    faults = cc.faults_of(sns_fifo)
+    assert faults == cc.faults_of(sqs_fifo)
+    assert len(faults) == 7
+    for fault in faults:
+        sns_row, sqs_row = cc.Row(sns_fifo, fault), cc.Row(sqs_fifo, fault)
+        assert cb.run_row(sns_row).verdict == cb.run_row(sqs_row).verdict, fault
+        assert _held_by(sns_row.id) == _held_by(sqs_row.id), fault
+
+
+def _held_by(row_id: str) -> tuple[str | None, str | None]:
+    """The names of the pin and the departure that hold a row, ``None`` for each that does not."""
+    pin, departure = cp.pin_of(row_id), cp.departure_of(row_id)
+    return (pin.name if pin else None, departure.name if departure else None)
+
+
+def test_no_pin_or_departure_names_a_bare_sns_row() -> None:
+    """SPEC-100 FR-006: the rename leaves no ``SNSSink-<fault>`` in the register, and no variant."""
+    assert "SNSSink" not in {v.id for v in cc.VARIANTS}
+    assert {"SNSSink[standard]", "SNSSink[fifo]"} <= {v.id for v in cc.VARIANTS}
+    named = [row for pin in cp.PINS for row in pin.rows] + [
+        row for d in cp.DEPARTURES for row in d.rows
+    ]
+    assert not [row for row in named if row.startswith("SNSSink-")]
+    retries = next(d for d in cp.DEPARTURES if d.name == "aws-client-retries")
+    assert len(retries.rows) == 12
+    assert {
+        "SNSSink[standard]-refused-once",
+        "SNSSink[standard]-refused-always",
+        "SNSSink[fifo]-refused-once",
+        "SNSSink[fifo]-refused-always",
+    } <= set(retries.rows)
 
 
 def _repository_texts() -> dict[str, str]:

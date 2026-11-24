@@ -24,7 +24,14 @@ if TYPE_CHECKING:
 
     from conformance_backend import Check
 
-_AWS = ("SQSSink[standard]", "SQSSink[fifo]", "SNSSink", "KinesisSink", "FirehoseSink")
+_AWS = (
+    "SQSSink[standard]",
+    "SQSSink[fifo]",
+    "SNSSink[standard]",
+    "SNSSink[fifo]",
+    "KinesisSink",
+    "FirehoseSink",
+)
 
 
 @dataclass(frozen=True, kw_only=True)

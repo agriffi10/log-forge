@@ -80,7 +80,7 @@ def _sink(fifo: bool = False, **kw: Any) -> SQSSink:
     if fifo:
         kw.setdefault("message_group_id", "g")
         kw.setdefault("message_deduplication_id", lambda e: "d")
-    return SQSSink("https://q", client=_Client(), fifo=fifo, **kw)
+    return SQSSink("https://q.fifo" if fifo else "https://q", client=_Client(), fifo=fifo, **kw)
 
 
 def _encoded(*sizes: int, char: str = "x") -> list[tuple[dict[str, object], str]]:

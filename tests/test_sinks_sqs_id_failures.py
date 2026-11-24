@@ -10,6 +10,9 @@ per attempt (Probe D: ``dropped == 4`` for one event).
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 import log_foundry
@@ -188,30 +191,25 @@ def test_an_id_failure_does_not_move_dropped_oversized() -> None:
     assert sink.losses() == SinkLosses(dropped=1, failed=0)
 
 
-def test_a_standard_queue_never_consults_the_callables() -> None:
+def test_a_standard_queue_refuses_the_callables_it_would_never_consult(monkeypatch) -> None:
+    """SPEC-100 FR-001: a standard queue never reads an id, so passing one is refused, not ignored.
+
+    1.x built this sink and sent with the callables never asked; the argument was ignored because
+    another was given (invariant 13). Now the constructor names both and builds no client.
+    """
+
     def never(event: dict[str, object]) -> str:
         raise AssertionError("a standard queue must not ask for an id")
 
-    client = DownOnce()
-    sink = SQSSink(
-        STD_URL,
-        client=client,
-        message_group_id=never,
-        message_deduplication_id=never,
-        max_retries=0,
+    built: list[str] = []
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=built.append))
+    with pytest.raises(ValueError) as info:
+        SQSSink(STD_URL, message_group_id=never, message_deduplication_id=never, max_retries=0)
+    assert str(info.value) == (
+        "SQSSink cannot apply message_group_id, message_deduplication_id to a standard queue; "
+        "drop it, or use a queue_url ending in .fifo"
     )
-    sink.MAX_BYTES = 300
-    batch = [_ev(0), _ev(1, pad="x" * 400)]
-
-    with pytest.raises(SinkDeliveryError):
-        sink.emit(batch)
-    assert sink.dropped_oversized == 0, "the attempt raised, so its oversize drop is not counted"
-
-    sink.emit(batch)
-    assert sink.dropped_oversized == 1
-    assert [sorted(entry) for entry in client.calls[-1]] == [["Id", "MessageBody"]], (
-        "the one sendable event went out with no FIFO ids"
-    )
+    assert built == []
 
 
 def test_no_sentinel_reaches_stderr(capsys) -> None:

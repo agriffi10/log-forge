@@ -36,6 +36,7 @@ from log_foundry.sinks.filtering import FilteringSink
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.otlp import OTLPSink
+from log_foundry.sinks.sns import SNSSink
 from log_foundry.sinks.sqs import SQSSink
 from log_foundry.sinks.transform import TransformSink
 
@@ -317,6 +318,56 @@ _REFUSED: list[tuple[str, Any, str]] = [
         "SQSSink message_deduplication_id must be callable or None, not str",
     ),
     (
+        "sns-fifo-group-int",
+        lambda: SNSSink("arn:aws:sns:r:1:t.fifo", message_group_id=5),
+        "SNSSink message_group_id must be a str, a callable or None, not int",
+    ),
+    (
+        "sns-standard-group-int",
+        lambda: SNSSink("arn:aws:sns:r:1:t", message_group_id=5),
+        "SNSSink message_group_id must be a str, a callable or None, not int",
+    ),
+    (
+        "sns-fifo-dedup-str",
+        lambda: SNSSink("arn:aws:sns:r:1:t.fifo", message_deduplication_id="x"),
+        "SNSSink message_deduplication_id must be callable or None, not str",
+    ),
+    (
+        "sns-standard-dedup-str",
+        lambda: SNSSink("arn:aws:sns:r:1:t", message_deduplication_id="x"),
+        "SNSSink message_deduplication_id must be callable or None, not str",
+    ),
+    (
+        "sqs-fifo-int",
+        lambda: SQSSink("https://q.fifo", fifo=1),
+        "SQSSink fifo must be a bool or None, not int",
+    ),
+    (
+        "sqs-fifo-str",
+        lambda: SQSSink("https://q.fifo", fifo="yes"),
+        "SQSSink fifo must be a bool or None, not str",
+    ),
+    (
+        "sqs-fifo-claims-bool",
+        lambda: SQSSink("https://q.fifo", fifo=_claims(bool)),
+        "SQSSink fifo must be a bool or None, not Claims",
+    ),
+    (
+        "sns-fifo-int",
+        lambda: SNSSink("arn:aws:sns:r:1:t.fifo", fifo=1),
+        "SNSSink fifo must be a bool or None, not int",
+    ),
+    (
+        "sns-fifo-str",
+        lambda: SNSSink("arn:aws:sns:r:1:t.fifo", fifo="yes"),
+        "SNSSink fifo must be a bool or None, not str",
+    ),
+    (
+        "sns-fifo-claims-bool",
+        lambda: SNSSink("arn:aws:sns:r:1:t.fifo", fifo=_claims(bool)),
+        "SNSSink fifo must be a bool or None, not Claims",
+    ),
+    (
         "filtering-predicate",
         lambda: FilteringSink(MemorySink(), predicate=5),
         "FilteringSink predicate must be callable or None, not int",
@@ -397,6 +448,55 @@ def test_a_subclass_of_sqs_is_named_in_its_callable_refusals(boto3: list[str]) -
     with pytest.raises(TypeError) as dedup:
         MySQS("https://q.fifo", message_deduplication_id="x")
     assert str(dedup.value) == "MySQS message_deduplication_id must be callable or None, not str"
+    with pytest.raises(TypeError) as fifo:
+        MySQS("https://q.fifo", fifo=1)
+    assert str(fifo.value) == "MySQS fifo must be a bool or None, not int"
+    assert boto3 == []
+
+
+def test_a_subclass_of_sns_is_named_in_its_fifo_refusals(boto3: list[str]) -> None:
+    """SPEC-100 FR-001: the four ``_REFUSED`` twins and the ``fifo`` type name ``SNSSink``'s own."""
+
+    class MySNS(SNSSink):
+        pass
+
+    with pytest.raises(TypeError) as group:
+        MySNS("arn:aws:sns:r:1:t.fifo", message_group_id=5)
+    assert str(group.value) == "MySNS message_group_id must be a str, a callable or None, not int"
+    with pytest.raises(TypeError) as dedup:
+        MySNS("arn:aws:sns:r:1:t", message_deduplication_id="x")
+    assert str(dedup.value) == "MySNS message_deduplication_id must be callable or None, not str"
+    with pytest.raises(TypeError) as fifo:
+        MySNS("arn:aws:sns:r:1:t.fifo", fifo="yes")
+    assert str(fifo.value) == "MySNS fifo must be a bool or None, not str"
+    assert boto3 == []
+
+
+@pytest.mark.parametrize("cls", [SQSSink, SNSSink], ids=["SQSSink", "SNSSink"])
+def test_a_fifo_claiming_bool_is_refused_without_running_its_getter(
+    boto3: list[str], cls: type
+) -> None:
+    """SPEC-100 FR-001: ``fifo`` is asked its type; a ``__class__`` claiming ``bool`` never runs."""
+    destination = "https://q.fifo" if cls is SQSSink else "arn:aws:sns:r:1:t.fifo"
+    for make, stored in ((lambda: _claims(bool), "Claims"), (_raises, "Raises")):
+        _Counted.calls = 0
+        value = make()
+        with pytest.raises(TypeError) as info, _armed():
+            cls(destination, fifo=value)
+        assert str(info.value) == f"{cls.__name__} fifo must be a bool or None, not {stored}"
+        assert _Counted.calls == 0
+    assert boto3 == []
+
+
+@pytest.mark.parametrize("cls", [SQSSink, SNSSink], ids=["SQSSink", "SNSSink"])
+def test_true_false_and_none_are_accepted_as_fifo(boto3: list[str], cls: type) -> None:
+    """SPEC-100 FR-001: the three values ``fifo`` takes, on a ``.fifo`` name, each construct."""
+    destination = "https://q.fifo" if cls is SQSSink else "arn:aws:sns:r:1:t.fifo"
+    assert [cls(destination, fifo=value).fifo for value in (True, False, None)] == [
+        True,
+        False,
+        True,
+    ]
 
 
 @pytest.mark.parametrize("value", [lambda e: True, _Call(), None], ids=["lambda", "class", "None"])
@@ -404,7 +504,8 @@ def test_a_callable_or_none_is_still_accepted_where_optional(boto3: list[str], v
     FilteringSink(MemorySink(), predicate=value)
     HTTPSink(URL, opener=value)
     CallbackSink(lambda batch: None, on_close=value)
-    SQSSink("https://q", message_group_id=value, message_deduplication_id=value)
+    SQSSink("https://q.fifo", message_group_id=value, message_deduplication_id=value)
+    SNSSink("arn:aws:sns:r:1:t.fifo", message_group_id=value, message_deduplication_id=value)
 
 
 @pytest.mark.parametrize("value", [lambda e: e, _Call()], ids=["lambda", "class"])
@@ -423,6 +524,15 @@ def test_a_group_id_str_and_str_subclass_are_accepted_and_a_blank_one_refused(
     assert SQSSink("https://q.fifo", message_group_id=Group("g")).message_group_id == "g"
     with pytest.raises(ValueError, match="message_group_id must be a non-empty string"):
         SQSSink("https://q.fifo", message_group_id="  ")
+    arn = "arn:aws:sns:r:1:t.fifo"
+    assert SNSSink(arn, message_group_id="g").message_group_id == "g"
+    assert SNSSink(arn, message_group_id=Group("g")).message_group_id == "g"
+    with pytest.raises(ValueError) as blank:
+        SNSSink(arn, message_group_id="  ")
+    assert str(blank.value) == (
+        "message_group_id must be a non-empty string; pass None to group by trace_id"
+    )
+    assert boto3 == ["sqs", "sqs", "sns", "sns"], "the refused calls built no client"
 
 
 @pytest.mark.parametrize(

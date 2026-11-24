@@ -486,6 +486,10 @@ sender faults included — `SQSSink._send` and, since SPEC-070, `SNSSink._send` 
 > SQS batch whose every id callable raised are refusals counted by their catcher alone; an SQS FIFO
 > group keeps its order for `max_retries + 1` sends and holds nothing in a run's last round. Decisions: *A sink round resends only what
 > failed, and an SQS FIFO group keeps its order* and *No shipped sink declares itself idempotent*.
+>
+> **Widened to SNS FIFO topics by SPEC-100:** a FIFO `SNSSink` holds a group's later message and
+> drops an event whose id callable raised exactly as `SQSSink` does, through `sinks/_fifo.py`, the
+> one module the two FIFO sinks share; the hold decision above names both.
 
 SPEC-070 widens the first two of the original three cases. An **SNS sender fault** joins the SQS
 one — the same required `SenderFault` field, read through the same `sinks/_classify.sender_fault`,
@@ -1889,15 +1893,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   answered "Lost, flush falsy (Recommended)". **Closed by** the engine reading such an event
   `UNKNOWN`, at the cost that a destination which times out every reply no longer fails its
   batches.
-- **`SNSSink` cannot write an SNS FIFO topic** (SPEC-095, Out of Scope; invariant 7). `SNSSink`
-  sends no `MessageGroupId`: each entry is an `Id` and a `Message` alone (`sinks/sns.py:495-501`
-  at `3da245a9`), and SNS refuses a FIFO publish without one:
-  "You must associate a non-empty MessageGroupId with a message. If you do not provide a
-  MessageGroupId, the action fails" (SNS `PublishBatchRequestEntry`, read on 2026-11-16). So every
-  batch to a FIFO topic is refused, and the topic's de-duplication on `MessageDeduplicationId`
-  is out of reach. Asked whether SPEC-095 should add it, Andrew answered "Follow-up spec
-  (Recommended)" on 2026-11-16. **Closed by** the follow-up spec of the 2026-11-14 audit arc that
-  adds the topic's group and de-duplication ids, drafted as SPEC-100.
+- ~~**`SNSSink` cannot write an SNS FIFO topic**~~ → **closed by SPEC-100** (2026-11-24); struck and moved under *Resolved*.
 - ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~ → **closed by SPEC-095**; struck and moved under *Resolved*.
 - ~~**An AWS batch reply that names no failure is read as full delivery**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
 - ~~**`SentrySink`'s SDK backend counts an event the SDK discarded as sent**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
@@ -2029,8 +2025,95 @@ an item leaves this list when a spec closes it, not because the arc names it.
   **Closed by** reading a raise from getting the channel as not landed (`reached=False`), held by
   a test whose channel open raises.
 
+- **`SQSSink`'s class docstring lists none of its three FIFO attributes** (found by SPEC-100's
+  completion ritual, 2026-11-24; present on `5d0e7f68`, before SPEC-100; unfixed under the audit
+  scope freeze; it serves no invariant, since the rule is CLAUDE.md's docstring convention). `SQSSink.__init__` stores `fifo`, `message_group_id` and
+  `message_deduplication_id` as public attributes, and the class docstring's `Attributes:` names
+  `MAX_BYTES`, `max_message_bytes`, `log_foundry_counters`, `dropped_oversized` and
+  `dropped_unadjudicated` only, while `SNSSink`'s, written by SPEC-100, lists the three. CLAUDE.md
+  asks a class for `Attributes:` naming its public attributes, and `docstring-lint.py` does not
+  check that half. **Closed by** adding the three to `SQSSink`'s `Attributes:`, worded as
+  `SNSSink`'s are, with "queue" for "topic".
+
+- **A FIFO group waits behind a message that will never be resent** (invariant 2; found by
+  SPEC-100's second diff review, 2026-11-24; present on `5d0e7f68` for `SQSSink`, before SPEC-100;
+  not fixed, because the fix is a reading change to a settled decision). `_fifo.block` blocks a
+  group whenever a sent entry is `not ACCEPTED and count < limit`, which includes an entry
+  refused as final (`REJECTED`, a sender fault) and one left unadjudicated (`UNKNOWN`), neither of
+  which is ever resent. The group's later messages then wait behind a message that will not come
+  again: under `run_delivery(decline=...)`, events 10 and 11 of a twelve-event group whose first
+  entry was a sender fault are counted `failed` with `0 attempt(s), held behind an earlier message
+  of its FIFO group`, and without a decline they cost an extra backoff round
+  (`p7_hold_final.py`, the review's probe). Identical on `SQSSink` and `SNSSink`, which share
+  `block`, and consistent with the hold decision's literal wording ("neither landed nor used its
+  sends"). **Closed by** the orchestrator's call to block only on a `RETRYABLE` fate, written into
+  *A sink round resends only what failed, and an SQS FIFO group keeps its order*, with a test of
+  the decline case on both sinks.
+
+- **Two timing tests fail `test (py3.12)` on a loaded 4-CPU runner** (invariants 3 and 2, as below;
+  found by SPEC-100's session on 2026-11-24, watching `main` after Dependabot PR #419, whose diff
+  `git diff 5d0e7f68 96252937` touches only `poetry.lock`; unfixed under the audit scope freeze).
+  Release run 45469796270 at `96252937` failed `test (py3.12)` twice and passed on the third
+  attempt, with a different failure each time; `test (py3.13)` passed on every attempt, and the
+  previous Release run, at `5d0e7f68`, passed first time. `main` also had a failed Release at
+  `5170b023`, not examined here. Neither failure was reproduced locally. Line numbers are at
+  `96252937`, and none of the files cited has changed since.
+  The first attempt failed `tests/test_invariants_model.py::test_the_soak_is_wired[http]`
+  (invariant 3) at `:985`: `invariant 3 (within its timeout plus 1.0 s): Stalled:info, info: own
+  time 1.067 s against a budget of 0.000 s; load average 12.0 / 4.2 / 1.5 on 4 CPUs seed=2`. Its
+  assumption is that an `info()` given no timeout returns within `model_oracles.EPSILON`, one
+  second, of wall-clock own time whatever the runner's load (`check_call`,
+  `tests/model_oracles.py:320`), and `_machine`'s docstring records that the bound is deliberately
+  neither skipped nor widened under load, so that a real stall cannot pass as starvation; the
+  starvation that docstring measured failed at loads of 81 to 112 on 10 cores and passed at 50 to
+  55, and this run failed at 12.0 on 4.
+  The second attempt failed
+  `tests/test_lock_reentry.py::test_the_recording_run_sees_a_re_entry_only_where_one_is_made[clean]`
+  at its `returncode == 0` assertion (`:113`), because its nested `pytest -n 4` over
+  `tests/test_runtime_state.py` and `tests/test_worker.py`, started inside the outer `-n 12` run,
+  failed `tests/test_worker.py::test_the_fast_return_reports_an_abandoned_drain_as_failure` with
+  `answered is not delivered — the batch it carried was abandoned`. That test (SPEC-021's flush
+  verdict, the announced loss of invariant 2) assumes span `a` is still queued when `flush()`
+  stamps its marker with `failed_batches` (`src/log_foundry/worker.py:1726`), but the worker
+  runs at `flush_interval=0.01` (`tests/test_worker.py:2328`) and nothing holds its drain back,
+  so a drain that emits and abandons `a` before that stamp leaves a marker that
+  `_nothing_lost_since` answers delivered while `failed_batches == 1` still holds. The code
+  admits that interleaving and the failure matches it, the premise assertion having passed, but
+  it was not reproduced. The outer test fails on any red test in the two child modules, so it
+  inherits every timing assumption they make.
+  **Closed by** two test changes. The soak's bound needs to hold on a loaded 4-CPU runner
+  without letting a real stall through, for instance by subtracting the time the calling thread
+  was not scheduled rather than widening `EPSILON`, which `_machine` rules out. The fast-return
+  test needs to hold span `a` in the queue until the marker is stamped, for instance with a sink
+  or a drain gated on an event the test sets after `flush()` has read `failed_batches`, in place
+  of the 0.01 s window.
+
 ### Resolved
 
+- ~~**`SNSSink` cannot write an SNS FIFO topic**~~ (SPEC-095, Out of Scope; invariant 7). `SNSSink`
+  sends no `MessageGroupId`: each entry is an `Id` and a `Message` alone (`sinks/sns.py:495-501`
+  at `3da245a9`), and SNS refuses a FIFO publish without one:
+  "You must associate a non-empty MessageGroupId with a message. If you do not provide a
+  MessageGroupId, the action fails" (SNS `PublishBatchRequestEntry`, read on 2026-11-16). So every
+  batch to a FIFO topic is refused, and the topic's de-duplication on `MessageDeduplicationId`
+  is out of reach. Asked whether SPEC-095 should add it, Andrew answered "Follow-up spec
+  (Recommended)" on 2026-11-16. **Closed by** the follow-up spec of the 2026-11-14 audit arc that
+  adds the topic's group and de-duplication ids, drafted as SPEC-100.
+  → **closed by SPEC-100** (2026-11-24): `SNSSink` takes `fifo`, `message_group_id` and
+  `message_deduplication_id`, and a `.fifo` topic ARN selects FIFO behaviour. Each entry then
+  carries a `MessageGroupId`, the event's `trace_id` by default, and a `MessageDeduplicationId`,
+  its `log_id` by default, both resolved once per run and resent unchanged, costed against the
+  message limit, and a later message of a group is held behind an earlier one as `SQSSink` holds
+  it, all through `sinks/_fifo.py`, the one module both FIFO sinks use. Re-run at `b145f9a2` with
+  moto (`spec100_moto_shapes.py` case A), both `emit`s to a FIFO topic returned with nothing
+  lost. **The spec found and closed a silent loss on `SQSSink` too** (FR-003): a
+  de-duplication id longer than 128 characters was cut to its first 128, so two events whose ids
+  shared that prefix went out under one id and the queue did not deliver the second. Case F, two
+  events whose callable answered 200 characters sharing the first 128, read on `03dbf502`: the
+  FIFO queue held 1 of 2, the sink counted `SinkLosses(dropped=0, failed=0)` and wrote no line. On
+  `b145f9a2` the over-long id is sent as the SHA-256 hex digest of the stripped answer, and the
+  queue held 2 of 2 with `SinkLosses(dropped=0, failed=0, resent=0)`. A FIFO `SNSSink` still
+  declares no idempotency (*No shipped sink declares itself idempotent*).
 - ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~
   (found during SPEC-095's build; invariants 2 and 11). `_engine._run` commits a run's
   `resent_events` and its resend line in the same `Deferral` as its `failed_events` and

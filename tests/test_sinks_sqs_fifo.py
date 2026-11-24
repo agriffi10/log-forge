@@ -6,7 +6,10 @@ test there runs on a standard queue and must keep passing byte-for-byte.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import sys
+import types
 
 import pytest
 
@@ -61,8 +64,17 @@ def test_standard_url_is_not_fifo() -> None:
     assert SQSSink(STD_URL, client=RecordingClient()).fifo is False
 
 
-def test_explicit_fifo_true_forces_it_on_a_plain_url() -> None:
-    assert SQSSink(STD_URL, client=RecordingClient(), fifo=True).fifo is True
+def test_explicit_fifo_true_on_a_plain_url_is_refused_before_any_client(monkeypatch) -> None:
+    """SPEC-100 FR-001: ``fifo=True`` no longer forces FIFO on a name AWS cannot make FIFO."""
+    built: list[str] = []
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=built.append))
+    with pytest.raises(ValueError) as info:
+        SQSSink(STD_URL, fifo=True)
+    assert str(info.value) == (
+        "SQSSink fifo=True needs a queue_url ending in .fifo: AWS requires every FIFO queue "
+        "name to end so"
+    )
+    assert built == []
 
 
 def test_explicit_fifo_false_forces_it_off_on_a_fifo_url() -> None:
@@ -217,10 +229,13 @@ def test_missing_log_id_mints_a_fresh_unshared_dedup_id() -> None:
     assert len(set(ids)) == 2, "never a value shared with another entry"
 
 
-def test_over_long_dedup_id_is_truncated() -> None:
+def test_over_long_dedup_id_is_sent_as_its_digest() -> None:
+    """SPEC-100 FR-003: a prefix let two events share one id, so the queue kept one of them."""
     client = RecordingClient()
     SQSSink(FIFO_URL, client=client).emit([_event(log_id="d" * 200)])
-    assert client.entries[0]["MessageDeduplicationId"] == "d" * MAX_ID_LEN
+    sent = client.entries[0]["MessageDeduplicationId"]
+    assert sent == hashlib.sha256(("d" * 200).encode("utf-8")).hexdigest()
+    assert len(sent) == 64 < MAX_ID_LEN
 
 
 # -- FR-004: standard queues are unaffected ---------------------------------------------
