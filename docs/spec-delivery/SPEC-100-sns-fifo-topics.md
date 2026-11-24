@@ -80,14 +80,19 @@
   refusal names `strip`, not the id; the drop itself is equivalent, since `str.strip` refuses a
   non-`str` too), and the destination's type check disabled by
   `test_a_destination_that_is_not_a_str_is_refused_naming_it` on both sinks.
-- **Diff review frame 2's mutants**, each re-planted once in `_fifo`: the done mark narrowed back
-  to an accepted fate and `plan_round` handing out dropped entries again is killed on both sinks
-  by `test_a_repeated_events_id_failure_is_never_handed_to_its_retried_twin`,
-  `test_a_repeated_events_sender_fault_keeps_its_id_off_its_twins_resend` and
-  `test_a_repeated_events_oversize_drop_is_never_handed_to_its_retried_twin`; the id-failure
-  line's count fixed at 1 by `test_the_id_failure_line_counts_every_failed_event` (`lost 1` for
-  `lost 2`); the digest's `surrogatepass` dropped by
-  `test_a_lone_surrogate_answer_over_the_limit_is_sent_as_its_digest`.
+- **Diff review frame 2's mutants**, each planted once in `_fifo` and each killed by an assertion
+  on both sinks. The widened condition has two halves, reverted one at a time: the done mark
+  narrowed back to an accepted fate is killed by
+  `test_a_repeated_events_sender_fault_keeps_its_id_off_its_twins_resend` (`'d1' == 'd2'`), and
+  `plan_round` handing out dropped entries again by
+  `test_a_repeated_events_id_failure_is_never_handed_to_its_retried_twin` (round 2 refused with
+  the first occurrence's `RuntimeError`) and
+  `test_a_repeated_events_oversize_drop_is_never_handed_to_its_retried_twin` (`[['b']] ==
+  [['b'], ['b']]`). The id-failure line's count fixed at 1 is killed by
+  `test_the_id_failure_line_counts_every_failed_event` (`lost 1` for `lost 2`), and the digest
+  without `surrogatepass` by `test_a_lone_surrogate_answer_over_the_limit_is_sent_as_its_digest`
+  (the surrogate event dropped). `_fifo.block` decides as before: the review's
+  `p7_hold_final.py` reads the same on the fixed tree.
 - **Recorded, not fixed:** a FIFO group waits behind a message refused as final or left
   unadjudicated, which `_fifo.block` blocks on though it is never resent (`architecture.md` §12,
   *Open*); the change is a reading of the hold decision, so it is the orchestrator's.
