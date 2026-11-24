@@ -1340,8 +1340,14 @@ both delivery paths:
   calls your wrapper's `close()`: a `close()` that hands `super().close()` to another thread
   forwards the member's close where the library cannot tell it is part of a sink change, so it
   cannot spare a member the new sink still holds.
-- **Leave the member's close out of your wrapper's `close()`, and close the member yourself** after
-  `shutdown()`. The library then closes the member only when you configure it directly.
+- **Leave the member's close out of your wrapper's `close()`.** The library closes a member it has
+  delivered to directly after each close of your wrapper, and a member it never delivered to
+  directly is yours to close.
+
+A wrapper that closes its member itself gets a second `close()` of that member from the library,
+after its own, wherever the library has delivered to that member directly; the protocol's
+idempotent `close()` absorbs it. Either way, the library closes such a member only once your
+wrapper's `close()` has returned, so a slow `close()` delays that member's close.
 
 A wrapper that closes a sink it was handed must not have that sink configured directly after it:
 `configure(sink=MyWrapper(file))` then `configure(sink=file)` lets your wrapper's `close()` close
