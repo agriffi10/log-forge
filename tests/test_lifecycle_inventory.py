@@ -1028,6 +1028,17 @@ INVENTORY: dict[Key, Row] = {
         "closes in flight, their threads with them (was _closing_now and _closers; SPEC-078)",
     ),
     _cr("_lock"): Row("_CloseRegistry", _R, "the registry's leaf lock"),
+    _cr("_written"): Row(
+        "_CloseRegistry",
+        ("reset: _lifecycle._clear_after_fork",),
+        "every sink this process armed; a child has written nothing yet (SPEC-101 FR-003)",
+    ),
+    _cr("_after"): Row(
+        "_CloseRegistry",
+        ("reset: _lifecycle._clear_after_fork",),
+        "the members closed after each caller's wrapper; a child closes no inherited holder, "
+        "and an ordered member's entry goes with the in-flight half (SPEC-101 FR-003)",
+    ),
     _rt("_owned"): Row(
         "Runtime",
         ("reset: _lifecycle._walk_after_fork",),

@@ -15,12 +15,12 @@ import threading
 import weakref
 from itertools import islice
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag, _fork, _sink_arg
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
     from types import FrameType
 
     from log_foundry.results import FlushResult
@@ -323,6 +323,78 @@ class _Close:
         self.participants = 1
 
 
+def _weak_or_strong(sink: object) -> object:
+    """Returns a weak reference to *sink*, or the sink itself when its type refuses one.
+
+    No callback, for :class:`_Entry`'s reason: a callback runs inside the collector, on whatever
+    thread allocates. Creating the reference runs none of the sink's code. A sink stored as itself
+    is held for as long as the record holding it keeps the entry, as ``_Entry`` holds such a sink
+    for life.
+
+    Args:
+      sink: The sink a record is about to hold.
+
+    Returns:
+      A ``weakref.ref`` to it, or the sink when it cannot be weakly referenced.
+
+    Raises:
+      None.
+    """
+    try:
+        return weakref.ref(sink)
+    except TypeError:
+        return sink
+
+
+class _Member:
+    """One sink the library closes after a caller's wrapper that holds it (SPEC-101).
+
+    A **persistent** member has ``closing`` ``None``: it was attached at a ``configure()``, or by a
+    forward a keep spared, and it stays attached for as long as its holder lives, so the library
+    closes it after every close of the holder it makes. It is held weakly where its type allows,
+    so the record keeps no sink alive. An **ordered** member carries the in-flight entry of the
+    take that removed it from the owed record (FR-002): it is held strongly, closed once after the
+    holder, and dropped; until then its entry stays in flight, so a bystander waits for it. The two
+    kinds sit side by side on one holder, and an ordered member never replaces a persistent one.
+
+    Attributes:
+      ref: The member, or a weak reference to it for a persistent member whose type allows one.
+      closing: The ordered member's taken entry, or ``None`` for a persistent member.
+    """
+
+    __slots__ = ("closing", "ref")
+
+    def __init__(self, member: Sink, closing: _Close | None) -> None:
+        """Records one member, weakly when it is persistent and its type allows.
+
+        Args:
+          member: The sink closed after its holder.
+          closing: The entry of the take that ordered it, or ``None`` for a persistent member.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.ref: object = member if closing is not None else _weak_or_strong(member)
+        self.closing = closing
+
+    def referent(self) -> Sink | None:
+        """Returns the member while it is alive.
+
+        Args:
+          None.
+
+        Returns:
+          The member, or ``None`` once a weakly held member was collected.
+
+        Raises:
+          None.
+        """
+        return cast("Sink | None", _referent(self.ref))
+
+
 class _CloseRegistry:
     """Every close the library owes and every close in flight, with the moves between them.
 
@@ -356,12 +428,23 @@ class _CloseRegistry:
     A fork breaks the bracket — the child inherits entries whose ``finally`` no thread will run —
     so :func:`_clear_after_fork` empties the in-flight half in the child.
 
+    **Two more records sit beside the in-flight half, under its leaf** (SPEC-101): ``_written``,
+    every sink this process armed, and ``_after``, by caller's wrapper, the members the library
+    closes after it (:class:`_Member`). Both are written and read only under :attr:`_lock`, each
+    entry is dropped lazily once its sink is collected, and no method here calls :meth:`finish`
+    or :meth:`put_back` while holding it.
+
     Attributes:
       owed: Every sink the library owes a close, by ``id``; guarded by ``_state._lock``.
     """
 
-    _FORK_SKIP = ("owed",)
-    """Keeps the owed record, which pins superseded sinks, out of the repair walk's descent.
+    _FORK_SKIP = ("owed", "_written", "_after")
+    """Keeps the records that hold sinks, which pin superseded sinks, out of the repair walk.
+
+    ``_written`` and ``_after`` (SPEC-101) hold a sink strongly where its type refuses a weak
+    reference, and ``_after`` holds an ordered member strongly while its close is in flight, so
+    they are opted out for the owed record's reason below; a forked child clears both in
+    :func:`_clear_after_fork`.
 
     It strongly references every sink still owed a close (SPEC-044 FR-005, SPEC-054 FR-002),
     including sinks the process abandoned several ``configure()`` calls ago. Without the opt-out the
@@ -389,10 +472,17 @@ class _CloseRegistry:
         """
         self.owed: dict[int, Sink] = {}
         self._in_flight: dict[int, _Close] = {}
+        self._written: dict[int, object] = {}
+        self._after: dict[int, tuple[object, list[_Member]]] = {}
         self._lock = threading.RLock()
 
     def arm(self, sink: Sink) -> None:
         """Records that the library owes *sink* a close; the caller holds ``_state._lock``.
+
+        It also records the sink as **written** (SPEC-101 FR-001), under the leaf, which is the
+        lock order every caller already keeps: ``_state._lock``, then the leaf. A first record of a
+        sink prunes every entry whose sink was collected, so the record holds only live sinks and
+        at most the dead ones since the last first record.
 
         Args:
           sink: The sink something has delivered to, or will.
@@ -404,6 +494,164 @@ class _CloseRegistry:
           None.
         """
         self.owed[id(sink)] = sink
+        with self._lock:
+            known = self._written.get(id(sink))
+            if known is not None and _referent(known) is sink:
+                return
+            for key, ref in list(self._written.items()):
+                if _referent(ref) is None:
+                    del self._written[key]
+            self._written[id(sink)] = _weak_or_strong(sink)
+
+    def was_written(self, sink: object) -> bool:
+        """Whether this process has armed *sink* as a root since it last forked (SPEC-101).
+
+        Args:
+          sink: The sink asked about.
+
+        Returns:
+          Whether the written record holds this very object.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            known = self._written.get(id(sink))
+            return known is not None and _referent(known) is sink
+
+    def attach_member(self, holder: Sink, member: Sink, closing: _Close | None = None) -> None:
+        """Attaches *member* to the caller's wrapper *holder*, to be closed after it (SPEC-101).
+
+        A persistent member (``closing`` ``None``) already attached to the holder is not added
+        twice; an ordered one is always added, beside any persistent record of the same sink,
+        which outlives it. Writing an entry prunes every entry whose holder was collected and
+        carries no ordered member, and every persistent member collected.
+
+        Args:
+          holder: The caller's wrapper.
+          member: The sink the library closes after it.
+          closing: The entry of the take that ordered it (FR-002), or ``None``.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            for key, (ref, members) in list(self._after.items()):
+                members[:] = [
+                    m for m in members if m.closing is not None or m.referent() is not None
+                ]
+                if not members or (
+                    _referent(ref) is None and all(m.closing is None for m in members)
+                ):
+                    del self._after[key]
+            entry = self._after.get(id(holder))
+            if entry is None or _referent(entry[0]) is not holder:
+                entry = (_weak_or_strong(holder), [])
+                self._after[id(holder)] = entry
+            if closing is None and any(
+                m.closing is None and m.referent() is member for m in entry[1]
+            ):
+                return
+            entry[1].append(_Member(member, closing))
+
+    def detach_member(self, holder: object, member: object) -> None:
+        """Drops *member*'s persistent attachment to *holder*, when it has one (SPEC-101).
+
+        Args:
+          holder: The caller's wrapper it was attached to.
+          member: The member that moves elsewhere.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            entry = self._after.get(id(holder))
+            if entry is None or _referent(entry[0]) is not holder:
+                return
+            entry[1][:] = [
+                m for m in entry[1] if m.closing is not None or m.referent() is not member
+            ]
+            if not entry[1]:
+                del self._after[id(holder)]
+
+    def members_of(self, holder: object, ordered: list[tuple[Sink, _Close]]) -> list[Sink]:
+        """Returns *holder*'s live persistent members and takes its ordered ones, in one section.
+
+        The ordered members leave the record here, so of two releases of one holder only one
+        closes them, and each entry is discharged once. The persistent ones stay. With no holder
+        attached at all it costs one dictionary read and no lock.
+
+        **The ordered members are added to the caller's own list**, in the statement after the
+        record drops them and with no call between, rather than returned: an interrupt landing
+        after this returns, before a returned value is bound, would lose every taken entry, and
+        the caller's list is what :func:`_release_after` puts back from.
+
+        Args:
+          holder: The sink whose close has just returned or raised.
+          ordered: The caller's list, which receives each ordered member with its taken entry.
+
+        Returns:
+          The persistent members still alive.
+
+        Raises:
+          None.
+        """
+        if not self._after:
+            return []
+        with self._lock:
+            entry = self._after.get(id(holder))
+            if entry is None or _referent(entry[0]) is not holder:
+                return []
+            persistent: list[Sink] = []
+            taken: list[tuple[Sink, _Close]] = []
+            kept: list[_Member] = []
+            for m in entry[1]:
+                member = m.referent()
+                if m.closing is None:
+                    if member is not None:
+                        persistent.append(member)
+                        kept.append(m)
+                elif member is not None:
+                    taken.append((member, m.closing))
+            entry[1][:] = kept
+            ordered.extend(taken)
+            if not kept:
+                del self._after[id(holder)]
+            return persistent
+
+    def take_ordered(self, holder: object) -> list[tuple[Sink, _Close]]:
+        """Takes *holder*'s ordered members, leaving its persistent ones attached (SPEC-101).
+
+        Args:
+          holder: A holder whose ordered members are put back, or released on their own.
+
+        Returns:
+          Each ordered member with its taken entry.
+
+        Raises:
+          None.
+        """
+        if not self._after:
+            return []
+        with self._lock:
+            entry = self._after.get(id(holder))
+            if entry is None or _referent(entry[0]) is not holder:
+                return []
+            ordered: list[tuple[Sink, _Close]] = []
+            for m in entry[1]:
+                member = m.referent()
+                if m.closing is not None and member is not None:
+                    ordered.append((member, m.closing))
+            entry[1][:] = [m for m in entry[1] if m.closing is None]
+            if not entry[1]:
+                del self._after[id(holder)]
+            return ordered
 
     def owes(self, sink: Sink) -> bool:
         """Whether the record owes *sink* a close right now; the caller holds ``_state._lock``.
@@ -600,7 +848,7 @@ class _CloseRegistry:
         with self._lock:
             return set(self._in_flight)
 
-    def attach(self, close: _Close, thread: threading.Thread) -> None:
+    def attach(self, close: _Close, thread: threading.Thread, holder: object | None = None) -> None:
         """Records a thread performing a close, once it has started, beside any already there.
 
         Appended, never assigned: a detached release that joins an entry another participant is
@@ -608,9 +856,20 @@ class _CloseRegistry:
         join, the graced wait and ``health().closing_sinks`` would stop seeing a close that is
         still running.
 
+        **The holder's ordered members get the thread too** (SPEC-101), in the same section, when
+        the caller names the holder: each is closed on that thread after the holder, so the
+        graced wait and ``health().closing_sinks`` see its close as they see the holder's. The
+        starter calls this once the thread has started, and the thread calls it again first
+        thing (:func:`_close_guarded`), before its release can take a member out of the record:
+        a holder whose ``close()`` returns at once would otherwise have its members taken before
+        the starter's call reached them, leaving their entries with no thread to count. A thread
+        already on an entry is not added a second time, so whichever call comes second adds
+        nothing.
+
         Args:
           close: The entry the thread discharges.
           thread: The started thread.
+          holder: The sink the thread closes; ``None`` for a caller with no holder to name.
 
         Returns:
           None.
@@ -619,7 +878,13 @@ class _CloseRegistry:
           None.
         """
         with self._lock:
-            close.threads = [*close.threads, thread]
+            if thread not in close.threads:
+                close.threads = [*close.threads, thread]
+            entry = None if holder is None else self._after.get(id(holder))
+            if entry is not None and _referent(entry[0]) is holder:
+                for m in entry[1]:
+                    if m.closing is not None and thread not in m.closing.threads:
+                        m.closing.threads = [*m.closing.threads, thread]
 
     def bystanders(self, mine: set[int]) -> list[_Close]:
         """Every close in flight that the caller did not take, for its bystander wait.
@@ -1642,6 +1907,12 @@ def _clear_after_fork() -> None:
     by the seed that runs before the repair walk (:func:`_seed_signals_after_fork`), so no sink's
     code runs here and the child's first delivery assigns nothing.
 
+    **It clears the written record and the after-holder record** (SPEC-101 FR-003), in the
+    section that clears the in-flight half, so the fork roster gains no lock. A child never runs
+    an after-holder close for an inherited holder, since :func:`releasable` refuses that holder
+    first; an ordered member's entry is in the in-flight half dropped here, and the sinks the
+    child itself arms from now on are the only ones it has written.
+
     **A child inherits no command** (SPEC-097 FR-006). The deferred stops would wait for a sink
     change whose other half, the parent's drain and closers, is not in the child, and the forking
     thread's command-path state belongs to the parent's call, so both are dropped.
@@ -1662,6 +1933,8 @@ def _clear_after_fork() -> None:
     with _state._lock:
         with _state._closes._lock:
             _state._closes._in_flight.clear()
+            _state._closes._written.clear()
+            _state._closes._after.clear()
             _state._swaps_running.clear()
             _state._stops_running.clear()
         _state._shutdown_running = 0
@@ -2737,6 +3010,20 @@ def release(
     library release inherits that release's keep too; every sink it would then skip is live or
     closed by another owner, so the skip is in the safe direction.
 
+    **A member attached to the sink is closed after it** (SPEC-101). Once ``sink.close()`` has
+    returned or raised, still inside this release's depth and before its entry is discharged,
+    :func:`_release_after` closes on this thread the members the library attached to the sink
+    as a caller's wrapper: those ordered behind it by the same take, always, and its persistent
+    ones when a keep is active. A forward the keep spares attaches its sink to the caller's
+    wrapper that should close it (:func:`_attach_skipped`). A take's release that performs no
+    close, refused by :func:`releasable` or given no thread, releases the members ordered behind
+    the sink on their own (:func:`_release_ordered_alone`), so each of their entries is
+    discharged. An interrupt that reaches this release's own ``finally`` before
+    :func:`_release_after` took the ordered members — one landing as it is entered, say — leaves
+    them in the record, so that ``finally`` puts back whatever is still ordered behind the sink,
+    each entry discharged, before it discharges the sink's own (:func:`_put_back_rest`). After a
+    normal close nothing is left there, and the read costs one dictionary lookup.
+
     Args:
       sink: The sink to close.
       detached: Whether to close on a daemon thread rather than inline. Detached is for a sink
@@ -2763,20 +3050,30 @@ def release(
     Raises:
       Exception: Whatever an inline ``close()`` raised. A refused release raises nothing, and
         neither does a detached one: its thread body absorbs, since there is no caller left to
-        hand it to.
+        hand it to. An ``Exception`` from a member closed after the sink is absorbed.
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from ``close()``, or from the close
+        of a member closed after the sink, or released on its own after a refused take
+        (SPEC-101 FR-003), once every ordered member not yet closed is put back.
     """
     if not releasable(sink, owner=owner):
         _state._closes.finish(sink, closing)
+        if closing is not None:
+            _release_ordered_alone(sink, keeping, detached=detached)
         return None
     active = keeping if keeping is not None else (_active_keep() if owner is not None else None)
-    if owner is not None and active is not None and active.spares(sink):
-        _state._closes.finish(sink, closing)
-        return None
+    if owner is not None and active is not None:
+        spared = active.spares(sink)
+        if spared is not None:
+            _state._closes.finish(sink, closing)
+            _attach_skipped(active, sink, spared, owner)
+            return None
     if detached:
         entry = closing if closing is not None else _state._closes.register(sink, _Rule.GRACED)
         closer = _start_closer(sink, entry, keeping=active)
         if closer is None:
             _state._closes.finish(sink, entry)
+            if closing is not None:
+                _release_ordered_alone(sink, active, detached=True)
         return closer
     epoch = _close_clock(sink)
     depth = _release_depth()
@@ -2785,12 +3082,18 @@ def release(
     try:
         _state._releasing_here.depth = depth + 1
         _state._releasing_here.keep = active
-        sink.close()
+        try:
+            sink.close()
+        finally:
+            _release_after(sink, active)
     finally:
         _state._releasing_here.depth = depth
         _state._releasing_here.keep = prior
         try:
-            _state._closes.finish(sink, registration)
+            try:
+                _put_back_rest(_state._closes.take_ordered(sink))
+            finally:
+                _state._closes.finish(sink, registration)
         finally:
             _settle_close(sink, epoch, repin=depth == 0)
     return None
@@ -3224,6 +3527,16 @@ def _installed_graph(
     return graph
 
 
+_KEPT = "kept"
+"""A forward is skipped because the graph the deciding swap installs keeps its sink."""
+
+_REMAINING = "remaining"
+"""A forward is skipped because its sink lies beneath a sink the record still holds."""
+
+_CLAIMED = "closed"
+"""A forward is skipped because the same decision already closes its sink."""
+
+
 class _Keep:
     """What one release of one decision must not close through a wrapper's forward (FR-002).
 
@@ -3261,6 +3574,9 @@ class _Keep:
       kept: The installed graph by ``id``; empty for the closer's take.
       remaining: The sinks the record still held after the section's takes.
       closed: By ``id``, each sink this decision closes and the token of the claim on it.
+      root: The sink the deciding swap installs, whose graph ``kept`` is; ``None`` for the
+        closer's take (SPEC-101). A member the keep spares as kept moves to its closest caller's
+        wrapper in that graph.
     """
 
     def __init__(
@@ -3268,13 +3584,15 @@ class _Keep:
         kept: Mapping[int, object],
         remaining: Sequence[Sink],
         closed: dict[int, tuple[object, object]],
+        root: Sink | None = None,
     ) -> None:
-        """Builds a keep from its three parts, reading no graph yet.
+        """Builds a keep from its parts, reading no graph yet.
 
         Args:
           kept: The installed graph, or an empty map for the closer's take.
           remaining: The sinks the record still holds after the section's takes.
           closed: The decision's one map of the sinks it closes, shared across its sections.
+          root: The sink the deciding swap installs, or ``None`` for the closer's take.
 
         Returns:
           None.
@@ -3285,6 +3603,7 @@ class _Keep:
         self.kept = kept
         self.remaining = remaining
         self.closed = closed
+        self.root = root
         self._remaining_graph: dict[int, object] | None = None
 
     def took(self, sink: object) -> None:
@@ -3327,26 +3646,31 @@ class _Keep:
             self._remaining_graph = graph
         return graph
 
-    def spares(self, sink: object) -> bool:
-        """Whether a forwarded release of *sink* is skipped; claims the sink when it is not.
+    def spares(self, sink: object) -> str | None:
+        """Why a forwarded release of *sink* is skipped, or ``None``, claiming the sink then.
+
+        The reason is what :func:`_attach_skipped` acts on (SPEC-101): a sink the installed graph
+        keeps moves to its closest caller's wrapper there, one beneath a remaining sink is
+        attached to its closest caller's wrapper among those, and one this decision already
+        claimed stays claimed.
 
         Args:
           sink: The sink a wrapper is forwarding a release of.
 
         Returns:
-          Whether it is kept, lies in the graph of a remaining sink, or is already claimed by
-          this decision, in which case the forward performs no close.
+          ``"kept"``, ``"remaining"`` or ``"closed"`` when the forward performs no close, and
+          ``None`` when it performs one, having claimed the sink for this decision.
 
         Raises:
           None.
         """
         if self.kept.get(id(sink)) is sink:
-            return True
+            return _KEPT
         if self.remaining and self.remaining_graph().get(id(sink)) is sink:
-            return True
+            return _REMAINING
         token = object()
         claim = self.closed.setdefault(id(sink), (sink, token))
-        return not (claim[0] is sink and claim[1] is token)
+        return None if claim[0] is sink and claim[1] is token else _CLAIMED
 
 
 def _lies_beneath(
@@ -3404,6 +3728,382 @@ def _active_keep() -> _Keep | None:
     return keep
 
 
+_AFTER_HOLDER = "closing a sink after the wrapper that holds it"
+"""The ``_diag`` phrase of a member close after its holder that raised (SPEC-101 FR-001)."""
+
+
+def _ships_close(holder: object) -> bool:
+    """Whether the holder's ``close``, read statically, is defined in this package (SPEC-101).
+
+    A holder whose ``close`` is not the package's is a **caller's wrapper**: a subclass of a
+    shipped wrapper that overrides ``close`` is one, and a subclass that inherits it is not. The
+    class defining ``close`` is read statically by ``_fork._member_defined_here``, through
+    ``sinks.base._class_member`` and ``_fork._defined_here``, so no descriptor, metaclass
+    ``__hash__`` or ``__eq__`` and no ``__module__`` property runs, and this module imports
+    nothing new. A class that cannot be read, or has no ``close`` of its own along its MRO, is not
+    shown to be the package's, so it is read as a caller's wrapper, and its member is closed after
+    it rather than left unclosed.
+
+    Args:
+      holder: A sink whose graph reaches another sink.
+
+    Returns:
+      Whether its ``close`` is defined in this package.
+
+    Raises:
+      None.
+    """
+    return _fork._member_defined_here(holder, "close")
+
+
+def _caller_graphs(candidates: Iterable[object]) -> list[tuple[object, Mapping[int, object]]]:
+    """Reads the graph of each caller's wrapper among *candidates*, with no lock held.
+
+    Args:
+      candidates: Sinks that may hold a member: a graph's sinks, or a keep's.
+
+    Returns:
+      Each candidate whose ``close`` is not the package's, with its graph.
+
+    Raises:
+      None.
+    """
+    return [(sink, _installed_graph(sink)) for sink in candidates if not _ships_close(sink)]
+
+
+def _closest_caller_holder(
+    sink: object, holders: Sequence[tuple[object, Mapping[int, object]]]
+) -> object | None:
+    """Returns the caller's wrapper closest above *sink*: the smallest graph that reaches it.
+
+    Args:
+      sink: The member.
+      holders: Caller's wrappers with their graphs, from :func:`_caller_graphs`.
+
+    Returns:
+      The holder whose graph reaches the sink and is smallest, or ``None`` when none reaches it.
+
+    Raises:
+      None.
+    """
+    best: object | None = None
+    size = 0
+    for holder, graph in holders:
+        if holder is sink or graph.get(id(sink)) is not sink:
+            continue
+        if best is None or len(graph) < size:
+            best, size = holder, len(graph)
+    return best
+
+
+def _attach_written(root: Sink, graph: Mapping[int, object]) -> None:
+    """Attaches every written sink in an installed graph to its closest caller's wrapper.
+
+    SPEC-101 FR-001's attach, made at every ``configure(sink=…)`` before its first critical
+    section, with no lock held but the registry's leaf for each read and write. A sink with no
+    caller's wrapper above it is attached to nothing, because a shipped holder's forward closes
+    it, and the root is above everything. The graphs of the caller's wrappers are read only when
+    the installed graph holds a written sink besides its root, so a configure of a fresh sink, or
+    of a wrapper over sinks nothing wrote to, reads no extra graph.
+
+    Args:
+      root: The sink the change installs.
+      graph: Its installed graph, by ``id``.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    written = [
+        sink for sink in graph.values() if sink is not root and _state._closes.was_written(sink)
+    ]
+    if not written:
+        return
+    holders = _caller_graphs(graph.values())
+    for sink in written:
+        holder = _closest_caller_holder(sink, holders)
+        if holder is not None:
+            _state._closes.attach_member(cast("Sink", holder), cast("Sink", sink))
+
+
+def _attach_skipped(keep: _Keep, sink: object, reason: str, owner: object) -> None:
+    """Attaches a member whose forwarded release the keep spared, by the reason it spared it.
+
+    SPEC-101 FR-001. A member the graph the deciding swap installs keeps **moves**: it leaves
+    the caller's wrapper that forwarded it, when that wrapper is one, for its closest caller's
+    wrapper in the installed graph. A member beneath a sink the record still holds is attached to
+    its closest caller's wrapper among those sinks, where a shipped holder's forward would have
+    closed it but a caller's wrapper's close need not. A member the same decision already claimed
+    stays claimed and is attached to nothing. Called with no lock held, from :func:`release`'s
+    spared exit, which never runs under ``_state._lock``.
+
+    Args:
+      keep: The deciding call's keep.
+      sink: The member it spared.
+      reason: What :meth:`_Keep.spares` returned.
+      owner: The wrapper whose forward or after-holder close released it.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if reason == _KEPT:
+        _state._closes.detach_member(owner, sink)
+        candidates: Iterable[object] = keep.kept.values() if keep.root is not None else ()
+    elif reason == _REMAINING:
+        candidates = keep.remaining_graph().values()
+    else:
+        return
+    holder = _closest_caller_holder(sink, _caller_graphs(candidates))
+    if holder is not None:
+        _state._closes.attach_member(cast("Sink", holder), cast("Sink", sink))
+
+
+def _order_after(
+    taken: Sequence[Sink], graphs: Mapping[int, tuple[object, Mapping[int, object]]] | None
+) -> dict[int, Sink]:
+    """Picks, for each taken sink beneath a taken caller's wrapper, the wrapper it closes after.
+
+    SPEC-101 FR-002. Among the taken caller's wrappers whose graph reaches the sink and that the
+    sink's own graph does not reach, the closest is the one with the smallest graph. A holder whose
+    ``close`` is the package's is never chosen: its forward already skips a member the decision
+    took, and ordering behind it would only delay the member to its slowest close. Since graphs
+    are read transitively, a sink never ends up ordered behind itself through a chain.
+
+    :func:`_close_owed` passes ``None`` and the graphs are read here, with no lock held. The
+    swap's stale take decides under ``_state._lock``, so it passes the graphs it read before its
+    first section, and a sink with no pre-read graph is neither ordered nor ordered behind: its
+    close runs as it would without this.
+
+    Args:
+      taken: The sinks one take is about to close.
+      graphs: Pre-read graphs by ``id``, each with the sink it was read from, or ``None`` to read.
+
+    Returns:
+      By the member's ``id``, the caller's wrapper it is closed after.
+
+    Raises:
+      None.
+    """
+    if len(taken) < 2:
+        return {}
+    holders = [sink for sink in taken if not _ships_close(sink)]
+    if not holders:
+        return {}
+    read: dict[int, Mapping[int, object]] = {}
+    for sink in taken:
+        if graphs is None:
+            read[id(sink)] = _installed_graph(sink)
+            continue
+        entry = graphs.get(id(sink))
+        if entry is not None and entry[0] is sink:
+            read[id(sink)] = entry[1]
+    order: dict[int, Sink] = {}
+    for sink in taken:
+        own = read.get(id(sink))
+        if own is None:
+            continue
+        best: Sink | None = None
+        size = 0
+        for holder in holders:
+            graph = read.get(id(holder))
+            if holder is sink or graph is None or graph.get(id(sink)) is not sink:
+                continue
+            if own.get(id(holder)) is holder:
+                continue
+            if best is None or len(graph) < size:
+                best, size = holder, len(graph)
+        if best is not None:
+            order[id(sink)] = best
+    return order
+
+
+def _put_back_ordered(pairs: Sequence[tuple[Sink, _Close]]) -> None:
+    """Puts back taken sinks and, transitively, every member ordered behind them.
+
+    SPEC-101 FR-003. A holder put back keeps its persistent members; a member ordered behind it
+    is put back with its taken entry, which :meth:`_CloseRegistry.put_back` discharges, and so is
+    every member ordered behind that one in turn, until none remain. Each entry is discharged
+    once, however many routes reach it. The caller holds ``_state._lock``, and the registry's leaf
+    is taken and released once per step, never held across a put-back.
+
+    Args:
+      pairs: Taken sinks with their entries, none of them handed to a closer.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    seen: set[int] = set()
+    stack = list(pairs)
+    while stack:
+        sink, closing = stack.pop()
+        if id(closing) in seen:
+            continue
+        seen.add(id(closing))
+        _state._closes.put_back(sink, closing)
+        stack.extend(_state._closes.take_ordered(sink))
+
+
+def _put_back_rest(pairs: list[tuple[Sink, _Close]]) -> None:
+    """Puts back the ordered members a caller took and did not hand to a release (SPEC-101).
+
+    The list is emptied **before** the put-back, so of the two handlers that may reach one list
+    for one interrupt — :func:`_release_ordered`'s and :func:`_release_after`'s — only the first
+    puts anything back, and no entry is discharged twice. A second interrupt landing inside the
+    put-back would leave the rest unreturned rather than discharge an entry twice, which is the
+    safer of the two: a second discharge could set the event of a close another participant is
+    still performing. ``_state._lock`` is taken only when something is left, and it is re-entrant,
+    so a caller already holding it, the swap's stale take, takes nothing new.
+
+    Args:
+      pairs: The caller's list of taken ordered members not yet handed to a release.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    rest = pairs[:]
+    pairs.clear()
+    if rest:
+        with _state._lock:
+            _put_back_ordered(rest)
+
+
+def _release_ordered(
+    pairs: list[tuple[Sink, _Close]], keep: _Keep | None, *, detached: bool
+) -> None:
+    """Releases ordered members in sequence, each with its taken entry (SPEC-101).
+
+    An ``Exception`` from a member's close is absorbed with one ``_diag`` line, and the next is
+    still closed. A ``BaseException`` reaches the caller, as an inline close's does (SPEC-025),
+    once every member not yet released is put back with its entry discharged
+    (:func:`_put_back_rest`), so it is owed when the call returns with no close of it in flight.
+
+    **It consumes the caller's list**, each member leaving it as it is handed to its release, so
+    the list holds exactly the members not yet handed off however the call leaves: an interrupt
+    landing as this is entered, before its ``try`` opens, leaves the list whole for
+    :func:`_release_after`'s own handler to put back. :func:`_release_ordered_alone` has no such
+    handler, so that window stays open on its route.
+
+    Args:
+      pairs: The ordered members and their entries, emptied as each is released.
+      keep: The deciding call's keep, handed on to each release.
+      detached: Whether each member is released on a thread of its own.
+
+    Returns:
+      None.
+
+    Raises:
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` a member's close raised.
+    """
+    try:
+        while pairs:
+            member, closing = pairs.pop(0)
+            try:
+                release(member, detached=detached, closing=closing, keeping=keep)
+            except Exception as exc:
+                _diag.absorbed(_AFTER_HOLDER, exc, "it may still hold its resources")
+    except BaseException:
+        _put_back_rest(pairs)
+        raise
+
+
+def _release_ordered_alone(holder: Sink, keep: _Keep | None, *, detached: bool) -> None:
+    """Releases the members ordered behind a holder whose take performed no close (SPEC-101).
+
+    A take's release of a holder that :func:`releasable` refuses, or whose closer thread never
+    started, closes nothing, so nothing closes after it. Its ordered members are released on their
+    own here, in the same mode, so each entry is discharged: in a forked child each is refused in
+    turn and closes nothing, and in a process out of threads each tries a thread of its own.
+
+    Args:
+      holder: The holder whose release performed no close.
+      keep: The deciding call's keep.
+      detached: Whether the holder's release was detached.
+
+    Returns:
+      None.
+
+    Raises:
+      BaseException: As :func:`_release_ordered` does.
+    """
+    pairs = _state._closes.take_ordered(holder)
+    if pairs:
+        _release_ordered(pairs, keep, detached=detached)
+
+
+def _release_after(holder: Sink, keep: _Keep | None) -> None:
+    """Closes the members attached to a holder, after its close returned or raised (SPEC-101).
+
+    Called by :func:`release` on the thread that closed the holder, inside the release's depth,
+    so each member's release is nested and the holder's re-pins once, and before the holder's
+    entry is discharged. The members **ordered** behind the holder (FR-002) are closed first, each
+    with its taken entry, and dropped. The **persistent** ones are closed only inside a decision,
+    with its keep, and stay attached. A persistent member is skipped when the record owes it,
+    since its own take closes it, or when a close of it is in flight; the one ``_state._lock``
+    section that reads both is taken only when the holder has persistent members. Its release
+    passes the holder as its owner, so it asks :func:`releasable` and the keep as a shipped
+    wrapper's forward does: a member the keep spares is attached elsewhere
+    (:func:`_attach_skipped`), and one a shipped forward of the same decision already closed stays
+    claimed. The library does not ask whether the holder closed the member itself, because it
+    cannot see that: a caller's wrapper that does gets a second close, in sequence.
+
+    **An interrupt from the take of the ordered members to their release puts them back.** They
+    leave the record at :meth:`_CloseRegistry.members_of` and are not handed off until
+    :func:`_release_ordered`, and between the two sits the persistent read, whose
+    ``_state._lock`` section an interrupt can land in whenever the holder is persistent and
+    ordered at once — an unconfirmed swap into a caller's wrapper over the sink it displaced is
+    exactly that. So one handler covers the take, the read and the hand-off, and puts back with
+    its entry discharged every member still in the list (:func:`_put_back_rest`); measured before
+    it, one interrupt there left the member owed by nobody and in flight forever, and every later
+    ``shutdown()`` spent the whole grace waiting on it.
+
+    Args:
+      holder: The sink whose close has just returned or raised.
+      keep: The release's keep, or ``None`` outside every decision.
+
+    Returns:
+      None.
+
+    Raises:
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` a member's close raised, after the
+        ordered members not yet closed are put back. An ``Exception`` is absorbed.
+    """
+    ordered: list[tuple[Sink, _Close]] = []
+    try:
+        persistent = _state._closes.members_of(holder, ordered)
+        if keep is None:
+            persistent = []
+        if not persistent and not ordered:
+            return
+        skip: set[int] = set()
+        if persistent:
+            with _state._lock:
+                for member in persistent:
+                    if _state._closes.owes(member) or _state._closes.in_flight(member):
+                        skip.add(id(member))
+        _release_ordered(ordered, keep, detached=False)
+    except BaseException:
+        _put_back_rest(ordered)
+        raise
+    for member in persistent:
+        if id(member) in skip:
+            continue
+        try:
+            release(member, owner=holder, keeping=keep)
+        except Exception as exc:
+            _diag.absorbed(_AFTER_HOLDER, exc, "it may still hold its resources")
+
+
 def _pin_inherited() -> None:
     """Holds strongly every entry a forked child inherited whose sink is alive (SPEC-081 FR-004).
 
@@ -3448,7 +4148,8 @@ def _start_closer(
     it was flushing.
 
     The started thread is attached to the close's entry, which is what the graced wait joins and
-    ``health().closing_sinks`` counts.
+    ``health().closing_sinks`` counts, and to the entry of each member ordered behind the sink
+    (SPEC-101), since the thread closes those after it.
 
     Args:
       sink: The sink that was swapped out.
@@ -3479,7 +4180,7 @@ def _start_closer(
             "it is left open and may still hold its resources",
         )
         return None
-    _state._closes.attach(closing, closer)
+    _state._closes.attach(closing, closer, sink)
     return closer
 
 
@@ -3492,6 +4193,12 @@ def _close_guarded(sink: Sink, closing: _Close, keeping: _Keep | None = None) ->
     itself. It goes back through :func:`release` rather than calling ``close()`` itself, so the
     thread body is one of the eight callers rather than a ninth close (SPEC-042 FR-002).
 
+    The thread first attaches itself to its entry and to the entry of each member ordered behind
+    the sink (:meth:`_CloseRegistry.attach`, SPEC-101), before its release can take those members:
+    a holder whose ``close()`` returns at once has them taken before the starter's own attach
+    runs, and a member's entry with no thread is neither counted by ``health().closing_sinks``
+    nor waited on by the shutdown's graced wait in its own right.
+
     Args:
       sink: The sink to close.
       closing: The in-flight entry the close discharges.
@@ -3503,6 +4210,7 @@ def _close_guarded(sink: Sink, closing: _Close, keeping: _Keep | None = None) ->
     Raises:
       None.
     """
+    _state._closes.attach(closing, threading.current_thread(), sink)
     try:
         release(sink, closing=closing, keeping=keeping)
     except Exception as exc:
@@ -4507,6 +5215,17 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     call's own closes. The read is made with no lock held and inside the ``try``, so an interrupt
     during it is put back like any other.
 
+    **A taken sink beneath a taken caller's wrapper is closed after that wrapper** (SPEC-101
+    FR-002). After the pass-over, with no lock held and inside the ``try``, :func:`_order_after`
+    reads the graphs of what the take took, and each taken sink lying beneath a taken caller's
+    wrapper is attached to the closest such wrapper with its entry, left out of the inline choice
+    and the fan-out, and dropped from the sinks this call must still hand off: the wrapper's
+    release closes it after the wrapper's own close, so a wrapper that closes its member and the
+    take's own close never overlap. A member ordered behind a ``GRACED`` wrapper is ``GRACED``
+    too, so the graced wait and ``health().closing_sinks`` count it with the wrapper's thread.
+    The put-back below returns each put-back sink's ordered members with it, transitively, and
+    discharges every entry once (:func:`_put_back_ordered`).
+
     **SPEC-097 adds two things to the take.** A take that takes the sink a published sink change
     installs marks that change ``withheld`` (FR-001), in the same section, so the change does not
     arm a sink this stop is closing. And a ``detach`` stop, the one a change runs for the stops
@@ -4574,9 +5293,21 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
             else set()
         )
         taken = [sink for sink in taken if id(sink) not in passed]
+        order = _order_after(taken, None)
+        if order:
+            rules = {id(sink): close.rule for sink, close in entries}
+            for sink, close in entries:
+                holder = order.get(id(sink))
+                if holder is None:
+                    continue
+                if rules[id(holder)] is _Rule.GRACED:
+                    close.rule = _Rule.GRACED
+                _state._closes.attach_member(holder, sink, close)
+                del undischarged[id(sink)]
+            taken = [sink for sink in taken if id(sink) not in order]
         inline = _inline_close_choice(taken, worker) if taken and not operation.detach else None
         for sink, close in entries:
-            if sink is inline or id(sink) in passed:
+            if sink is inline or id(sink) in passed or id(sink) in order:
                 continue
             del undischarged[id(sink)]
             if close.rule is _Rule.GRACED:
@@ -4608,8 +5339,7 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     finally:
         if undischarged:
             with _state._lock:
-                for sink, close in undischarged.values():
-                    _state._closes.put_back(sink, close)
+                _put_back_ordered(list(undischarged.values()))
         _state._closes.join_joined(joined)
     if not waiting:
         return False
@@ -5806,6 +6536,16 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     owed as a root was one nothing is using while the drain thread is inside it through the
     wrapper — measured, an expired ``shutdown(timeout=0.3)`` closed it under that thread.
 
+    **It attaches every written sink in the graph it installs** (SPEC-101 FR-001), right after
+    that read and before its first critical section: a sink this process armed that lies beneath
+    a caller's wrapper in that graph is attached to the closest one (:func:`_attach_written`), so
+    the library closes it after each close of that wrapper it makes. In the stale take, a stale
+    sink lying beneath a stale caller's wrapper the same take releases is ordered behind it
+    instead of being handed a closer of its own (:func:`_order_after`), from the graphs read
+    before the section; one whose graph was not read is not ordered. Each ordered sink is taken
+    and attached in a loop of its own, after the take's ``took`` and before any release starts a
+    thread.
+
     **Every release it starts carries one decision's keep** (:class:`_Keep`): the installed graph,
     the sinks the record still holds after the section's takes (worked out under the lock before
     anything is taken, because each take stays inside its own ``release`` call), and one map of
@@ -5916,6 +6656,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     armed = False
     try:
         kept = _installed_graph(new_sink)
+        _attach_written(new_sink, kept)
         closed: dict[int, tuple[object, object]] = {}
         owed_now = list(_state._closes.owed.values())
         graphs = (
@@ -5952,10 +6693,20 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                 kept,
                 [sink for sink in _state._closes.owed.values() if id(sink) not in leaving],
                 closed,
+                root=new_sink,
             )
             for stale in taking:
                 keep.took(stale)
+            order = _order_after(taking, graphs)
             for stale in taking:
+                holder = order.get(id(stale))
+                if holder is not None:
+                    _state._closes.attach_member(
+                        holder, stale, _state._closes.take(stale, _Rule.GRACED)
+                    )
+            for stale in taking:
+                if id(stale) in order:
+                    continue
                 closer = release(
                     stale,
                     detached=True,
@@ -6014,6 +6765,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                             kept,
                             [sink for sink in _state._closes.owed.values() if sink is not previous],
                             closed,
+                            root=new_sink,
                         )
                         second.took(previous)
                         closer = release(

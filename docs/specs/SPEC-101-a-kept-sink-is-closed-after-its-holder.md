@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-101
 title: "A Kept Sink Behind a Caller's Wrapper Is Closed After That Wrapper, Never Beside It"
 description: "Has the library close a sink it wrote to, wherever a caller's wrapper holds it, after each close of that wrapper the library makes, so a wrapper that leaves its member alone no longer leaves the member closed by nobody, a wrapper that closes its member gives it a second close in sequence rather than two at once, and the model test learns to tell a wrapper's close from the library's."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-042, SPEC-054, SPEC-076, SPEC-081, SPEC-086, SPEC-087, SPEC-097, SPEC-098]
 arc: audit-2026-11-14
 arc_order: 17
@@ -211,7 +211,14 @@ sink (SPEC-042). Every path that closes a holder therefore carries it:
 
 **An interrupt** between a take and the hand-off of a holder puts the holder back
 (`_CloseRegistry.put_back`). The holder keeps its persistent attachments. A member ordered behind
-it by FR-002 is put back with its taken entry, which `put_back` discharges.
+it by FR-002 is put back with its taken entry, which `put_back` discharges, and so, in turn, is
+every member ordered behind that member, until none remain; each entry is discharged once.
+
+**A take's release of a holder that performs no close**, because `releasable` refuses the holder
+or its closer thread never started, closes nothing after it either. The members FR-002 ordered
+behind it are then released on their own, in the same mode (`_release_ordered_alone`), so each of
+their entries is discharged: in a forked child each is refused in turn and closes nothing, and an
+ordered member's in-flight entry is never left behind by a refused holder.
 
 A `BaseException` raised by a member's close reaches the caller, as an inline close's does
 (SPEC-025). Every member that FR-002 ordered behind the same holder and that has not been closed
@@ -240,6 +247,9 @@ it, so the after-holder close hands nothing.
       closes A once (`lifecycle/spec101_interrupt.py`) (invariants 1 and 5).
 - [ ] A member FR-002 ordered behind a holder whose member close raises `KeyboardInterrupt` is
       owed when the call returns, with no close of it in flight (invariants 1 and 5).
+- [ ] A child forked after an unconfirmed `configure(A)` then `configure(Mine(A))` calls
+      `shutdown()`: its take orders A behind the inherited `Mine(A)`, which `releasable` refuses,
+      and the child closes A zero times with no close of A left in flight (invariant 12).
 - [ ] On the tree carrying SPEC-097 and SPEC-098, `tests/test_model_cells.py`'s 637 cells give the
       same verdict, cell for cell, as the same tree without this change (invariant 6).
 
@@ -257,7 +267,7 @@ The sequential driver of `tests/test_invariants_model.py` installs a fresh recor
 `current` is the configured sink. A wrapper is installed only when that sink is a recorder the
 library has already written to. Otherwise the step installs a fresh recorder. The draw comes from
 a second random stream keyed on the seed, so every seed's list of steps is unchanged. `Leaves` and
-`Mine` live beside the recorder.
+`Mine` live beside the recorder, in `tests/test_invariants_model.py`.
 
 `Mine.close()` sets a thread-local mark around its close of its member. The recorder records each
 close's mark in a new `Closes.by_wrapper` field, which defaults to empty so SPEC-085's cells,
@@ -309,7 +319,8 @@ These are the completion ritual's edits.
     also owes it, two closes overlapping".
   - **Exceptions added.** Three replace them:
     - a caller's wrapper that closes its member closes it once itself, and the library closes it
-      again after, in sequence and never overlapping;
+      again after, in sequence and never overlapping, save for the swap's unlocked graph-read
+      window §12 holds open;
     - a member ordered behind a caller's wrapper is closed only when that wrapper's `close()`
       returns, so a slow close delays the member and one that never returns leaves it unclosed;
     - a sink the library first writes through a caller's wrapper is that wrapper's to close.
@@ -336,8 +347,8 @@ These are the completion ritual's edits.
     say-so".
 - **README, *Writing your own sink*.**
   - The second route becomes: "leave the member's close out of your wrapper's `close()`. The
-    library closes a member it has delivered to directly after each close of your wrapper, and a
-    member it never delivered to directly is yours to close."
+    library closes a member it has delivered to directly after each close of your wrapper that the
+    library makes, and a member it never delivered to directly is yours to close."
   - New sentence: a wrapper that closes its member itself gets a second `close()` of that member
     from the library after its own, which the protocol's idempotent close absorbs.
   - New sentence: a slow `close()` delays that member's close.
@@ -374,19 +385,31 @@ These are the completion ritual's edits.
 
 ```python
 # src/log_foundry/_lifecycle.py — private
+class _Member:
+    __slots__ = ("closing", "ref")
+    ref: object
+    """The member: a ``weakref.ref`` for a persistent member whose type allows one, else the sink
+    itself (an ordered member is always held strongly)."""
+    closing: _Close | None
+    """``None`` for a persistent attachment; the member's taken ``_Close`` for one FR-002 ordered,
+    which is closed once and dropped. An ordered member sits beside a persistent one of the same
+    sink and never replaces it."""
+
 class _CloseRegistry:
-    _written: dict[int, weakref.ref[Sink] | Sink]
-    """By id, each sink this process armed as a root; strong only for a type that cannot be weakly
-    referenced. Guarded by ``_lock``; an entry whose sink is gone is dropped."""
-    _after: dict[int, tuple[weakref.ref[Sink] | Sink, list[list[object]]]]
-    """By holder id, the holder and its attached members, each ``[member, closing]``: ``closing``
-    is ``None`` for a persistent attachment and the member's taken ``_Close`` for one FR-002
-    ordered, which is closed once and dropped. Guarded by ``_lock``; cleared with ``_written`` and
-    the in-flight half in ``_clear_after_fork``."""
+    _FORK_SKIP = ("owed", "_written", "_after")
+    _written: dict[int, object]
+    """By id, each sink this process armed (a ``weakref.ref``, or the sink when its type cannot be
+    weakly referenced), recorded by ``arm`` under ``_lock``; dead entries are pruned on each first
+    record of a sink. Cleared in ``_clear_after_fork``."""
+    _after: dict[int, tuple[object, list[_Member]]]
+    """By holder id, the holder (weak where its type allows) and its attached members. Guarded by
+    ``_lock``; dead holders and dead persistent members are pruned on each attach; cleared with
+    ``_written`` and the in-flight half in ``_clear_after_fork``."""
 
 class _Keep:
     root: Sink | None
-    """The sink the deciding swap installs; ``None`` for the closer's take."""
+    """The sink the deciding swap installs, a constructor argument; ``None`` for the closer's
+    take."""
 ```
 
 ```python
@@ -406,25 +429,50 @@ No public surface changes. Private, in `src/log_foundry/_lifecycle.py`:
 
 ```python
 class _CloseRegistry:
-    def attach(self, holder: Sink, member: Sink, closing: _Close | None = None) -> None: ...
-    def take_ordered(self, holder: Sink) -> list[tuple[Sink, _Close]]: ...
-    def was_written(self, sink: Sink) -> bool: ...
+    def arm(self, sink: Sink) -> None: ...  # also records the sink as written, under _lock
+    def was_written(self, sink: object) -> bool: ...
+    def attach_member(self, holder: Sink, member: Sink, closing: _Close | None = None) -> None: ...
+    def detach_member(self, holder: object, member: object) -> None: ...
+    def members_of(self, holder: object, ordered: list[tuple[Sink, _Close]]) -> list[Sink]: ...
+    """The holder's live persistent members; its ordered ones, taken, into the caller's list."""
+    def take_ordered(self, holder: object) -> list[tuple[Sink, _Close]]: ...
+    def attach(self, close: _Close, thread: threading.Thread, holder: object = None) -> None: ...
+    """Also gives the thread to each member ordered behind ``holder``, for closing_sinks."""
+
+class _Keep:
+    def __init__(self, kept, remaining, closed, root: Sink | None = None) -> None: ...
+    def spares(self, sink: object) -> str | None: ...  # "kept", "remaining", "closed" or None
 
 def _ships_close(holder: object) -> bool:
-    """Whether the holder's ``close``, read statically, is defined in the package."""
+    """Whether the holder's ``close``, read statically, is defined in the package: through
+    ``_fork._member_defined_here``, which reads ``sinks.base._class_member`` and
+    ``_fork._defined_here``, never ``inspect.getattr_static``."""
 
-def _closest_caller_holder(sink: Sink, roots: Sequence[Sink]) -> Sink | None: ...
+def _caller_graphs(candidates: Iterable[object]) -> list[tuple[object, Mapping[int, object]]]: ...
+def _closest_caller_holder(
+    sink: object, holders: Sequence[tuple[object, Mapping[int, object]]]
+) -> object | None: ...
 def _attach_written(root: Sink, graph: Mapping[int, object]) -> None: ...
-def _attach_skipped(keep: _Keep, sink: Sink, previous: Sink | None = None) -> None: ...
-def _release_after(holder: Sink, keep: _Keep) -> None: ...
-def _order_after(taken: Sequence[Sink]) -> dict[int, Sink]: ...
+def _attach_skipped(keep: _Keep, sink: object, reason: str, owner: object) -> None: ...
+def _order_after(
+    taken: Sequence[Sink], graphs: Mapping[int, tuple[object, Mapping[int, object]]] | None
+) -> dict[int, Sink]: ...  # the swap passes its pre-read graphs; _close_owed passes None
+def _put_back_ordered(pairs: Sequence[tuple[Sink, _Close]]) -> None: ...  # transitive
+def _release_ordered(pairs, keep: _Keep | None, *, detached: bool) -> None: ...
+def _release_ordered_alone(holder: Sink, keep: _Keep | None, *, detached: bool) -> None: ...
+def _release_after(holder: Sink, keep: _Keep | None) -> None: ...
 
 # release(): after sink.close() returns or raises, and before its entry is discharged:
-#     if active is not None: _release_after(sink, active)
+#     _release_after(sink, active)  # ordered members always; persistent ones only with a keep
+# release()'s refused and thread-less exits, when handed a take's entry:
+#     _release_ordered_alone(sink, keeping, detached=detached)
+
+# src/log_foundry/_fork.py — private
+def _member_defined_here(value: object, name: str) -> bool: ...
 ```
 
 ```python
-# tests/model_sinks.py
+# tests/test_invariants_model.py
 class Leaves: ...   # emit forwards; close() leaves the member alone
 class Mine: ...     # emit forwards; close() marks its thread, closes the member, unmarks
 ```
@@ -433,11 +481,13 @@ class Mine: ...     # emit forwards; close() marks its thread, closes the member
 
 ```
 src/log_foundry/_lifecycle.py           # the two records, the after-holder close, the take order
+src/log_foundry/_fork.py                # _member_defined_here, the static read of close's class
 tests/test_after_holder_close.py        # new: FR-001 to FR-003
-tests/model_sinks.py                    # Leaves and Mine
 tests/model_oracles.py                  # Closes.by_wrapper; check_repeat reads it
-tests/test_invariants_model.py          # the configure step's install draw
+tests/test_invariants_model.py          # Leaves, Mine and the configure step's install draw
+tests/test_model_oracles.py             # check_repeat's four wrapper rows
 tests/test_shared_sink_swap.py          # three tests rewritten to FR-001's counts
+tests/test_stable_stop_signal.py        # the two reinstall tests reach "set, still open" anew
 ```
 
 ## Implementation Phases
@@ -590,10 +640,24 @@ tree.
   tree. So they come from SPEC-097's prototype leaving state behind between tests, not from this
   change and not from chance.
 - **This prototype.** It adds the same eight failures in both modes, all in
-  `test_shared_sink_swap.py`, and each pins a count FR-001 changes:
+  `test_shared_sink_swap.py`, and each pins a count FR-001 changes (on `5d0e7f68`, which carries
+  SPEC-098, the build failed two more, listed after these):
   - the two `Leaves` rows read 1 close where they assert 0;
   - the four caller's-wrapper forward rows and the two hoarding rows read `closes=2 overlaps=0
-    refused=0` where they assert 1.
+    refused=0` where they assert 1;
+  - on the build, also `tests/test_stable_stop_signal.py`'s
+    `test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_published` and
+    `test_a_kafka_sink_configured_again_after_a_shutdown_confirms_what_it_produced`, which leave
+    P (or K) behind a caller's wrapper that leaves it alone and need it still open after a
+    completed `shutdown()`; FR-001 now closes it there (`confirmed=0`). Both are rewritten to
+    reach "signal set, still open" through an expired `shutdown()` with the drain thread parked
+    inside the wrapper, and with the reinstall's clear removed both still fail (`failed=5`).
+
+Re-run on 2026-11-24 on `5d0e7f68` (`origin/main` carrying SPEC-097 and SPEC-098):
+`leaves_remaining_holder.py` printed `A.closes=0 A.closed_while_inside=0 A.closes_while_parked=0
+A.refused=0 A.events=5 B.closes=1`, `spec101_interrupt.py` closed A never (`A.at_entry=[]`), and
+`spec101_sequences.py` read the base column in every row it ran, the unconfirmed `Mine` row
+included at `A.closes=2 overlaps=1`. So the base column holds on the tree this spec is built on.
 
 ## Revision history
 
@@ -625,3 +689,6 @@ tree.
     Data Model, and the criterion that named `check_closed`, which the driver never calls, now
     names the driver's own assertion.
   - **The suite figures are corrected** as stated under *Evidence*.
+- **Checked against `5d0e7f68` before the build, 2026-11-24.** `Leaves` and `Mine` move to
+  `tests/test_invariants_model.py`, beside the recorder the sequential driver installs; the base
+  column was re-measured and holds.

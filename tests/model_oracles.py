@@ -218,11 +218,15 @@ class Closes:
       writes: The delivery calls that entered the sink.
       at_entry: The write count as each close entered.
       at_return: The write count as each close returned.
+      by_wrapper: Per close, whether a caller's wrapper made it, from inside its own ``close()``
+        (SPEC-101 FR-004); empty reads as all ``False``, so SPEC-085's cells, which share the
+        type and never draw a wrapper, are unchanged.
     """
 
     writes: int
     at_entry: tuple[int, ...]
     at_return: tuple[int, ...]
+    by_wrapper: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -399,6 +403,14 @@ def served(wait: Wait) -> float:
 def check_repeat(closes: Closes) -> None:
     """Holds a sink to no close entering at the same write count as the close before it.
 
+    **A caller's wrapper's close followed by the library's is not a repeat** (SPEC-101 FR-004).
+    A wrapper that closes its member itself gets the library's close after its own, because the
+    library cannot see that the wrapper closed it; so of two closes at one write count, the pair
+    whose first is the wrapper's and whose second is the library's is the one the library owed.
+    The library's close followed by a wrapper's is the order FR-002 forbids, and two of either
+    kind mean a holder was closed twice with nothing written between, so every other pair is a
+    repeat.
+
     Args:
       closes: One sink's record.
 
@@ -408,9 +420,17 @@ def check_repeat(closes: Closes) -> None:
     Raises:
       CloseBroken: ``repeat@<count>``, one key for each count at which it happened.
     """
+    wrapper = closes.by_wrapper
     counts: list[int] = []
-    for before, after in zip(closes.at_entry, closes.at_entry[1:], strict=False):
-        if after == before and after not in counts:
+    for index, (before, after) in enumerate(
+        zip(closes.at_entry, closes.at_entry[1:], strict=False)
+    ):
+        owed = (
+            index < len(wrapper)
+            and wrapper[index]
+            and not (index + 1 < len(wrapper) and wrapper[index + 1])
+        )
+        if after == before and not owed and after not in counts:
             counts.append(after)
     if counts:
         raise CloseBroken(*(f"repeat@{count}" for count in counts), detail=f"{closes}")

@@ -676,7 +676,7 @@ specs:
   - id: "SPEC-101"
     title: "A Kept Sink Behind a Caller's Wrapper Is Closed After That Wrapper, Never Beside It"
     description: "Has the library close a sink it wrote to, wherever a caller's wrapper holds it, after each close of that wrapper the library makes, so a wrapper that leaves its member alone no longer leaves the member closed by nobody, a wrapper that closes its member gives it a second close in sequence rather than two at once, and the model test learns to tell a wrapper's close from the library's."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-042", "SPEC-054", "SPEC-076", "SPEC-081", "SPEC-086", "SPEC-087", "SPEC-097", "SPEC-098"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-101-a-kept-sink-is-closed-after-its-holder.md"

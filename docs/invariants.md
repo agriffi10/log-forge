@@ -423,7 +423,8 @@ measured as a latency bound by any test — listed so the gap is visible.
 Whoever is delivering owns the close: the worker for its sink, the orphan path for a sink it
 reached with no worker, the swap for the sinks the graph it installs no longer holds. A sink that
 graph still holds is kept: it leaves the owed record with no close and joins the graph, closed
-once when its holder is released (SPEC-087). One decision — one swap, or one take by
+once when its holder is released (SPEC-087), and, where that holder is a caller's wrapper, closed
+by the library after each close of the holder it makes, if the library wrote to it (SPEC-101). One decision — one swap, or one take by
 `shutdown()` or the exit drain — closes a sink once: a shipped wrapper's forwarded release made
 inside it skips a sink that is kept, lies beneath a sink still owed, or that the decision already
 closed; the closer's take passes over a sink lying beneath one it leaves owed, and the swap's
@@ -449,9 +450,13 @@ rather than a double (SPEC-045), and a swap between two graphs that share a sink
 reaches it, because the swap keeps the shared sink open (SPEC-087); a sink a swap keeps is closed
 by the graph that holds it, so where that holder is not a shipped wrapper the library cannot
 spare it (SPEC-087 FR-004, `docs/architecture.md` §13): a caller's wrapper that closes its member
-itself closes a kept sink it is displaced from while the sink is still live, and closes it beside
-the record's own close where the record also owes it, two closes overlapping; a caller's wrapper
-that leaves its member alone leaves a kept sink closed by nobody (§12 holds that one open); and a
+itself closes a kept sink it is displaced from while the sink is still live; a caller's wrapper
+that closes its member closes it once itself, and the library closes it again after, in sequence
+and never overlapping (SPEC-101), save for a sink armed in the swap's unlocked graph-read window,
+which `architecture.md` §12 holds open; a member ordered behind a caller's wrapper is closed only when
+that wrapper's `close()` returns, so a slow close delays the member and one that never returns
+leaves it unclosed (SPEC-101); a sink the library first writes through a caller's wrapper is that
+wrapper's to close (SPEC-101); and a
 sink the swap's read does not reach — beneath a `sink_factory` that has not built, or past the
 read's bound — is released as it was before SPEC-087, every event it then refuses counted and
 announced; a `shutdown()` that a sink change in flight does not let take
@@ -480,7 +485,10 @@ swap when that shutdown took the displaced sink and one when it left it owed; `t
 that every sink written to is closed and no two closes overlap, in both halves, and in its
 sequential half, where one caller makes the count exact, that no close enters at the write count of
 the close before it, after every step, and that no sink is written after its last close returned,
-after every `shutdown()` and exit drain (SPEC-086); its soak, run only on request and gating
+after every `shutdown()` and exit drain (SPEC-086), its sequential half installing a caller's
+wrapper of either kind, one that leaves its member alone and one that closes it, over a recorder
+the library wrote to, with the repeat rule telling the wrapper's close from the library's
+(SPEC-101); its soak, run only on request and gating
 nothing, judges the same count under four callers by the library's own arms and takes;
 `tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
 lock, its connection released once, and a forked child releases nothing (SPEC-061);
@@ -492,10 +500,13 @@ built and no `sink=` (SPEC-081); `tests/test_model_cells.py` that, with a sink t
 from its own code, every sink written to has had a close when the `shutdown()` returns, no two closes enter at one
 count unless two sink changes overlapped, and no write enters after the last close once the exit
 drain has run, except in the cells and the reproduction pinned to `architecture.md` §12 open items
-and the cells those pins withhold (SPEC-085); and
+and the cells those pins withhold (SPEC-085);
 `tests/test_shared_sink_swap.py` that a sink both graphs hold is closed once, after its last event, for every shipped wrapper in each direction and on every
 twin path, and that each recorded exception above for a caller's wrapper holds as stated
-(SPEC-087).
+(SPEC-087); and `tests/test_after_holder_close.py` that a written sink beneath a caller's wrapper
+is closed after each library close of it, once behind a wrapper that leaves it alone and twice in
+sequence behind one that closes it, on every twin path, through an interrupt and in a forked child
+(SPEC-101).
 
 ## 6. Twin paths keep the same promises
 

@@ -874,10 +874,17 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "(SPEC-035 FR-003)"
         ),
         ("_swap_sink", "take", 0): (
+            "removed per sink, closed after its holder — a stale sink beneath a caller's wrapper "
+            "the same take releases is taken with its entry and attached to that wrapper, before "
+            "any of the take's closers starts, and closed once by the wrapper's release after the "
+            "wrapper's own close, which discharges it; a refused or thread-less release of the "
+            "wrapper releases it on its own (SPEC-101 FR-002)"
+        ),
+        ("_swap_sink", "take", 1): (
             "removed per sink — the swap releases a superseded sink itself, detached, and the "
             "take records that close in flight in the same call (SPEC-054 FR-003)"
         ),
-        ("_swap_sink", "take", 1): (
+        ("_swap_sink", "take", 2): (
             "removed per sink — the previous sink, once the worker confirmed its fence, so "
             "nothing can still be inside it; released detached and joined to the swap's budget"
         ),
@@ -896,13 +903,19 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "it in flight in the **same** call, so there is no instant at which a sink it takes "
             "is neither owed nor in flight (SPEC-054 FR-003)"
         ),
-        ("_close_owed", "put_back", 0): (
-            "re-armed — a sink this call took but never handed to a closer is put back, so an "
-            "interrupt between the take and the close leaves it owed rather than owed by nobody. "
-            "`setdefault`, so a re-arm that landed meanwhile keeps its own entry. Measured "
-            "before it: three sinks, `closes=[0, 0, 0]`, and an empty record. Also a sink the "
-            "take found lying beneath one the take left in the record, which the guard passed "
-            "over, so a later call closes it once nothing holds it (SPEC-087 FR-003)"
+        ("_put_back_ordered", "put_back", 0): (
+            "re-armed — `_close_owed`'s put-back: a sink this call took but never handed to a "
+            "closer is put back, so an interrupt between the take and the close leaves it owed "
+            "rather than owed by nobody. `setdefault`, so a re-arm that landed meanwhile keeps "
+            "its own entry. Measured before it: three sinks, `closes=[0, 0, 0]`, and an empty "
+            "record. Also a sink the take found lying beneath one the take left in the record, "
+            "which the guard passed over, so a later call closes it once nothing holds it "
+            "(SPEC-087 FR-003). Since SPEC-101 it also puts back, transitively, each member "
+            "ordered behind a sink it puts back, and each ordered member not yet closed when "
+            "another member's close raised a BaseException (`_release_ordered`) or an interrupt "
+            "landed after the holder's close before they were handed off (`_release_after`, "
+            "`release`'s own finally), through `_put_back_rest`, every entry discharged once "
+            "(FR-003)"
         ),
     }
     found = set(_orphan_record_sites()[0])

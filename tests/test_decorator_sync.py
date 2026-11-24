@@ -469,6 +469,10 @@ def test_a_raising_traced_call_leaves_no_reference_cycle(monkeypatch) -> None:
 
     Without an explicit `del`, the frame holds the exception whose traceback holds the frame —
     a cycle only the collector can break, which also pins the *caller's* frames and locals.
+
+    A few raising calls run before the measurement opens, because the first calls after
+    `configure()` make one-time allocations (caches, the sink's first-arm state) that are not
+    per-call growth; counted inside the window they moved the total within reach of the bound.
     """
     log_foundry.configure(service="t")
     from log_foundry import decorator
@@ -477,6 +481,12 @@ def test_a_raising_traced_call_leaves_no_reference_cycle(monkeypatch) -> None:
     @log_foundry.trace(name="boom")
     def boom() -> None:
         raise ValueError("x")
+
+    for _ in range(5):
+        try:
+            boom()
+        except ValueError:
+            pass
 
     gc.collect()
     gc.disable()

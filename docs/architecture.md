@@ -1132,55 +1132,7 @@ close it.
   transport when it is handed over again, against SPEC-032's rule that it refuses. Either way
   the docstring and the README are brought into agreement, and the pin gains a shipped sink that
   refuses after `close()`.
-- **A sink the library wrote to and never closes, behind a wrapper that leaves its member alone**
-  (invariant 5; ~~no spec yet~~ SPEC-101, a Draft later in this arc; SPEC-087 FR-004's fourth
-  shape, held open here as well as stated in §13). A kept sink is closed by the graph that holds it, and for a caller's wrapper that is the
-  wrapper's own `close()`. A wrapper `Leaves(A)` whose `close()` does not close its member, as the
-  holder on whose account the library does not close A, leaves A closed by nobody. It is that
-  holder when it is installed over a kept sink — `configure(A)` then `configure(Leaves(A))`, or
-  `configure(MultiSink(A, B))` then `configure(Leaves(A))` — and when it is still in the record
-  with a retired worker's drain thread inside it while a later `configure(MultiSink(A, B))` is
-  shut down, where SPEC-087's keep skips the shipped wrapper's forward of A because a sink the
-  record still holds lies over it. No event is lost in any of the three; the close is the
-  caller's to make. For the last sequence, on SPEC-087's prototype:
-
-  | Remaining holder | `5cb0f449` | SPEC-087 | With the member kept owed |
-  |---|---|---|---|
-  | `Leaves(A)` | 1 close, under the drain thread | 0 closes, no event lost | 1 close |
-  | A wrapper that closes its member | 1 close, under the drain thread | 1 close | 2 closes, overlapping |
-
-  For the two installed sequences, 0 closes, where `5cb0f449` closed A once at the swap and lost
-  the events after it; measured again at the commit that merged SPEC-087, each delivered 3 of 3 events with no loss
-  term moved and `A.close()` never called. The reproduction is
-  `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`, written for SPEC-087 and
-  not one of the audit's own: `configure(Leaves(A))`, a span; a second span parks the drain thread
-  inside `A.emit`; `shutdown(timeout=0.2)`; `configure(MultiSink(A, B))`, a log with no span;
-  `shutdown(timeout=0.3)`; the emit released; `shutdown()`. Its output at the commit that merged SPEC-087:
-
-  ```
-  log-foundry: shutdown timed out after 0.2s; the sink is left open because the worker thread is still using it; 2 event(s) in flight, counted when the emit returns
-  A.closes=0 A.closed_while_inside=0 A.closes_while_parked=0 A.refused=0 A.events=5 B.closes=1
-  ```
-
-  and at `5cb0f449`, run from a worktree of that commit with `PYTHONPATH=src`:
-
-  ```
-  A.closes=1 A.closed_while_inside=1 A.closes_while_parked=1 A.refused=0 A.events=5 B.closes=1
-  ```
-
-  That close was made under the drain thread. In this short probe the parked emits had already
-  been counted, so A refused nothing; the spec's own run of the sequence, with events written
-  after the close, had A refuse two. Keeping the member owed when a forward is skipped was built
-  for SPEC-087 and is the table's last column: it closes A once behind `Leaves`, and twice,
-  overlapping, behind a wrapper that closes its member, and the library cannot tell the two
-  wrappers apart. **Closed by** the closer ordering a member after its holder: the member is kept
-  owed when a forward is skipped on a holder's account, and closed after that holder's own close
-  has returned, so that a wrapper which closes its member gives a second close in sequence, which
-  a sink tolerates, and never two at once. That restructures `_close_owed`'s take and its fan-out,
-  so it is not a further patch to the closer. It was first assigned to this arc's lifecycle
-  command-path spec; on 2026-11-16 Andrew placed it in a spec of its own, written later in this
-  arc, which SPEC-097, the command-path spec, records as Out of Scope and leaves open: that spec
-  is SPEC-101.
+- ~~**A sink the library wrote to and never closes, behind a wrapper that leaves its member alone**~~ → **closed by SPEC-101**; struck and moved under *Resolved*.
 - ~~**A kept sink a straddling orphan log put back in the record can be handed a stop signal on its own**~~ → **closed by SPEC-098**; struck and moved under *Resolved*.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
@@ -2024,6 +1976,61 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `resent` is an upper bound by SPEC-095's own record, so this over-counts and loses nothing.
   **Closed by** reading a raise from getting the channel as not landed (`reached=False`), held by
   a test whose channel open raises.
+- **The overlap SPEC-101's FR-002 removes returns in the swap's unlocked graph-read window**
+  (found by SPEC-101's build; invariant 5; measured at `60afdb03`; unfixed under the audit scope
+  freeze). FR-002 orders a member after a caller's wrapper that one take takes with it. The swap's
+  stale take decides under `_state._lock`, so it orders only by the graphs `_swap_sink` read before
+  its first critical section, and it reads those only when two or more sinks are owed; a sink with
+  no pre-read graph is neither ordered nor ordered behind (`_order_after`). A sink armed into the
+  record after that read therefore escapes the order. Reproduced with a scratch probe, not
+  committed: two orphan logs read A and then `Mine(A)` as the configured sink and park before they
+  arm; an unconfirmed swap leaves X and Y owed; a swap to Z reads the owed X's graph, and the two
+  logs are then let go to arm A and `Mine(A)`. The stale take holds both with no pre-read graph,
+  so A is not ordered behind `Mine(A)`, and `Mine`'s close of A overlaps the library's:
+  `A.at_entry=[2, 2] by_wrapper=[True, False] overlaps=1`. No event is lost; the two closes run at
+  once, which is the shape SPEC-101 closed everywhere else. **Closed by** no spec yet.
+- **`_CloseRegistry._written` and `_after` hold a sink strongly when its type cannot be weakly
+  referenced** (found by SPEC-101's build; invariant 5; measured at `e9cc6cac`; unfixed under the
+  audit scope freeze). Both of SPEC-101's records keep a sink by `id`, as a `weakref.ref` where the
+  sink's type allows one and as the sink itself where it does not (`_weak_or_strong`): `_written`
+  each sink the library armed, and `_after` each caller's wrapper with its attached members.
+  `_written` prunes only an entry whose weak reference has died, and `_after` only an entry whose
+  holder has died or whose persistent members all have, so a strong entry stays until the process
+  forks and `_clear_after_fork` clears both records, as the ownership record's `_Entry` holds such
+  a sink. A process that keeps configuring fresh written sinks of such a type, a `__slots__` class
+  with no `__weakref__` slot, grows both records without bound, and a displaced caller's wrapper of
+  that type over a live member stays pinned in `_after`. Reproduced with a scratch probe, not
+  committed: 200 rounds of `configure(A)`, a log, `configure(W(A))` with `W` such a wrapper, a log,
+  then `shutdown()`, print `after=200 written=201 A.closes=1`, each round's displaced `W` held
+  strongly by both records. No event is lost and A is closed once; the cost is memory. **Closed
+  by** no spec yet.
+- **A `KeyboardInterrupt` in `release()`'s preamble leaves a taken entry in flight for good**
+  (found by SPEC-101's last diff review; invariant 5; measured at `03a6e6b5` and at `8b509f97`,
+  identically, so not introduced by SPEC-101; unfixed under the audit scope freeze). A caller that
+  hands `release()` an entry it took has given up its own put-back before `release()` opens the
+  `try` that discharges that entry: `_close_owed` drops the sink from `undischarged` and then
+  calls `_close_taken`, or `release(..., detached=True)` for a `GRACED` entry, and
+  `_release_ordered` pops the member off its list. Between the hand-off and that `try`,
+  `release()` runs calls and a contended lock: `releasable()`, `_close_clock()` (which takes
+  `_state._owned_lock`), `_release_depth()` and `_active_keep()`. Measured with a real SIGINT: a
+  caller's wrapper whose `close()` has a helper thread hold `_owned_lock` for 1 s, and a timer
+  that sends SIGINT. In 3 of 3 runs the interrupt landed in `releasable()` under an ordered
+  member's `release()`, and the member ended neither owed nor closed, its entry in flight, so the
+  next `shutdown(timeout=1.0)` took 1.01 s. The holder's own release from `_close_owed` has the
+  same shape, so `_close_owed`'s docstring, which says its residual window "contains no call", is
+  wrong; it is left as is under the freeze. Two narrower windows are of the same class. On the
+  inline path with no taken entry, `release()` registers the `INLINE` entry before
+  `prior = _active_keep()`, a call, so an interrupt there leaves that entry in flight. And on the
+  refused and no-thread branches, from `release()`'s `finish` of the holder's entry through
+  `_release_ordered_alone`'s `take_ordered` to `_release_ordered`'s `try`, an interrupt leaves an
+  ordered member attached behind a holder that is neither owed nor in flight; that is reachable
+  only when a closer thread will not start or a forked child refuses the release. No event is
+  lost; the cost is a close never performed and a later exit that waits out its grace. **Closed
+  by** no spec yet: the structural closure makes the hand-off the first statement inside the
+  `try` that owns the discharge, with `release()` taking its pair off the caller's list once its
+  preamble is done and its `try` is open, for `_close_owed`'s `undischarged` too; the inline
+  path swaps the `register` and `_active_keep()` lines; and both refused and no-thread branches
+  put back `take_ordered(sink)` in an `except BaseException`.
 
 - **`SQSSink`'s class docstring lists none of its three FIFO attributes** (found by SPEC-100's
   completion ritual, 2026-11-24; present on `5d0e7f68`, before SPEC-100; unfixed under the audit
@@ -2114,6 +2121,66 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `b145f9a2` the over-long id is sent as the SHA-256 hex digest of the stripped answer, and the
   queue held 2 of 2 with `SinkLosses(dropped=0, failed=0, resent=0)`. A FIFO `SNSSink` still
   declares no idempotency (*No shipped sink declares itself idempotent*).
+- ~~**A sink the library wrote to and never closes, behind a wrapper that leaves its member alone**~~
+  (invariant 5; SPEC-087 FR-004's fourth shape, held open here as well as stated in §13). A kept sink is closed by the graph that holds it, and for a caller's wrapper that is the
+  wrapper's own `close()`. A wrapper `Leaves(A)` whose `close()` does not close its member, as the
+  holder on whose account the library does not close A, leaves A closed by nobody. It is that
+  holder when it is installed over a kept sink — `configure(A)` then `configure(Leaves(A))`, or
+  `configure(MultiSink(A, B))` then `configure(Leaves(A))` — and when it is still in the record
+  with a retired worker's drain thread inside it while a later `configure(MultiSink(A, B))` is
+  shut down, where SPEC-087's keep skips the shipped wrapper's forward of A because a sink the
+  record still holds lies over it. No event is lost in any of the three; the close is the
+  caller's to make. For the last sequence, on SPEC-087's prototype:
+
+  | Remaining holder | `5cb0f449` | SPEC-087 | With the member kept owed | SPEC-101 |
+  |---|---|---|---|---|
+  | `Leaves(A)` | 1 close, under the drain thread | 0 closes, no event lost | 1 close | 1 close, after the wrapper |
+  | A wrapper that closes its member | 1 close, under the drain thread | 1 close | 2 closes, overlapping | 2 closes, in sequence |
+
+  For the two installed sequences, 0 closes, where `5cb0f449` closed A once at the swap and lost
+  the events after it; measured again at the commit that merged SPEC-087, each delivered 3 of 3 events with no loss
+  term moved and `A.close()` never called. The reproduction is
+  `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`, written for SPEC-087 and
+  not one of the audit's own: `configure(Leaves(A))`, a span; a second span parks the drain thread
+  inside `A.emit`; `shutdown(timeout=0.2)`; `configure(MultiSink(A, B))`, a log with no span;
+  `shutdown(timeout=0.3)`; the emit released; `shutdown()`. Its output at the commit that merged SPEC-087:
+
+  ```
+  log-foundry: shutdown timed out after 0.2s; the sink is left open because the worker thread is still using it; 2 event(s) in flight, counted when the emit returns
+  A.closes=0 A.closed_while_inside=0 A.closes_while_parked=0 A.refused=0 A.events=5 B.closes=1
+  ```
+
+  and at `5cb0f449`, run from a worktree of that commit with `PYTHONPATH=src`:
+
+  ```
+  A.closes=1 A.closed_while_inside=1 A.closes_while_parked=1 A.refused=0 A.events=5 B.closes=1
+  ```
+
+  That close was made under the drain thread. In this short probe the parked emits had already
+  been counted, so A refused nothing; the spec's own run of the sequence, with events written
+  after the close, had A refuse two. Keeping the member owed when a forward is skipped was built
+  for SPEC-087 and is the table's last column: it closes A once behind `Leaves`, and twice,
+  overlapping, behind a wrapper that closes its member, and the library cannot tell the two
+  wrappers apart. **Closed by** the closer ordering a member after its holder: the member is kept
+  owed when a forward is skipped on a holder's account, and closed after that holder's own close
+  has returned, so that a wrapper which closes its member gives a second close in sequence, which
+  a sink tolerates, and never two at once. That restructures `_close_owed`'s take and its fan-out,
+  so it is not a further patch to the closer. It was first assigned to this arc's lifecycle
+  command-path spec; on 2026-11-16 Andrew placed it in a spec of its own, written later in this
+  arc, which SPEC-097, the command-path spec, records as Out of Scope and leaves open: that spec
+  is SPEC-101.
+  → **closed by SPEC-101** (2026-11-24): the library attaches each sink it wrote to that lies
+  beneath a caller's wrapper to the closest such wrapper, for as long as that wrapper lives, and
+  closes it after each close of the wrapper the library makes, on every path that closes a
+  holder; one decision that takes both a caller's wrapper and a sink beneath it closes the sink
+  after the wrapper. The table's last column was read at `60afdb03`: the probe above prints
+  `A.closes=1 A.closed_while_inside=0 A.closes_while_parked=0 A.refused=0 A.events=5 B.closes=1`,
+  and a scratch variant of it whose wrapper closes its member, not committed, read `A.closes=2`
+  with no two closes overlapping. The two installed sequences close A once behind `Leaves` and
+  twice in sequence behind a wrapper that closes its member (`tests/test_after_holder_close.py`).
+  The decision is `docs/decisions/pipeline/`, *A swap keeps the sinks the graph it installs
+  holds, and one decision closes a sink once*, Part 4; §13 carries what the rule costs a caller's
+  wrapper.
 - ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~
   (found during SPEC-095's build; invariants 2 and 11). `_engine._run` commits a run's
   `resent_events` and its resend line in the same `Deferral` as its `failed_events` and
@@ -3870,12 +3937,13 @@ and a third copy is a fork with no merge.
   concurrent `configure(sink=…)` calls closing one sink twice with nothing written in between,
   which `config._sink_lock` now prevents (§7).
 
-- **A sink a swap keeps is closed by the graph that holds it, so four shapes are the caller's
-  wrapper's or the read's, not the library's** (SPEC-087 FR-004). Since SPEC-087 a
+- **A sink a swap keeps is closed by the graph that holds it, so some shapes are the caller's
+  wrapper's or the read's, not the library's** (SPEC-087 FR-004, SPEC-101). Since SPEC-087 a
   `configure()` reads the graph it installs and keeps every sink in it open (§7, step 4); the kept
   sink is closed when its holder is released. For a shipped wrapper that is the library's own
   forwarded release, which skips what the decision keeps. For a wrapper the package does not ship
-  it is the wrapper's own `close()`, which no rule in `release` can reach, and the read itself
+  it is the wrapper's own `close()`, which no rule in `release` can reach, and since SPEC-101 the
+  library's close of each member it wrote to, made after that `close()` returns; the read itself
   stops at a bound. The counts below were measured at the commit that merged SPEC-087 with the refusing double of
   `tests/test_shared_sink_swap.py` (a sink that refuses after `close()` and counts its closes),
   one write before the swap and two after, then `shutdown()`; "spans" is a span per write, two
@@ -3898,19 +3966,38 @@ and a third copy is a fork with no merge.
     calling `A.close()`, or a subclass of a shipped wrapper overriding `close()` to do so.
     Displaced while A is kept, `configure(Mine(A))` then `configure(A)`, it closes the live sink
     as before SPEC-087: the same counts as above, for a `Mine` that subclasses a sink and for one
-    that subclasses nothing. Where the record also owes A, `Mine` closes A beside the record's own
-    close: after an unconfirmed `configure(A)` then `configure(Mine(A))`, and after a straddling
-    orphan log with `Mine(A)`, `shutdown()` closed A twice, **two closes overlapping**, with no
-    event refused. At `5cb0f449` the unconfirmed sequence does the same, and the straddle closed
-    A three times and lost events (SPEC-087 *Evidence*). Forward on a fenced swap or with no
-    worker the read reaches into such a wrapper, A joins it and `Mine.close()` is its one close.
+    that subclasses nothing. Where the record also owes A — after an unconfirmed `configure(A)`
+    then `configure(Mine(A))`, and after a straddling orphan log with `Mine(A)` — `shutdown()`
+    closes A twice, **two closes in sequence**: `Mine`'s own, then the library's once it has
+    returned (SPEC-101 FR-002), with no event refused. At `60afdb03` both sequences read 2 closes,
+    0 overlapping and 0 refused. On SPEC-087's tree the two closes overlapped; at `5cb0f449` the
+    unconfirmed sequence did the same, and the straddle closed A three times and lost events
+    (SPEC-087 *Evidence*). Forward on a fenced swap or with no worker the read reaches into such a
+    wrapper and A joins it: A is closed twice in sequence, by `Mine.close()` and then by the
+    library, where SPEC-087 read one close. Each second close is one the sink protocol's
+    idempotent `close()` absorbs.
   - **A wrapper that leaves its member alone.** Installed over a kept sink —
     `configure(A)` then `configure(Leaves(A))`, or `configure(MultiSink(A, B))` then
-    `configure(Leaves(A))` — A took 3 of 3 events, no loss term moved and **A was closed 0 times,
-    against 1** at `5cb0f449`, which closed it at the swap and lost the events after. As a
-    remaining holder with a retired drain thread inside it, the same 0 against 1, where
-    `5cb0f449`'s one close was made under that thread. The close is the caller's to make; §12
-    holds this shape open, with its probe and what would close it.
+    `configure(Leaves(A))` — A takes 3 of 3 events, no loss term moves and **A is closed once**,
+    by the library after the wrapper's close (SPEC-101); SPEC-087 closed it 0 times, and
+    `5cb0f449` once at the swap, losing the events after. As a remaining holder with a retired
+    drain thread inside it, the same one close, never under that thread, where `5cb0f449`'s one
+    close was made under it. A wrapper written to and closed again has A closed again after it,
+    as `MultiSink(A)` does. §12's *Resolved* carries the probe.
+  - **A member behind a slow or hung caller's wrapper.** One decision that takes both a caller's
+    wrapper and a sink beneath it closes the sink only once the wrapper's `close()` returns
+    (SPEC-101 FR-002), so the member waits for it. After an unconfirmed `configure(A)` then a
+    holder over A and `shutdown(timeout=0.5)`, `spec101_slow_holder.py` read at `60afdb03` A's
+    close 3.0 s after the `shutdown()` call behind a wrapper whose `close()` takes 3 s, 20.0 s
+    behind one that waits 20 s, and 0.0 s behind a shipped `MultiSink(A, Z)` whose Z takes 3 s,
+    because a shipped holder is never ordered. The `shutdown()` call itself returned only when the
+    holder's inline close did, before SPEC-101 as after, so a wrapper whose `close()` never
+    returns leaves its member unclosed.
+  - **A sink the library first writes through a caller's wrapper.** In `configure(Leaves(X))`, or
+    `configure(X)` with nothing written and then `configure(Leaves(X))`, the library has
+    delivered only to the wrapper, so X is not attached and its close is the wrapper's: at
+    `60afdb03` both read `X.closes=0` with every event delivered. Invariant 5 promises a close
+    only to a sink the library wrote to.
 
   Deferring the displaced wrapper's release was built and is rejected: under 200 rounds of
   `configure(Mine(A))` and `configure(A)` it left 201 sinks owed and called `A.close()` 201
@@ -3918,10 +4005,12 @@ and a third copy is a fork with no merge.
   caller who writes a wrapper has two routes, measured in both directions and on both delivery
   paths with no event lost, and `README.md` (*Writing your own sink*) gives them: build the
   wrapper on a shipped one and inherit its `close()`, so its member sits in a declared slot and
-  is closed once through `release`; or leave the member's close out of the wrapper's `close()`
-  and close the member yourself after `shutdown()`. There is no third, because a wrapper has no
-  public means to declare its members. The fifth shape, a stop-signal hand to a sink a straddling
-  log put back in the record, is §12's, read and not reproduced.
+  is closed once through `release`; or leave the member's close out of the wrapper's `close()`,
+  and the library closes a member it delivered to directly after each close of the wrapper that
+  the library makes, while a member it never delivered to directly is the caller's to close
+  (SPEC-101). There is no third,
+  because a wrapper has no public means to declare its members. The fifth shape, a stop-signal
+  hand to a sink a straddling log put back in the record, was §12's and is closed by SPEC-098.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —

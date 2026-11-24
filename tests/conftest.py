@@ -690,6 +690,8 @@ def _reset_worker() -> None:
     ledger_check.restart()
     with _lifecycle._state._closes._lock:
         _lifecycle._state._closes._in_flight.clear()
+        _lifecycle._state._closes._written.clear()
+        _lifecycle._state._closes._after.clear()
     with _lifecycle._state._owned_lock:
         dropped = dict(_lifecycle._state._owned)
         _lifecycle._state._owned.clear()

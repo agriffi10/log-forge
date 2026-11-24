@@ -162,6 +162,14 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_signal_handed", "_state._owned_lock"): 1,
             ("_set_every_signal", "_state._owned_lock"): 1,
             ("reinstall_signals", "_state._owned_lock"): 1,
+            ("_CloseRegistry.arm", "self._lock"): 1,
+            ("_CloseRegistry.was_written", "self._lock"): 1,
+            ("_CloseRegistry.attach_member", "self._lock"): 1,
+            ("_CloseRegistry.detach_member", "self._lock"): 1,
+            ("_CloseRegistry.members_of", "self._lock"): 1,
+            ("_CloseRegistry.take_ordered", "self._lock"): 1,
+            ("_release_after", "_state._lock"): 1,
+            ("_put_back_rest", "_state._lock"): 1,
         }
     ),
     "worker.py": collections.Counter(
@@ -214,7 +222,24 @@ half, unchanged in what it guards and still taken alone, so ``Worker.submit``'s 
 a caller's own ``flush()`` sweep could not queue, in ``dropped`` and ``_overflow_lost``, the counting
 ``_enqueue`` does on overflow. It takes the worker's lock alone, as a leaf, and only after the sweep
 hold is released, which is why it exists: no lock but the queue's mutex, bounded, is taken under the
-hold, so the order does not move."""
+hold, so the order does not move.
+
+**Eight sites added at SPEC-101 (2026-11-24).** Six are the close registry's leaf, taken alone
+around a dictionary read or write of the two records SPEC-101 adds beside the in-flight half:
+``arm`` records the sink as written, under the leaf, inside the ``_state._lock`` section every
+caller already holds, which is the order that section already took the leaf in through ``held``;
+``was_written``, ``attach_member``, ``detach_member``, ``members_of`` and ``take_ordered`` are each
+the leaf alone, and none calls ``finish`` or ``put_back`` while holding it. Two take
+``_state._lock`` with nothing held: ``_release_after`` reads whether the record owes each
+persistent member or a close of it is in flight, only when the holder has persistent members, and
+``_put_back_rest`` puts back the ordered members a caller took and did not hand off, after an
+interrupt: a member's close raising a ``BaseException`` in ``_release_ordered``, or one landing in
+``_release_after`` or in ``release``'s own ``finally`` before the members were handed off.
+``_release_after`` runs only inside an inline release, which no caller makes under
+``_state._lock``, and ``release``'s ``finally`` reaches the site only after such a release.
+``_release_ordered`` is reached there too, and also from the swap's stale take, under
+``_state._lock``, when a detached release is refused or gets no thread; that lock is re-entrant,
+so the section re-enters it and takes nothing new. So the lock order does not move."""
 
 
 def _tree(name: str) -> ast.Module:
@@ -332,13 +357,14 @@ def test_the_fork_opt_out_lists_both_pinning_records() -> None:
     SPEC-078 moved the owed record onto the close registry, so ``Runtime._FORK_SKIP`` names
     ``_owned`` and ``_CloseRegistry._FORK_SKIP`` names ``owed``; SPEC-098 adds the stop-signal
     table and the event set to ``Runtime``'s, which the seed repairs before the walk
-    (``tests/test_fork_roster.py`` holds that declaration). ``_fork._skipped_names`` reads the
+    (``tests/test_fork_roster.py`` holds that declaration). SPEC-101 adds the written record and
+    the after-holder record to the registry's, since each can hold a sink strongly. ``_fork._skipped_names`` reads the
     opt-out off the holder of the attribute. The behavioural half — a child of ``configure(A)``,
     ``info()``, ``configure(B)`` runs no hook on A — is
     ``test_lifecycle_races.test_a_forked_child_does_not_hook_a_superseded_sink``.
     """
     assert _lifecycle.Runtime._FORK_SKIP == ("_owned", "_signals", "_signal_events")
-    assert _lifecycle._CloseRegistry._FORK_SKIP == ("owed",)
+    assert _lifecycle._CloseRegistry._FORK_SKIP == ("owed", "_written", "_after")
 
 
 def test_the_lock_sites_are_the_base_commits() -> None:
