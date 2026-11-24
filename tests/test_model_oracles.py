@@ -252,6 +252,40 @@ def test_the_close_rules_by_signature(closes: Closes, expected: frozenset[str]) 
 
 
 @pytest.mark.parametrize(
+    ("by_wrapper", "expected"),
+    [
+        pytest.param((True, False), frozenset(), id="wrapper-then-library"),
+        pytest.param((False, True), frozenset({"CloseBroken:repeat@2"}), id="library-then-wrapper"),
+        pytest.param(
+            (False, False), frozenset({"CloseBroken:repeat@2"}), id="library-then-library"
+        ),
+        pytest.param((True, True), frozenset({"CloseBroken:repeat@2"}), id="wrapper-then-wrapper"),
+    ],
+)
+def test_the_repeat_rule_tells_a_wrappers_close_from_the_librarys(
+    by_wrapper: tuple[bool, bool], expected: frozenset[str]
+) -> None:
+    """SPEC-101 FR-004's table: two closes at one count are a repeat unless the wrapper's is first.
+
+    A caller's wrapper that closes its member gets the library's close after its own, which the
+    library owed; every other pair is a repeat. The first row is the one that must stay silent.
+    """
+    closes = Closes(2, (2, 2), (2, 2), by_wrapper)
+    assert _signatures(check_repeat, closes) == expected
+
+
+def test_the_repeat_rule_reads_an_empty_mark_as_the_librarys() -> None:
+    """``by_wrapper`` defaults to empty, which SPEC-085's cells rely on: every close the library's."""
+    assert Closes(2, (2, 2), (2, 2)).by_wrapper == ()
+    assert _signatures(check_repeat, Closes(2, (2, 2), (2, 2))) == frozenset(
+        {"CloseBroken:repeat@2"}
+    )
+    assert _signatures(check_repeat, Closes(3, (2, 2, 3, 3), (2, 2, 3, 3), (True, False))) == (
+        frozenset({"CloseBroken:repeat@3"})
+    )
+
+
+@pytest.mark.parametrize(
     ("calls", "expected"),
     [
         pytest.param(

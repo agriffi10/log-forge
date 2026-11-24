@@ -100,11 +100,14 @@ import ast
 import collections
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import pathlib
 import random
 import re
+import subprocess
+import sys
 import threading
 import time
 import weakref
@@ -357,6 +360,10 @@ _SOAK: dict[str, _SoakRecord | None] = {"run": None}
 """The soak record of the run in progress, or ``None``; set for one test by :func:`_install`."""
 
 
+_WRAPPER_MARK = threading.local()
+"""Set on a thread while a :class:`Mine` is inside its own close of its member (SPEC-101)."""
+
+
 class _CloseRecord:
     """One recorder's write count, taken at the delivery method's first statement, and its closes.
 
@@ -366,7 +373,9 @@ class _CloseRecord:
     after it: counting at ``HTTPRecorder``'s opener rather than at ``deliver`` failed the
     late-write rule on 113 of 1,000 ``http`` runs that are clean counted at entry (the spec's
     evidence). It holds no reference to its recorder, which passes itself to each call, so the
-    record keeps nothing alive. While a soak runs it also feeds :data:`_SOAK`.
+    record keeps nothing alive. While a soak runs it also feeds :data:`_SOAK`. Each close also
+    records whether a caller's wrapper made it (:data:`_WRAPPER_MARK`), which ``check_repeat``
+    reads (SPEC-101 FR-004).
     """
 
     def __init__(self) -> None:
@@ -384,6 +393,7 @@ class _CloseRecord:
         self._writes = 0
         self._at_entry: list[int] = []
         self._at_return: list[int] = []
+        self._by_wrapper: list[bool] = []
         self._lock = threading.Lock()
 
     def wrote(self, sink: object) -> None:
@@ -418,6 +428,7 @@ class _CloseRecord:
         """
         with self._lock:
             self._at_entry.append(self._writes)
+            self._by_wrapper.append(bool(getattr(_WRAPPER_MARK, "on", False)))
             soak = _SOAK["run"]
             if soak is not None:
                 name = threading.current_thread().name
@@ -451,7 +462,12 @@ class _CloseRecord:
           None.
         """
         with self._lock:
-            return Closes(self._writes, tuple(self._at_entry), tuple(self._at_return))
+            return Closes(
+                self._writes,
+                tuple(self._at_entry),
+                tuple(self._at_return),
+                tuple(self._by_wrapper),
+            )
 
 
 class Recorder:
@@ -1669,6 +1685,104 @@ def test_the_seed_range_covers_every_cell() -> None:
     )
 
 
+DRAWS_DIGEST = "067042001a29068db3424a51e15f58ba1594c3e0ae8df04b093240fefdd8684f"
+"""``sha256(repr([_draws(s) for s in DEFAULT_SEQ_SEEDS]))`` on ``5d0e7f68``, before SPEC-101."""
+
+
+def test_the_install_draw_leaves_every_seeds_steps_unchanged() -> None:
+    """SPEC-101 FR-004 AC2: the install draw has a stream of its own, so the steps are the base's.
+
+    The digest was read on the tree before SPEC-101: 24 seeds, 168 ``configure`` steps among
+    them. A draw that took from ``sequential:<seed>`` would shift every later step of the seed and
+    change it, so the gate's seeds keep their meaning only while this holds.
+    """
+    drawn = repr([_draws(seed) for seed in DEFAULT_SEQ_SEEDS])
+    assert hashlib.sha256(drawn.encode()).hexdigest() == DRAWS_DIGEST
+    configures = sum(
+        1 for seed in DEFAULT_SEQ_SEEDS for step, _ in _draws(seed) if step == "configure"
+    )
+    assert configures == 168
+
+
+_INSTALL_LINE = re.compile(r"model-install seed=(\d+) Leaves=(\d+) Mine=(\d+)")
+
+
+def test_the_install_draw_reaches_both_wrappers_in_half_the_seeds() -> None:
+    """SPEC-101 FR-004 AC1: over the 24 default seeds the driver passes, and ``Leaves`` and
+    ``Mine`` are each installed over a written recorder in at least 12 of them.
+
+    The counts come from a child pytest of the driver alone, read from the per-seed line each
+    seed prints, as whole lines of its captured output (``-s -n 0``), never from a substring
+    count, which reads differently at another terminal width.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "LOG_FOUNDRY_MODEL_SEEDS"}
+    env["COLUMNS"] = "200"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-s",
+            "-n",
+            "0",
+            "-p",
+            "no:cacheprovider",
+            "tests/test_invariants_model.py",
+            "-k",
+            "test_the_sequential_driver_holds_the_state_table",
+        ],
+        cwd=_REPO,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        env=env,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+    rows = [m for line in result.stdout.splitlines() if (m := _INSTALL_LINE.fullmatch(line))]
+    seeds = {int(m[1]): (int(m[2]), int(m[3])) for m in rows}
+    assert sorted(seeds) == list(DEFAULT_SEQ_SEEDS), result.stdout[-4000:]
+    leaves = sum(1 for n, _ in seeds.values() if n)
+    mine = sum(1 for _, n in seeds.values() if n)
+    assert leaves >= 12 and mine >= 12, seeds
+
+
+def test_an_unconfirmed_swap_into_mine_is_closed_in_sequence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SPEC-101 FR-004 AC6: FR-002's order, held through the recorder the driver installs.
+
+    An unconfirmed ``configure(A)`` then ``configure(Mine(A))``, two span writes and
+    ``shutdown()``: one take takes both, and A is closed by ``Mine.close()`` and then by the
+    library, never at once. No default seed reached this when it was measured, so the order has a
+    test of its own: the recorder's close count, overlap counter and ``check_repeat`` read it.
+    """
+    from log_foundry import worker as worker_mod
+
+    a = StateRecorder()
+    log_foundry.configure(service="mine-order", sink=a)
+    _outer(False)
+    log_foundry.flush(timeout=FLUSH_TIMEOUT)
+    a.emit_delay = 0.5
+    _outer(False)
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.1)
+    log_foundry.configure(sink=Mine(a))  # type: ignore[arg-type]
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 5.0)
+    assert log_foundry.health().incomplete_swaps == 1, "the premise: the swap is unconfirmed"
+    a.emit_delay = 0.0
+    _outer(False)
+    _outer(False)
+    log_foundry.flush(timeout=FLUSH_TIMEOUT)
+    assert _lifecycle._state._closes.owes(a), "the premise: the record owes A and Mine(A)"
+    log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+    closes = a.record.closes()
+    assert a.closes == 2 and not a.overlapped, closes
+    assert closes.by_wrapper == (True, False), closes
+    check_repeat(closes)
+    check_late_write(closes)
+
+
 _BRACKET: list[str | None] = [None]
 """The step the driver is inside, set before each call and cleared after it returns."""
 
@@ -1707,6 +1821,45 @@ class StateRecorder(Recorder):
             self.threads.clear()
 
 
+class Leaves:
+    """A caller's wrapper whose ``close()`` leaves its member alone (SPEC-101 FR-004).
+
+    The library closes its member after it, when the library wrote to that member directly.
+    """
+
+    def __init__(self, inner: StateRecorder) -> None:
+        self.inner = inner
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Forwards the batch."""
+        self.inner.emit(batch)
+
+    def close(self) -> None:
+        """Closes nothing."""
+
+
+class Mine:
+    """A caller's wrapper whose ``close()`` closes its member, marked (SPEC-101 FR-004).
+
+    The mark is what lets ``check_repeat`` tell this close from the library's close after it.
+    """
+
+    def __init__(self, inner: StateRecorder) -> None:
+        self.inner = inner
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Forwards the batch."""
+        self.inner.emit(batch)
+
+    def close(self) -> None:
+        """Closes the member with its own code, its thread marked meanwhile."""
+        _WRAPPER_MARK.on = True
+        try:
+            self.inner.close()
+        finally:
+            _WRAPPER_MARK.on = False
+
+
 def _sample(kind: str) -> None:
     """Records what the state read at this instant of a recorder call."""
     stop = _lifecycle._state._stop.is_set()
@@ -1723,11 +1876,32 @@ class _Run:
     orphans: int = 0
     drains: set[int] = field(default_factory=set)
     history: list[str] = field(default_factory=list)
+    installs: collections.Counter[str] = field(default_factory=collections.Counter)
+    draws: random.Random | None = None
 
     def recorder(self) -> StateRecorder:
         sink = StateRecorder()
         self.sinks.append(sink)
         return sink
+
+    def install(self) -> object:
+        """The sink a ``configure`` step installs: a fresh recorder, or a wrapper over the current.
+
+        SPEC-101 FR-004. One draw of three from a stream of its own, keyed on the seed and
+        consumed on every ``configure`` step whatever the state, so the seed's list of steps,
+        drawn from ``sequential:<seed>``, is unchanged. A wrapper is installed only over a
+        configured recorder the library has written to; any other draw installs a fresh one.
+        """
+        if self.draws is None:
+            self.draws = random.Random(f"install:{self.seed}")  # noqa: S311
+        kind = self.draws.choice(("fresh", "Leaves", "Mine"))
+        current = _lifecycle._live_config_sink()
+        recorder = next((sink for sink in self.sinks if sink is current), None)
+        if kind == "fresh" or recorder is None or recorder.record.closes().writes == 0:
+            return self.recorder()
+        self.installs[kind] += 1
+        self.history.append(f"install:{kind}")
+        return Leaves(recorder) if kind == "Leaves" else Mine(recorder)
 
     def where(self, index: int) -> str:
         return f"seed={self.seed} step={index} history={self.history}"
@@ -1845,7 +2019,7 @@ def _take(run: _Run, step: str, nested: bool, label: str) -> object:
     _BRACKET[0] = label
     try:
         if step == "configure":
-            log_foundry.configure(service="model", sink=run.recorder())
+            log_foundry.configure(service="model", sink=run.install())  # type: ignore[arg-type]
         elif step == "info":
             log_foundry.info("orphan")
             run.orphans += 1
@@ -2012,12 +2186,17 @@ def test_the_sequential_driver_holds_the_state_table(
     is recorded for the session's line.
     """
     with _rerun_on_failure(request, seed, concurrent=False):
-        worst = _drive(seed, monkeypatch)
+        worst, installs = _drive(seed, monkeypatch)
     record_property(GATE_MARGIN, f"{worst:.6f}")
+    print(f"\nmodel-install seed={seed} Leaves={installs['Leaves']} Mine={installs['Mine']}")
 
 
-def _drive(seed: int, monkeypatch: pytest.MonkeyPatch) -> float:
-    """Runs one sequential seed, asserting after every step; returns the worst margin."""
+def _drive(seed: int, monkeypatch: pytest.MonkeyPatch) -> tuple[float, collections.Counter[str]]:
+    """Runs one sequential seed, asserting after every step.
+
+    Returns the worst margin, and how many times each caller's wrapper was installed over a
+    written recorder (SPEC-101 FR-004).
+    """
     margins: list[float] = []
     run = _Run(seed)
     monkeypatch.setattr("log_foundry.sinks.stdout.StdoutSink", run.recorder)
@@ -2066,7 +2245,7 @@ def _drive(seed: int, monkeypatch: pytest.MonkeyPatch) -> float:
         _check_transient(cell, label, transient, where)
         _check_invariants(run, step, result, driver, where)
         _check_close_count(run, step, where)
-    return max(margins)
+    return max(margins), run.installs
 
 
 def _ids(sink: Recorder, message: str) -> list[str]:
