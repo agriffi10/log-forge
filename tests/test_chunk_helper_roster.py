@@ -21,8 +21,11 @@ _SINKS = Path(__file__).resolve().parents[1] / "src" / "log_foundry" / "sinks"
 
 _HELPERS = frozenset({"chunk_items", "chunk_list"})
 
-EXPECTED = frozenset({"clickhouse", "firehose", "kinesis", "postgres", "sns", "sqs"})
-"""The modules calling a shared chunk helper; ``http`` and ``eventhubs`` keep their own batching."""
+EXPECTED = frozenset({"_fifo", "clickhouse", "firehose", "kinesis", "postgres", "sns"})
+"""The modules calling a shared chunk helper; ``http`` and ``eventhubs`` keep their own batching.
+
+SPEC-100 moved ``SQSSink``'s call into ``_fifo.plan_round``, which draws the FIFO sinks' chunks.
+"""
 
 
 def chunking_modules(sources: dict[str, str]) -> set[str]:
@@ -67,9 +70,9 @@ def test_the_chunking_modules_are_the_six() -> None:
 
 def test_a_sink_that_inlines_its_chunker_back_is_named() -> None:
     tree = _tree()
-    assert "chunk_items(" in tree["sqs"], "the premise: sqs calls the helper"
-    tree["sqs"] = tree["sqs"].replace("chunk_items(", "_inline_chunker(")
-    assert EXPECTED - chunking_modules(tree) == {"sqs"}
+    assert "chunk_items(" in tree["_fifo"], "the premise: _fifo calls the helper"
+    tree["_fifo"] = tree["_fifo"].replace("chunk_items(", "_inline_chunker(")
+    assert EXPECTED - chunking_modules(tree) == {"_fifo"}
 
 
 def test_converting_http_or_eventhubs_is_named() -> None:
