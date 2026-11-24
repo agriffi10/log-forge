@@ -347,8 +347,8 @@ These are the completion ritual's edits.
     say-so".
 - **README, *Writing your own sink*.**
   - The second route becomes: "leave the member's close out of your wrapper's `close()`. The
-    library closes a member it has delivered to directly after each close of your wrapper, and a
-    member it never delivered to directly is yours to close."
+    library closes a member it has delivered to directly after each close of your wrapper that the
+    library makes, and a member it never delivered to directly is yours to close."
   - New sentence: a wrapper that closes its member itself gets a second `close()` of that member
     from the library after its own, which the protocol's idempotent close absorbs.
   - New sentence: a slow `close()` delays that member's close.

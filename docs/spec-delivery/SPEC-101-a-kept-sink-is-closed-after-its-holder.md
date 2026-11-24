@@ -36,8 +36,9 @@
   open" through an expired `shutdown()` with the drain parked in the wrapper, since FR-001 now
   closes the member after a completed one.
 - **Two residuals open in §12**, unfixed under the scope freeze: FR-002's overlap returns for a
-  sink armed in the swap's unlocked graph-read window (measured), and `_written` holds a sink
-  whose type refuses a weak reference strongly until a fork (reasoned).
+  sink armed in the swap's unlocked graph-read window (measured), and `_written` and `_after`
+  hold a sink whose type refuses a weak reference strongly until a fork, so both grow under
+  repeated configures of such a wrapper (measured).
 
 ## Verification
 

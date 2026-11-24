@@ -1989,15 +1989,21 @@ an item leaves this list when a spec closes it, not because the arc names it.
   so A is not ordered behind `Mine(A)`, and `Mine`'s close of A overlaps the library's:
   `A.at_entry=[2, 2] by_wrapper=[True, False] overlaps=1`. No event is lost; the two closes run at
   once, which is the shape SPEC-101 closed everywhere else. **Closed by** no spec yet.
-- **`_CloseRegistry._written` holds a sink strongly when its type cannot be weakly referenced**
-  (found by SPEC-101's build; invariant 5; reasoned from the code, not measured; unfixed under the
-  audit scope freeze). SPEC-101's record of the sinks the library armed keeps each by `id`, as a
-  `weakref.ref` where the sink's type allows one and as the sink itself where it does not
-  (`_weak_or_strong`), and prunes only entries whose weak reference has died. A strong entry
-  therefore stays until the process forks and `_clear_after_fork` clears the record, as the
-  ownership record's `_Entry` holds such a sink. A process that keeps configuring fresh written
-  sinks of such a type, a `__slots__` class with no `__weakref__` slot, grows that record without
-  bound. **Closed by** no spec yet.
+- **`_CloseRegistry._written` and `_after` hold a sink strongly when its type cannot be weakly
+  referenced** (found by SPEC-101's build; invariant 5; measured at `e9cc6cac`; unfixed under the
+  audit scope freeze). Both of SPEC-101's records keep a sink by `id`, as a `weakref.ref` where the
+  sink's type allows one and as the sink itself where it does not (`_weak_or_strong`): `_written`
+  each sink the library armed, and `_after` each caller's wrapper with its attached members.
+  `_written` prunes only an entry whose weak reference has died, and `_after` only an entry whose
+  holder has died or whose persistent members all have, so a strong entry stays until the process
+  forks and `_clear_after_fork` clears both records, as the ownership record's `_Entry` holds such
+  a sink. A process that keeps configuring fresh written sinks of such a type, a `__slots__` class
+  with no `__weakref__` slot, grows both records without bound, and a displaced caller's wrapper of
+  that type over a live member stays pinned in `_after`. Reproduced with a scratch probe, not
+  committed: 200 rounds of `configure(A)`, a log, `configure(W(A))` with `W` such a wrapper, a log,
+  then `shutdown()`, print `after=200 written=201 A.closes=1`, each round's displaced `W` held
+  strongly by both records. No event is lost and A is closed once; the cost is memory. **Closed
+  by** no spec yet.
 
 - **`SQSSink`'s class docstring lists none of its three FIFO attributes** (found by SPEC-100's
   completion ritual, 2026-11-24; present on `5d0e7f68`, before SPEC-100; unfixed under the audit
@@ -3973,8 +3979,9 @@ and a third copy is a fork with no merge.
   paths with no event lost, and `README.md` (*Writing your own sink*) gives them: build the
   wrapper on a shipped one and inherit its `close()`, so its member sits in a declared slot and
   is closed once through `release`; or leave the member's close out of the wrapper's `close()`,
-  and the library closes a member it delivered to directly after each close of the wrapper, while
-  a member it never delivered to directly is the caller's to close (SPEC-101). There is no third,
+  and the library closes a member it delivered to directly after each close of the wrapper that
+  the library makes, while a member it never delivered to directly is the caller's to close
+  (SPEC-101). There is no third,
   because a wrapper has no public means to declare its members. The fifth shape, a stop-signal
   hand to a sink a straddling log put back in the record, was §12's and is closed by SPEC-098.
 

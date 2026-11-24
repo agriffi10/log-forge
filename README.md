@@ -1341,8 +1341,8 @@ both delivery paths:
   forwards the member's close where the library cannot tell it is part of a sink change, so it
   cannot spare a member the new sink still holds.
 - **Leave the member's close out of your wrapper's `close()`.** The library closes a member it has
-  delivered to directly after each close of your wrapper, and a member it never delivered to
-  directly is yours to close.
+  delivered to directly after each close of your wrapper that the library makes, and a member it
+  never delivered to directly is yours to close.
 
 A wrapper that closes its member itself gets a second `close()` of that member from the library,
 after its own, wherever the library has delivered to that member directly; the protocol's
