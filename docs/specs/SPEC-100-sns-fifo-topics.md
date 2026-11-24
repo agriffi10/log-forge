@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-100
 title: "SNSSink Writes an SNS FIFO Topic: Each Message Carries Its Trace's Group and Its Event's `log_id`, Resent Unchanged"
 description: "Gives SNSSink the FIFO arguments SQSSink has, so a FIFO topic receives every event with a MessageGroupId that defaults to its trace_id and a MessageDeduplicationId that defaults to its log_id, both resolved once per delivery run, resent unchanged, costed in the message limit and held in group order through the mechanism SQSSink already uses; refuses on both sinks, at construction, a fifo that is not a bool, fifo=True on a name not ending in .fifo and an id argument on a sink that is not FIFO; sends an over-long deduplication id on either sink as its digest rather than a prefix two events can share; and records why a FIFO SNSSink still may not declare itself idempotent."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-010, SPEC-016, SPEC-058, SPEC-071, SPEC-074, SPEC-092, SPEC-093, SPEC-095, SPEC-096]
 arc: audit-2026-11-14
 arc_order: 16
