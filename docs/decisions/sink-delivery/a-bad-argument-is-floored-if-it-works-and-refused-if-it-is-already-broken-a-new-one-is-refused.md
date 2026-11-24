@@ -19,7 +19,9 @@ beside `LogstashSink`'s `url=`, is an argument the chosen backend cannot use, a 
 **Applied by SPEC-100 to the FIFO arguments of `SQSSink` and `SNSSink`**, through one judgement both
 call, `sinks/_fifo.judge`, after every refusal each constructor made before and before any client is
 built, so a call refused there keeps its exact error. It asks the types first, then the values.
-`fifo` that is neither a `bool` nor `None` is a `TypeError` naming its real type, for SPEC-065's
+A queue URL or topic ARN that is not a `str` is a `TypeError` naming the argument and its type,
+*already broken*: no send can reach it. `fifo` that is neither a `bool` nor `None` is a `TypeError`
+naming its real type, for SPEC-065's
 reason: it is outside the declared type, so no type-checked caller breaks, though `SQSSink` had read
 it by truthiness since SPEC-016 and `fifo=1` constructed there. `fifo=True` on a queue URL or topic
 ARN not ending in `.fifo` is a `ValueError`, *already broken*: AWS requires every FIFO queue and

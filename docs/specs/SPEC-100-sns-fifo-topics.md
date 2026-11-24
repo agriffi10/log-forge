@@ -164,6 +164,12 @@ It judges the types first and then the values:
   subclassed, so the test admits `True` and `False` alone, and no subclass case exists to read as
   SPEC-066 reads an `int` subclass. `SQSSink` has read `fifo` by truthiness since SPEC-016, so
   `fifo=1` stops constructing there.
+- A queue URL or topic ARN whose type is not a `str` subclass is refused with `TypeError` `<Class>
+  <queue_url|topic_arn> must be a str, not <type>`, asking the type, never the value. At the base
+  `SNSSink(None, client=c)` and `SQSSink(None, client=c, fifo=False)` constructed, and
+  `SQSSink(None, client=c)` raised an `AttributeError` naming no argument from `.endswith`; no
+  such sink can send. The suffix is then read through `str.endswith`, so a `str` subclass's own
+  `endswith` never runs.
 - A constant group id that is blank after `str.strip` is refused with `ValueError` `message_group_id
   must be a non-empty string; pass None to group by trace_id`, the base's text, which names no
   class, on both sinks.
@@ -251,6 +257,11 @@ client build option, and the prototype passes all three unchanged.
       non-empty string; pass None to group by trace_id` before any client is built, and a `str`
       subclass constant is accepted and sent as the `str` it holds, without its own `strip`
       running (invariant 13).
+- [ ] On both sinks, a destination of `None`, `bytes` or `int`, with or without an injected
+      client, raises `TypeError` `<Class> <queue_url|topic_arn> must be a str, not <type>` and
+      builds no client, a call also carrying an earlier refusal raises that refusal instead, and
+      a `str` subclass destination is accepted without its own `endswith` running (invariants 13
+      and 6).
 - [ ] `log_foundry.sinks.sns.GroupIdSource is log_foundry.sinks.sqs.GroupIdSource`, and the same
       holds for `DedupIdSource`. Both are in `sns.__all__`, and the typed consumer type-checks under
       `mypy --strict` (invariant 10).
@@ -319,7 +330,11 @@ since `sqs` no longer calls `chunk_items`.
   a fresh UUID, and an over-long one is FR-003's.
 - An id callable that raises, or that returns something other than a `str`, costs its own event,
   dropped and announced. When every event's callable raised, the round is refused with the first
-  exception (SPEC-058 FR-004).
+  exception (SPEC-058 FR-004). **The answer is asked its type** (`_fifo.answer`): one whose type
+  is not a `str` subclass raises `TypeError` `a FIFO <group|deduplication> id callable must answer
+  a str`, an id failure of its event, and a `str` subclass is stripped through `str.strip`, so its
+  own methods never run. Reading the answer's own `strip` instead sent an object whose `strip`
+  returned a `str` as that `str`.
 - So does an answer that resolves but cannot be costed. At the base, `SQSSink._prepare` costs each
   id with `.encode("utf-8")` outside the `try` that guards the callables (`sqs.py:781-786`). An
   answer that is not a `str` but has a working `strip`, such as `bytes`, and a `str` holding a
@@ -395,6 +410,10 @@ de-duplicates. The topic's own absorption rests on AWS's word, and FR-007 says s
 - [ ] On both sinks, an id callable answering `bytes` for one event of two, and one answering a
       `str` holding a lone surrogate for one event of two, each drop that event as an id failure
       with the id-failure line and send the other (invariant 2).
+- [ ] On both sinks, an answer that is not a `str` but whose `strip` returns one is dropped as an
+      id failure naming `TypeError`; when every event's answer is such an object `emit` raises
+      `TypeError` `a FIFO <group|deduplication> id callable must answer a str`; and a `str`
+      subclass whose own `strip` raises is sent as the plain `str` it holds (invariant 2).
 - [ ] A blank group answer sends `log-foundry`, and a blank de-duplication answer sends a
       32-character hex id that is the same on that event's resend (invariant 2).
 - [ ] With `max_message_bytes` at its default, a FIFO `SNSSink` drops an event whose body is 40
@@ -809,8 +828,9 @@ __all__ = ["DedupIdSource", "GroupIdSource", "SNSSink"]
 
 ```python
 # src/log_foundry/sinks/_fifo.py
-def judge(owner: str, kind: str, name: str, destination: str, fifo: object,
+def judge(owner: str, kind: str, name: str, destination: object, fifo: object,
           group: object, dedup: object) -> bool: ...   # FR-001; returns the sink's fifo
+def answer(raw: object, kind: str) -> str: ...        # FR-002; a non-str answer is a TypeError
 def bounded(raw: str, fallback: str) -> str: ...      # was sqs._bounded; the group id's cut
 def group_id(source: GroupIdSource, event: dict[str, object]) -> str: ...
 def dedup_id(source: DedupIdSource, event: dict[str, object]) -> str: ...   # digest past 128
@@ -829,6 +849,15 @@ def plan_round(owner: object, batch: list[dict[str, object]], bodies: dict[int, 
 def hold(chunk: list[Prepared], blocked: set[str], sends: list[int], limit: int) -> list[bool]: ...
 def block(sent: list[Prepared], fates: list[Outcome], sends: list[int],
           blocked: set[str], limit: int) -> None: ...
+def send_round(owner: object, batch: list[dict[str, object]], plan: Plan, fates: list[Outcome],
+               *, fifo: bool, max_retries: int,
+               send: Callable[[list[Prepared], list[str]], Called[KeyedReply]],
+               call: str, name: str) -> None: ...
+    # The one round loop both sinks' _round call after their plan, refusal and drops: the
+    # last-round gate (fifo and not RunContext.last), hold with the held line, each chunk sent
+    # through send and settled by settle_keyed, the landed marks from notes["prepared_round"],
+    # and block. hold and block are called through the module, so a patch of _fifo.hold reaches
+    # both sinks. Each sink passes only its _send, its API's name and its class name (FR-004).
 
 # src/log_foundry/sinks/sns.py
 SNSSink(
@@ -1116,3 +1145,12 @@ SPEC-095's *Evidence* quotes the same `PublishBatchRequestEntry` sentences, read
        docstrings say so.
     8. The moto re-run of cases E and F moves to the end of Phase 2, so case E is read with the
        hold in place.
+  - **Diff review frame 1 found four more**, fixed in the build; none widens the scope beyond
+    the behaviour FR-001 and FR-002 already stated. `SNSSink._round` was a near-copy of
+    `SQSSink._round`, and two mutants on the SNS copy alone survived the suite (holding in the
+    run's last round, and not marking a landed occurrence), so the round loop moved into one
+    shared `_fifo.send_round` (Interface Contract) and the engine suite's FIFO tests run on both
+    sinks. An object whose own `strip` returned a `str` was sent as that `str`, against FR-002, so
+    an answer is now asked its type (FR-002, a criterion added). `SNSSink(None, client=c)` built
+    and failed later, so `judge` refuses a destination that is not a `str` (FR-001, a criterion
+    added). Two docstring lines over 100 characters were rewrapped.

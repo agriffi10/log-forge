@@ -959,7 +959,8 @@ a NaN or non-number is refused at the call; SPEC-100 refused, on `SQSSink` and `
 that is not a `bool` or `None` with `TypeError`, and with `ValueError` `fifo=True` on a queue URL
 or topic ARN not ending in `.fifo` and a `message_group_id` or `message_deduplication_id` on a sink
 that is not FIFO, each before any client is built, through one judgement both sinks call,
-`sinks/_fifo.judge`).
+`sinks/_fifo.judge`, which also refuses a queue URL or topic ARN that is not a `str` with a
+`TypeError` naming it).
 
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
