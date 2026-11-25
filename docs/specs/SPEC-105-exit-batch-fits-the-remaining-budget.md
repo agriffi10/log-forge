@@ -57,7 +57,8 @@ stay open (*Out of Scope*).
   recorded, the same bound, lowering the target that `main` keeps through that failure and never
   raising it (FR-002).
 - The bound applies only when the time left less the margin is at least the longest exit attempt,
-  which is when SPEC-062's prediction would let the next batch start (FR-003).
+  which is when SPEC-062's prediction would let the next batch start; and a declined exit batch,
+  once a rate is recorded, restores the rate rule's target the bound lowered (FR-003).
 - The end-to-end outcome at a tight budget: the join completes, `close()` runs once, and every
   event is delivered or counted in an existing line, on the 1.x and the engine path (FR-004).
 - Where the budget does not bind, the batches are what they are today; in the last margin before
@@ -95,8 +96,17 @@ keep sharing every rule but this one, which, like the exit budget it serves, exi
   could lower only a target stamped with the old generation, which `_size_target` already reads as
   zero, so it would change no batch; keying the rate by generation would need a second attribute
   for no effect (FR-002 pins this through a stand-in for `retarget`'s locked reassign).
-- **A declined exit batch.** It is not emitted, records nothing and is followed only by declined
-  batches while the deadline stands, so no bound is applied after it.
+- **A bound after a declined exit batch.** A declined batch is not emitted, records nothing and is
+  followed only by declined batches while the deadline stands, so no bound is applied after it;
+  once a rate is recorded it restores the rate rule's target instead (FR-003).
+- **An exit batch whose emit the clock cannot see.** FR-001 records no rate when `elapsed` is zero
+  or below, and `_set_target` reads that as the cap. On a monotonic clock coarser than a fast small
+  exit batch's emit, that batch reads zero elapsed, records no rate, and the next batch goes out at
+  the cap with no bound: the §12 item's first shape again, for a fast sink. How coarse the clock is
+  depends on the platform (`time.get_clock_info('monotonic').resolution` reports it). Keeping the
+  previous rate when `elapsed <= 0` would close it for every exit batch but the first, which would
+  stay unmeasured. It is recorded as a remainder of the first shape in the §12 item, with no closer
+  named, by diff review frame 2.
 - **The first exit batch.** Its size is whatever the target read at the stop, and its first attempt
   is always made (SPEC-090 FR-003). A target measured before the stop is not capped, so a first
   exit batch can still be longer than the budget; that is the first-attempt rule's own trade.
@@ -162,8 +172,8 @@ Every value below is exact in binary unless it says otherwise.
 #### Acceptance Criteria:
 
 - [ ] On FR-001's clock (the pre-stop call charged nothing) with the deadline at 0.328125 and 500
-      spans queued, the first two exit batches are 20 and 54 events. Without the bound they are 20
-      and 128 (invariant 3).
+      spans queued, the first two exit batches are 20 and 54 events, and the declined line names
+      926 events in 8 batches. Without the bound they are 20 and 128 (invariant 3).
 - [ ] The engine twin, a `deliver` sink with the same per-event cost, `max_retries=0` at both
       levels and the same clock and deadline, is handed the same 20 and 54 (invariant 6).
 - [ ] On FR-001's clock (the pre-stop call charged nothing) with a first exit batch that costs no
@@ -218,7 +228,7 @@ minimum, so it never raises the kept target; a target that reads zero stays zero
       `test_a_refused_http_sink_at_exit_is_handed_batches_at_the_cap` pass unchanged (invariant 2).
 - [ ] Serves invariants 2, 3, 5 and 6.
 
-### FR-003: The bound applies only when the prediction would let the next batch start
+### FR-003: The bound applies only when the prediction would let the next batch start, and a decline restores the rate rule's target
 
 #### Description:
 
@@ -232,32 +242,66 @@ named dozens where it names one. Because `room` is then at least `_exit_longest`
 positive whenever `_exit_longest` is, so it never sets a target to zero, which `_set_target`'s rule
 reads as unmeasured: the next batch is then the count trigger's.
 
-**This guard is the one whose failure would be silent.** Without it, or with it weakened to
-`room > 0`, no event is lost or delivered differently and no line appears or disappears; only the
-count of declined batches in the existing declined line changes. The two mutants are killed by
-different criteria. Removing the guard fails
-`tests/test_event_ledger_defects.py::test_an_expired_shutdown_leaves_the_batch_in_flight` with 48
-declined batches. The guard weakened to `room > 0` passes that test, because `room` is negative
-once the deadline has passed and the weakened guard refuses there too; it is killed by the 0.6 s,
-200-span criterion below, and by the ledger test not at all.
+**A declined exit batch restores the rate rule's target** (diff review frame 2, 2026-11-24). The
+guard is asked when an exit batch returns; the prediction is asked again before the next batch,
+after its items were taken. When the room at the fit lies in `[_exit_longest, _exit_longest + the
+take's time)`, the guard lowers the target, the next batch is declined anyway, and the whole
+declined backlog was cut at the lowered target: 980 events in 49 batches where `main` names 8, on
+both twins. So when an exit batch is declined and a rate is recorded, `_emit_pending` sets the
+target to `min(cap, _exit_rate × flush_interval / 2)`, what `_set_target` gave the batch that
+recorded the rate, with no new attribute. The first declined batch was already taken at the
+lowered target, so the cost is at most one declined batch more than the rate rule's target alone
+cuts the backlog into, in a window narrower than one take: an accepted trade (980 events in 9
+batches). With no rate recorded, a decline leaves the target as it was, as SPEC-090 has it. Two
+cases differ from "the target the fit lowered", read from the code: an empty exit batch after a
+rate is recorded zeroes the target and a later decline restores the rate rule's, which cuts the
+declined backlog into fewer batches and delivers nothing differently; and a caller that changes
+`flush_interval` between exit batches gets the restore at the new interval.
+
+**The guard's failure is nearly silent.** Since the restore, the guard decides only the size of
+the first declined batch. Without it, or with it weakened to `room > 0`, no event is lost or
+delivered differently and no line appears or disappears; the count of declined batches in the
+existing line moves by one. The two mutants are killed by different criteria. Removing the guard
+fails `tests/test_event_ledger_defects.py::test_an_expired_shutdown_leaves_the_batch_in_flight`
+with `lost 960 event(s); 2 exit batch(es) declined unattempted` where it pins 1. The guard weakened
+to `room > 0` passes that test, because `room` is negative once the deadline has passed and the
+weakened guard refuses there too, and it passes the 0.6 s, 200-span criterion, which gives 258
+events in 3 batches either way; the 0.6 s, 199-span criterion kills it.
 
 #### Acceptance Criteria:
 
 - [ ] `tests/test_event_ledger_defects.py::test_an_expired_shutdown_leaves_the_batch_in_flight`
       passes unchanged, with its `lost 960 event(s); 1 exit batch(es) declined unattempted`.
-      Removing the guard makes it fail with 48 declined batches; this is mutation-tested
+      Removing the guard makes it fail with 2 declined batches; this is mutation-tested
       (invariants 2 and 11).
 - [ ] On FR-001's clock (the pre-stop call charged nothing) with the deadline at 0.09765625 and 500
       spans queued, so the time left is below the margin after the first exit batch, no later exit
       batch is handed to the sink, the target reads 128.0, and the declined line names 980 events
-      in 8 batches. Without the guard it names 49 batches (invariants 2 and 3).
+      in 8 batches. Without the guard it names 9 (invariants 2 and 3).
 - [ ] On FR-001's clock (the pre-stop call charged nothing) with the deadline at 0.6 and 200 spans
       queued, the exit batches handed are 20 and 122, and the declined line names 258 events in 3
-      batches. With the guard weakened to `room > 0` it names 13; this is mutation-tested, and is
-      the criterion that kills that mutant (invariants 2 and 3).
+      batches (invariants 2 and 3).
+- [ ] On FR-001's clock (the pre-stop call charged nothing) with the deadline at 0.6 and 199 spans
+      queued, the exit batches handed are 20 and 122, and the declined line names 256 events in 2
+      batches. With the guard weakened to `room > 0`, or removed, it names 3; this is
+      mutation-tested, and is the criterion that kills the weakened guard (invariants 2 and 3).
+- [ ] On FR-001's clock (the pre-stop call charged nothing) with the deadline at 0.1953125, 500
+      spans queued and the clock moved on 2**-20 s after the first exit batch returns, no later
+      exit batch is handed to the sink, the declined line names 980 events in 9 batches, and the
+      target reads 128.0 after the join, on the 1.x and the engine path. Without the restore it
+      names 49; this is mutation-tested (invariants 2 and 6).
+- [ ] On FR-001's clock (the pre-stop call charged nothing) with a first exit batch that costs no
+      time, the deadline at 0.03125 and 1,000 spans queued, no later exit batch is handed to the
+      sink, the declined line names 1,980 events in 2 batches, and the target reads 1000.0. A
+      restore made without a recorded rate names 50; this is mutation-tested (invariant 2).
+- [ ] On FR-001's clock (the pre-stop call charged nothing) with the deadline at 0.1953125, 500
+      spans queued and no time between the fit and the prediction, the room equals the longest
+      attempt: the exit batches handed are 20 and 20, the second returning at 0.15625, and the
+      declined line names 960 events in 8 batches. A guard of `room > _exit_longest` hands 20 and
+      128; this is mutation-tested (invariant 3).
 - [ ] In FR-001's first criterion, after the 54-event batch the time left less the margin is
       exactly 0.0, and `worker._target` reads 128.0 after the join, never 0.0 (invariant 3).
-- [ ] Serves invariants 2, 3 and 11.
+- [ ] Serves invariants 2, 3, 6 and 11.
 
 ### FR-004: At a tight budget the join completes, the sink is closed, and every event is accounted
 
@@ -378,8 +422,8 @@ points at the §12 item.
 
 - [ ] The sink-lifecycle decision's fence and body state the bound, after a delivered and after a
       failed exit batch, its guard, and why it holds the prediction to the budget; its trade
-      paragraph gains the two trades above with this spec's numbers and Andrew's decision, and the
-      `retarget` note; its **Rejected** list gains the growth-tied bound with the arithmetic above,
+      paragraph gains the two trades above with this spec's numbers and Andrew's decision, the
+      restore's one-batch trade (FR-003), and the `retarget` note; its **Rejected** list gains the growth-tied bound with the arithmetic above,
       no growth at exit with the §12 item's measured reason, and the floor of one event and
       `max(0, …)` with their reasons; and its History gains a dated SPEC-105 entry at the top
       (serves no invariant: the register's record, judged by the completion ritual).
@@ -441,6 +485,13 @@ No public surface changes. The private shape, in `Worker._emit_pending` on `main
 (`src/log_foundry/worker.py`), whose failed-exit branch today is `if exit_batch and failed: return`:
 
 ```python
+if exit_batch and self._exit_batches and self._exit_deadline is not None and (...):
+    self._decline_exit_batch(size)
+    if self._exit_rate > 0:                                       # FR-003's restore
+        self._target = min(float(_BACKLOG_BATCH_CAP), self._exit_rate * self.flush_interval / 2)
+    ...
+    return
+...
 failed = self.failed_batches != before
 if exit_batch and failed:
     if generation == self._sink_generation:                       # FR-002
@@ -483,9 +534,11 @@ README.md, docs/release-notes/v1.2.1.md                                       # 
 - Add `_exit_rate`, its resets and its inventory row; record it after a delivered exit batch; add
   `_fit_exit_target` with its guard and call it after every emitted exit batch that did not
   straddle a sink change.
-- Write the clock, flapping, retarget, guard, fork-reset, tight-budget, engine-twin, margin-band
-  and unchanged-path tests; mutation-test the guard (removed, against the ledger test and the
-  0.09765625 s criterion, and weakened to `room > 0`, against the 0.6 s, 200-span criterion), the
+- Restore the rate rule's target when an exit batch is declined and a rate is recorded.
+- Write the clock, flapping, retarget, guard, restore, boundary, fork-reset, tight-budget,
+  engine-twin, margin-band and unchanged-path tests; mutation-test the guard (removed, against the
+  ledger test and the 0.09765625 s criterion; weakened to `room > 0`, against the 0.6 s, 199-span
+  criterion; and `>=` turned to `>`), the restore (removed, and without its rate check), the
   delivered-path bound and the failed-path bound; run `spec103_recovered_slow_exit.py` at the
   FR-004 and FR-005 timeouts on 3.12 and 3.13 for the record.
 
@@ -521,6 +574,9 @@ the failed-path bound, and driven on FR-001's clock.
 | deadline 0.6, 74 spans | 20, 122; 6 declined in 1 | 20, 128, ending 0.578125, inside the margin; none declined |
 | deadline 64.0, 2,000 spans | sizes equal `main`'s and the `None` deadline's; 33 exit batches, every interior one 128 | |
 
+Those figures predate the restore FR-003 gained in diff review frame 2, which changes the
+guard-removed rows: with it the 0.09765625 s case names 980 events in 9 batches, the ledger test 2
+declined batches, and the 0.6 s, 200-span case 258 in 3 under the weakened guard (FR-003).
 `test_an_expired_shutdown_leaves_the_batch_in_flight` with the guard removed fails with
 `lost 960 event(s); 48 exit batch(es) declined unattempted`; with the guard weakened to `room > 0`
 it passes. With the full prototype, `tests/test_event_ledger_defects.py`,
@@ -713,3 +769,23 @@ design hands 100 to 110 and declines 20 to 30; at 0.5 s on 3.12.12, today hands 
     `Worker._lock` before its reassign. Both criteria now pin the state through a stand-in for
     `retarget`'s locked reassign (`_reassign` in the tests), and Out of Scope's *Keying the rate by
     sink generation* says the sink-change handling on the exit path is therefore defensive.
+- **Diff review frame 2, 2026-11-24.** Four findings:
+  - Fixed: the guard is asked when an exit batch returns and the prediction again before the next
+    batch, after its items were taken, so a room in `[_exit_longest, _exit_longest + the take's
+    time)` lowered the target, the batch was declined anyway, and the whole declined backlog was
+    cut at the lowered target: 980 events in 49 batches against `main`'s 8, on both twins. A
+    declined exit batch now restores the rate rule's target once a rate is recorded (FR-003), and
+    the repro names 9. FR-003's Description and criteria are rewritten for it: removing the guard
+    now fails the ledger test with 2 declined batches, not 48, and gives 9 at the 0.09765625 s
+    deadline; the weakened guard is no longer killed by the 0.6 s, 200-span criterion but by a
+    199-span one; the guard's failure moves the declined count by one batch, not dozens; and
+    criteria are added for the restore on both twins and for a decline with no rate recorded.
+    FR-001's first criterion gains its declined line, 926 events in 8 batches.
+  - Fixed: the guard's boundary, `room == _exit_longest`, had no test; FR-003 gains one, and the
+    `>` mutant hands 20 and 128.
+  - Fixed: `_reinit_after_fork`'s docstring said a child never bounds a batch by a parent's exit
+    rate; a fork from inside an exit batch's `emit` on the drain thread can, after the reset, and
+    the docstring now says so and why it cannot make the child overrun a budget.
+  - Flagged, not built: an exit batch whose emit the clock cannot see records no rate, and the
+    next batch goes out at the cap. Recorded in Out of Scope and in the §12 item as a remainder of
+    the first shape, with a candidate closure and no closer named.

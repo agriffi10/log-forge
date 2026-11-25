@@ -27,7 +27,9 @@ so the steady drain and the exit drain decide a batch boundary the same way, inv
   emit, or one a test froze); zero, which is the count trigger's batch, after a batch counted in
   `failed_batches`, after one that held no events, after one whose emit straddled a
   `retarget`, for a new worker and in a forked child. A batch the exit drain declines, or
-  abandons, leaves it as it was: at exit nothing waits for a failing sink to recover, and a reset
+  abandons, leaves it as it was, except that once an exit batch's rate is recorded a declined one
+  restores the rate rule's target, which the exit bound may have lowered (SPEC-105, below): at
+  exit nothing waits for a failing sink to recover, and a reset
   cut a dead sink's backlog into `batch_size` submissions, each paying the sink's own calls and
   lines. The trade is a sink that fails because a batch is too large: at exit it is now handed
   the target every time rather than ten spans after its first failure. It is no regression
@@ -144,8 +146,10 @@ later batch, predicted to end past the shutdown deadline* (`docs/decisions/sink-
 - **Refined** by SPEC-105: the size-target bullet names the exit bound, which lowers the target
   after an exit batch to what the last delivered exit batch's rate fits in the time left, and
   points at the sink-lifecycle decision that holds it; "so an emit stays shorter than the time
-  trigger's interval" is qualified for a sink whose rate changes during the exit. The fence is
-  unchanged, since the bound only lowers a target.
+  trigger's interval" is qualified for a sink whose rate changes during the exit. "A batch the
+  exit drain declines … leaves it as it was" now excepts a declined exit batch once a rate is
+  recorded, which restores the rate rule's target (SPEC-105's second diff review). The fence is
+  unchanged, since the bound only lowers a target and the restore sets only the rate rule's own target.
 
 ### 2026-11-17
 

@@ -12,7 +12,9 @@
   `_exit_rate × (deadline − now − _JOIN_MARGIN)`. A failed exit batch still keeps its target, and
   the bound then lowers what it kept.
 - **The guard** (FR-003): the bound applies only when that room is at least `_exit_longest`, when
-  the exit budget's prediction would let the next batch start.
+  the exit budget's prediction would let the next batch start. A declined exit batch, once a rate
+  is recorded, restores the rate rule's target, `min(cap, _exit_rate × flush_interval / 2)`, so a
+  decline after the guard passed costs at most one declined batch.
 - **The docstrings**: `_emit_pending`, `_set_target`, `_retry_declined`, `_fit_exit_target`,
   `Worker.__init__`'s exit fields, `_reinit_after_fork`, `_JOIN_MARGIN`, `_emit`, and
   `sinks/nats.py`'s module headline, each sentence the §12 item showed false now qualified.
@@ -57,27 +59,38 @@ one-minute load average at 61 at the start and 27 at the end.
 At `d9f2f097`, before the build, the join expired at 0.45 to 0.65 s on 3.13.1 with a second exit
 batch of 222 to 248 events (the §12 item's before-and-after table).
 
-**Mutation runs**, each mutant scoped to one method and restored from the committed bytes:
+**Mutation runs** at `901b6690`, each mutant scoped to one method and restored from the committed
+bytes:
 
-- M1, the guard removed: killed by the ledger test
-  (`lost 960 event(s); 48 exit batch(es) declined unattempted` against 1), by the
-  within-the-margin test (target −5.0) and by the delivered-path test (target 0.0).
-- M2, the guard weakened to `room > 0`: **survives the ledger test**, the within-the-margin test
-  and the delivered-path test, as FR-003 says; killed only by the 0.6 s, 200-span test (258
-  events in 13 declined batches against 3).
-- M3, the delivered-path bound removed: killed by the fake-clock tests on both twins (`[20, 128]`
-  against `[20, 54]`), the margin-band test, and both FR-004 real-clock tests. On
-  `test_a_tight_shutdown_completes_its_join_behind_a_sink_that_recovered_by_exit` (FR-004 AC3) it
-  failed on `stopped_reason`, `ShutdownTimeout`, with 228 events in flight. The return-time
-  assertion passed under the mutant, so it alone could not tell the two apart.
-- M4, the failed-path bound removed: killed (`[20, 118, 118, 118, 118]`). M5, the failed path's
-  generation check dropped: killed (target 102.0 against 118.0). M6, the rate's generation check
-  dropped: killed (`_exit_rate` 256.0 against 0.0).
+| Mutant | Killed by, and the reason |
+|---|---|
+| M1 guard removed | the ledger test (`2 exit batch(es) declined`, against 1); the within-the-margin test (980 in 9 against 8); the delivered-path test (926 in 9 against 8); the 199-span test (256 in 3 against 2) |
+| M2 guard weakened to `room > 0` | **only the 0.6 s, 199-span test** (256 in 3 against 2); it survives the ledger test, the 200-span test (258 in 3 either way), the within-the-margin test and the delivered-path test |
+| M3 delivered-path bound removed | the fake-clock tests on both twins (`[20, 128]` against `[20, 54]`), the margin-band test (`[20, 122]`), and both FR-004 real-clock tests |
+| M4 failed-path bound removed | the flapping test (`[20, 118, 118, 118, 118]`) |
+| M5 failed-path generation check dropped | the straddle test (target 102.0 against 118.0) |
+| M6 rate-record generation check dropped | the delivered-straddle test (`_exit_rate` 256.0 against 0.0) |
+| M7 restore removed | the restore test on both twins (980 in 49 against 9) |
+| M8 restore without the rate check | the no-rate decline test (1,980 in 50 against 2) |
+| M9 guard `>=` turned to `>` | the boundary test (`[20, 128]` against `[20, 20]`) |
+
+On FR-004 AC3, M3 failed
+`test_a_tight_shutdown_completes_its_join_behind_a_sink_that_recovered_by_exit` on
+`stopped_reason`, `ShutdownTimeout`, with 228 events in flight; the return-time assertion passed
+under the mutant, so it alone could not tell the two apart.
+
+**From the second diff review.** A decline after the guard passed, in a window narrower than one
+take, cut the whole declined backlog at the lowered target (980 events in 49 batches against 8); a
+declined exit batch now restores the rate rule's target, and that case names 9, the accepted
+one-batch trade. The delivered-path test now asserts its declined line exactly (926 in 8), which
+is what lets M1 fail it. An exit batch whose emit the clock cannot see records no rate and is
+flagged as an open remainder in §12, not built.
 
 ## Verification
 
 Ruff, mypy, pytest (13,213 passed on 3.12.12 and 3.13.1), spec-lint and its corpus, docs-lint,
 docstring-lint, the all-extras suite and the integration suite against nine services all exited 0
-at `e46c367c`. The two FR-004 real-clock tests passed 20 of 20 runs in a row beside a full
-parallel suite. Runner-collected test ids over the four touched test files went from 147 to 165,
-with none removed.
+at `e46c367c`, and the suite again at `901b6690` (13,218 passed on 3.12.12 and 3.13.1). The two
+FR-004 real-clock tests passed 20 of 20 runs in a row beside a full parallel suite, at both heads.
+Runner-collected test ids over the four touched test files went from 147 at `c0fd19a1` to 165 at
+`e46c367c`, with none removed.

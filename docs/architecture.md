@@ -1484,6 +1484,17 @@ an item leaves this list when a spec closes it, not because the arc names it.
     | 2.0 s | 1.69 to 1.72 s; 738 to 750 events handed | 1.67 to 1.71 s; 708 to 734 |
     | 30 s | 8.23 s; 3,982 handed | 8.30 to 8.32 s; 3,982 |
 
+    **A remainder of this shape stays open: an exit batch whose emit the clock cannot see**
+    (found by SPEC-105's second diff review, 2026-11-24; read from the code at `901b6690`, not
+    measured). A delivered exit batch records its rate only when `elapsed` is above zero; one
+    whose `elapsed` reads zero or below records none, and `_set_target` reads that as the cap.
+    On a monotonic clock coarser than a fast small exit batch's emit, that batch reads zero
+    elapsed, records no rate, and the next batch goes out at the cap with no bound, which is
+    this shape again for a fast sink. How coarse the clock is depends on the platform; a reader
+    can see it with `time.get_clock_info('monotonic').resolution`. A candidate closure is to keep
+    the previous rate when `elapsed <= 0`, which closes it for every exit batch but the first,
+    which stays unmeasured. No closer is named.
+
   - **A sink that slows during the exit** (`<start> slowdown 2000 <t>`: ten events a request, each
     request 0.5 ms for the first two exit calls and 0.3 s after). Fast requests grow the batches
     to the 1,000-event cap, so the first slow one is 100 requests, about 30 s. With the target
@@ -1539,9 +1550,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   after a call that failed at once, a first exit batch longer than the budget) and pointing
   here, and narrowed the README's and the v1.2.1 notes' caveat to those, dropping "a batch the
   exit has grown since". **Closed by**, for the first shape, SPEC-105 (landed: the fit bound,
-  marked closed above and recorded under *Resolved*). The item stays open for the second and
-  third shapes, and for a sink slow from its very first exit call, which have no closer yet: a
-  bound on the whole call, a per-call deadline handed to the sink, not a per-request timeout,
+  marked closed above, except its remainder, and recorded under *Resolved*). The item stays open
+  for the first shape's remainder, the second and third shapes, and a sink slow from its very
+  first exit call, which have no closer yet; for the last three the candidate is a bound on the
+  whole call, a per-call deadline handed to the sink, not a per-request timeout,
   since each request here is well inside any. ~~SPEC-105's text still names this item by the
   title SPEC-103's growth branch gave it~~ — SPEC-105 was revised on 2026-11-24 and names this
   item by this title.
@@ -2135,7 +2147,8 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `_JOIN_MARGIN`, when the prediction would let the next batch start. Before and after are the
   table under the open item's first shape: the join expired at 0.45 to 0.65 s at `d9f2f097` and
   completes at all four at `e46c367c`, on 3.12.12 and 3.13.1, with the 2 s and 30 s drains as
-  they were. The item itself stays open for its second and third shapes.
+  they were. The item itself stays open for its second and third shapes, and for this shape's
+  remainder, an exit batch whose emit the clock cannot see.
 
 - ~~**`SNSSink` cannot write an SNS FIFO topic**~~ (SPEC-095, Out of Scope; invariant 7). `SNSSink`
   sends no `MessageGroupId`: each entry is an `Id` and a `Message` alone (`sinks/sns.py:495-501`
