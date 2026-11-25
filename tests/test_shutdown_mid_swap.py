@@ -1316,24 +1316,18 @@ def test_a_retarget_answering_declined_does_not_arm_a_sink_a_concurrent_shutdown
     assert _once(b), f"B was not closed exactly once: {b}"
 
 
-def test_a_retarget_answering_fenced_keeps_its_arm_and_closes_the_sink_once_after_its_write(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """FR-001, the ``fenced`` branch: a withheld change keeps its arm, so B is owed after its write.
+def _force_fenced(monkeypatch: pytest.MonkeyPatch, a: Sink, b: Sink) -> list[str]:
+    """Forces the ``fenced`` choreography: a stop whose wait runs out takes B mid-change.
 
-    The change to B is parked after its retarget answered ``fenced``: the worker already delivers
-    to B. An orphan log writes to B and arms it, and a concurrent ``shutdown()`` whose wait for the
-    change's decision runs out after its two-second closer grace stops the worker, takes B and
-    closes it, which marks the change withheld. Its timeout leaves the stop time to see the drain
-    thread end, so B is no longer held when it takes. The change is released and still arms B,
-    since on ``fenced`` that arm is the only one the worker's new sink gets: B is owed when
-    ``configure()`` returns, and its last close comes after its last write.
+    A live worker on A; the change to B is parked after its retarget answered; an orphan log
+    writes to B and arms it; a ``shutdown()`` on another thread waits out its closer grace for the
+    change, stops the worker, takes B and closes it; the change is then released. Shared with
+    SPEC-099's ``tests/test_soak_known.py``, which records B's events under the model soak's
+    wrappers and holds them to the fixed ``fenced`` record.
 
-    What this row does not claim: B is closed a second time at the same write count by the exit.
-    That is the stop whose wait for a change in flight ran out (invariant 5's recorded exception),
-    not the window FR-001 closes, and FR-001 keeps the ``fenced`` arm on purpose.
+    Returns:
+      Each verdict the retarget to B answered.
     """
-    a, b = Sink("A"), Sink("B")
     _worker_on(a)
     verdicts: list[str] = []
     real = Worker.retarget
@@ -1356,6 +1350,28 @@ def test_a_retarget_answering_fenced_keeps_its_arm_and_closes_the_sink_once_afte
     _finish(stop)
     release.set()
     _finish(swap)
+    return verdicts
+
+
+def test_a_retarget_answering_fenced_keeps_its_arm_and_closes_the_sink_once_after_its_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001, the ``fenced`` branch: a withheld change keeps its arm, so B is owed after its write.
+
+    The change to B is parked after its retarget answered ``fenced``: the worker already delivers
+    to B. An orphan log writes to B and arms it, and a concurrent ``shutdown()`` whose wait for the
+    change's decision runs out after its two-second closer grace stops the worker, takes B and
+    closes it, which marks the change withheld. Its timeout leaves the stop time to see the drain
+    thread end, so B is no longer held when it takes. The change is released and still arms B,
+    since on ``fenced`` that arm is the only one the worker's new sink gets: B is owed when
+    ``configure()`` returns, and its last close comes after its last write.
+
+    What this row does not claim: B is closed a second time at the same write count by the exit.
+    That is the stop whose wait for a change in flight ran out (invariant 5's recorded exception),
+    not the window FR-001 closes, and FR-001 keeps the ``fenced`` arm on purpose.
+    """
+    a, b = Sink("A"), Sink("B")
+    verdicts = _force_fenced(monkeypatch, a, b)
     assert verdicts == ["fenced"], f"the premise: the retarget answered fenced, read {verdicts}"
     deadline = time.monotonic() + GATE_WAIT
     while b.closes == 0 and time.monotonic() < deadline:

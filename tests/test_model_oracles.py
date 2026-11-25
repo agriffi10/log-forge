@@ -30,6 +30,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -57,6 +58,7 @@ from model_oracles import (
     Interval,
     Ledger,
     ModelFailure,
+    Note,
     Take,
     Wait,
     Write,
@@ -86,6 +88,11 @@ from model_oracles import (
 from model_pins import PINS, Cell, PinnedVerdict, cell_id, cells, judge, pin_of, scheduled, withheld
 from model_sinks import ChildRun, Forker, Reentrant, Waiter, factory, install_sink, run_body
 from test_model_cells import CellHooks, cell_body
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from model_oracles import SinkEvent
 
 TESTS = pathlib.Path(__file__).parent
 
@@ -1198,15 +1205,21 @@ def test_every_pinned_cell_is_in_the_table_and_under_one_pin() -> None:
     assert len(named) == len(set(named))
 
 
-def open_item_leads() -> list[str]:
+def open_item_leads(text: str | None = None) -> list[str]:
     """Returns the bold lead of every bullet between ``### Open`` and ``### Resolved`` in §12.
 
-    A lead wraps across lines there, so it is read across the wrap, and whitespace collapsed.
+    A lead wraps across lines there, so it is read across the wrap, and whitespace collapsed. A
+    struck bullet (``- ~~**...**~~``) is not a lead.
+
+    Args:
+      text: ``docs/architecture.md``'s text, or ``None`` to read the file; SPEC-099 passes a
+        scratch copy to show its open-item check failing.
 
     Returns:
       The leads, in order.
     """
-    text = (TESTS.parent / "docs" / "architecture.md").read_text(encoding="utf-8")
+    if text is None:
+        text = (TESTS.parent / "docs" / "architecture.md").read_text(encoding="utf-8")
     section = text.split("\n### Open\n", 1)[1].split("\n### Resolved\n", 1)[0]
     leads: list[str] = []
     for bullet in re.split(r"\n(?=- )", "\n" + section):
@@ -1497,6 +1510,58 @@ def _close(count: int, thread: str = "log-foundry-sink-close") -> Close:
 
 _WRITE = Write("Thread-1 (runner)")
 _BY_WRITER, _BY_CHANGE = Arm(by_writer=True), Arm(by_writer=False)
+_T2 = "Thread-2 (runner)"
+_NOTE, _NOTE2, _WRITE2 = Note(_WRITE.thread), Note(_T2), Write(_T2)
+_LOG_ARM = Arm(by_writer=True, by="_note_orphan_emit")
+_SWAP_ARM = Arm(by_writer=False, by="_swap_sink")
+_OWED, _SWAPS = Take(by="_close_owed"), Take(by="_swap_sink")
+
+SHAPE_A: list[SinkEvent] = [_NOTE, _LOG_ARM, _WRITE, _OWED, _close(1), _SWAP_ARM, _OWED, _close(1)]
+"""SPEC-099's Shape A: a sink change arms a sink a ``shutdown()``'s take already closed.
+
+The first take is ``_close_owed``'s, the only arm between the two takes is ``_swap_sink``'s, and
+the log that wrote entered before the first take. Red under FR-001's rule, and no known row may
+ever explain it (``tests/test_soak_known.py``).
+"""
+
+FENCED: list[SinkEvent] = [
+    Note("MainThread"),
+    _LOG_ARM,
+    Write("MainThread"),
+    _OWED,
+    _close(1),
+    _SWAP_ARM,
+    _OWED,
+    _close(1),
+]
+"""Sink B's record under the forced ``fenced`` choreography, measured 7 of 7 at ``d9f2f097``.
+
+``tests/test_shutdown_mid_swap.py``'s forced ``fenced`` test, recorded with the soak's wrappers:
+``note(MainThread) arm(writer:_note_orphan_emit) write(MainThread) take(_close_owed) | close@1
+arm(change:_swap_sink) take(_close_owed) | close@1``. It is Shape A's record exactly, which is why
+the open ``fenced`` item has no known row (SPEC-099 FR-002). ``tests/test_soak_known.py`` re-records
+it from the live choreography.
+"""
+
+
+def closes_of(events: Sequence[object]) -> Closes:
+    """Returns the close record a fixed event record implies.
+
+    ``writes`` counts the :class:`Write` events, and each close's count at entry is its own
+    ``count``. The count at return is taken equal to it, which holds for a fixed record in which
+    no write lands while a close runs, as in :data:`SHAPE_A` and :data:`FENCED`.
+
+    Args:
+      events: One sink's events.
+
+    Returns:
+      Its close record.
+
+    Raises:
+      None.
+    """
+    counts = tuple(event.count for event in events if isinstance(event, Close))
+    return Closes(sum(isinstance(event, Write) for event in events), counts, counts)
 
 
 @pytest.mark.parametrize(
@@ -1536,6 +1601,42 @@ _BY_WRITER, _BY_CHANGE = Arm(by_writer=True), Arm(by_writer=False)
             [Take(), _close(0), Take(), _close(0), _WRITE, Take(), _close(1), Take(), _close(1)],
             frozenset({"CloseBroken:repeat@0", "CloseBroken:repeat@1"}),
         ),
+        (
+            [
+                _NOTE,
+                _LOG_ARM,
+                _WRITE,
+                _OWED,
+                _SWAP_ARM,
+                _NOTE2,
+                _WRITE2,
+                _close(2),
+                _OWED,
+                _close(2),
+            ],
+            frozenset(),
+        ),
+        (SHAPE_A, frozenset({"CloseBroken:repeat@1"})),
+        (
+            [_NOTE, _LOG_ARM, _WRITE, _SWAPS, _close(1), _SWAP_ARM, _SWAPS, _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
+        (
+            [_NOTE, _LOG_ARM, _OWED, _WRITE, _SWAP_ARM, _close(1), _OWED, _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
+        (
+            [_NOTE, _LOG_ARM, _WRITE, _OWED, _close(1), _SWAP_ARM, _NOTE2, _OWED, _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
+        (
+            [_NOTE, _LOG_ARM, _OWED, _NOTE2, _WRITE, _SWAP_ARM, _close(1), _SWAPS, _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
+        (
+            [_NOTE, _LOG_ARM, _OWED, _WRITE, _NOTE, _SWAP_ARM, _close(1), _SWAPS, _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
     ],
     ids=[
         "the-traced-rearm",
@@ -1548,6 +1649,13 @@ _BY_WRITER, _BY_CHANGE = Arm(by_writer=True), Arm(by_writer=False)
         "a-writers-arm-before-the-first-take-excuses-nothing",
         "a-close-with-no-take-is-not-excused-by-a-wider-window",
         "two-counts-each-repeated",
+        "shape-b-a-log-entering-after-the-take-finds-the-sink-owed",
+        "shape-a-a-swap-arms-a-sink-a-shutdowns-take-closed",
+        "339-a-sink-changes-take-first",
+        "the-boundary-a-log-that-entered-before-the-take-writes-after-it",
+        "a-a-log-entering-between-the-takes-writes-only-after-the-second",
+        "b-the-boundary-beside-another-threads-entry",
+        "c-the-boundary-then-the-same-threads-next-entry",
     ],
 )
 def test_the_unowed_repeat_rule(events: list[object], expected: frozenset[str]) -> None:
@@ -1559,6 +1667,11 @@ def test_the_unowed_repeat_rule(events: list[object], expected: frozenset[str]) 
     its own is a wiring failure, ``untaken``, and is never judged against a wider window: the
     earlier take there belongs to the first close, so a wider window would reach back past it to
     the writer's arm and excuse the repeat.
+
+    SPEC-099 FR-001 adds a log that entered after the first take and wrote before the second,
+    Shape B, as owed, and keeps red every record in which the write's log entered before the first
+    take (the boundary, Shape A), a log that wrote only after the second take (a), another
+    thread's entry beside the boundary (b), and the same thread's next entry after it (c).
     """
     assert _signatures(check_unowed_repeat, events) == expected
 
