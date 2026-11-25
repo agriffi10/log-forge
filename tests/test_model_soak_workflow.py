@@ -700,6 +700,7 @@ _ITEMS_FOR_CEILING = 3 * ((_CEILING + 1) // 3 + 2)
             f"{_CEILING} x {_SHAPE}, ceiling {_CEILING}",
         ),
         ([_known(f"{_SHAPE},{_SHAPE}")] + [""] * 5, "0-1", None, 0, f"1 x {_SHAPE}, ceiling"),
+        ([_known("no-such-shape")] + [""] * 5, "0-1", None, 1, "no-such-shape names no row"),
     ],
     ids=[
         "clean",
@@ -715,6 +716,7 @@ _ITEMS_FOR_CEILING = 3 * ((_CEILING + 1) // 3 + 2)
         "over-the-ceiling",
         "at-the-ceiling",
         "one-item-one-shape-on-two-sinks",
+        "a-known-item-naming-no-row",
     ],
 )
 def test_the_report(

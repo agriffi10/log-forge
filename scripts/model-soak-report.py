@@ -236,7 +236,10 @@ def report(xml: pathlib.Path, seeds_value: str) -> tuple[str, int]:
             ceiling = ceiling_of(shape)
             item = row.item if row is not None else "(no such row)"
             lines.append(f"- {count} x {shape}, ceiling {ceiling}: {item}")
-            if row is None or count > ceiling:
+            if row is None:
+                lines.append(f"  **No such row:** {shape} names no row of tests/soak_known.py.")
+                status = 1
+            elif count > ceiling:
                 lines.append(
                     f"  **Ceiling broken:** {shape} held {count} items, ceiling {ceiling}."
                 )

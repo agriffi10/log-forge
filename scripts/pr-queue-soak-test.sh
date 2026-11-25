@@ -7,7 +7,10 @@
 # GH_RUNS_JSON (the head's runs) and GH_SCHED_JSON (the soak's runs, filtered by the caller's
 # --event, --status and --limit), attempts in GH_ATT_JSON keyed "<run id>/<attempt>" — refuses a
 # --json field the canned objects lack, and applies the caller's own --jq to the JSON with `jq`, so
-# a broken filter fails a case rather than reading a canned answer. "HEAD" in a canned headSha is
+# a broken filter fails a case rather than reading a canned answer. It also renders a missing
+# conclusion exactly as the real client does, and refuses canned data in the other shape:
+# `gh run list --json` gives "" (measured, gh 2.93.0) and the API gives null, and a stub that canned
+# null for a run list once hid a read that an empty field broke. "HEAD" in a canned headSha is
 # the trunk's head. GH_FAIL fails every call, GH_API_FAIL only `gh api`. Every call is logged.
 #
 # Every case asserts where it lands AND why: the state or exit, and a line of what the queue said,
@@ -76,12 +79,16 @@ case "$cmd/$sub" in
     data="$(printf '%s' "$data" | "$JQ" -c --arg ev "$event" --arg st "$status" --argjson lim "$limit" \
       '[.[] | select(($ev == "") or (.event == $ev)) | select(($st == "") or (.status == $st))] | .[:$lim]')"
     fields "$data"
+    printf '%s' "$data" | "$JQ" -e 'all(.[]; .conclusion != null)' >/dev/null \
+      || { echo "stub: gh run list renders a missing conclusion as \"\", never null" >&2; exit 2; }
     printf '%s' "$data" | "$JQ" -r "$jqx" ;;
   api/)
     [ -n "${GH_API_FAIL:-}" ] && { echo "gh: api failure" >&2; exit 1; }
     key="$(printf '%s' "$path" | sed -n 's#^repos/{owner}/{repo}/actions/runs/\([0-9]*\)/attempts/\([0-9]*\)$#\1/\2#p')"
     obj="$(printf '%s' "${GH_ATT_JSON:-"{}"}" | "$JQ" -c --arg k "$key" '.[$k] // empty')"
     [ -n "$key" ] && [ -n "$obj" ] || { echo "HTTP 404: Not Found" >&2; exit 1; }
+    printf '%s' "$obj" | "$JQ" -e '.conclusion != ""' >/dev/null \
+      || { echo "stub: the API renders a missing conclusion as null, never \"\"" >&2; exit 2; }
     printf '%s' "$obj" | "$JQ" -r "$jqx" ;;
   pr/list) printf '[]' | "$JQ" -r "$jqx" ;;
   *) echo "stub: unknown call $cmd $sub" >&2; exit 1 ;;
@@ -125,7 +132,7 @@ verdict() { Qs soak-verdict 2>/dev/null; }
 mstate() { Qs main-state >/dev/null 2>&1; echo $?; }
 
 # run_json <id> <sha> <status> <event> — one canned soak run.
-run_json() { printf '{"databaseId":%s,"attempt":%s,"headSha":"%s","status":"%s","conclusion":null,"workflowName":"Model soak","event":"%s"}' "$1" "$2" "$3" "$4" "$5"; }
+run_json() { printf '{"databaseId":%s,"attempt":%s,"headSha":"%s","status":"%s","conclusion":"","workflowName":"Model soak","event":"%s"}' "$1" "$2" "$3" "$4" "$5"; }
 att_json() { printf '"%s/%s":{"conclusion":%s,"updated_at":"%s"}' "$1" "$2" "$3" "$4"; }
 q() { case "$1" in null) printf 'null' ;; *) printf '"%s"' "$1" ;; esac; }
 # night C...: scheduled run 101 on HEAD whose attempts concluded C (null for one still running).
@@ -190,13 +197,17 @@ if want head; then
   night success
   GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"success","workflowName":"CI"},{"headSha":"HEAD","status":"completed","conclusion":"failure","workflowName":"Model soak"}]'; export GH_RUNS_JSON
                            check "a red dispatch on the head does not block" "$(mstate)" 0
-  GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"success","workflowName":"CI"},{"headSha":"HEAD","status":"in_progress","conclusion":null,"workflowName":"Model soak"}]'; export GH_RUNS_JSON
+  GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"success","workflowName":"CI"},{"headSha":"HEAD","status":"in_progress","conclusion":"","workflowName":"Model soak"}]'; export GH_RUNS_JSON
                            check "a soak running on the head is not unsettled" "$(mstate)" 0
+  GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"success","workflowName":"CI"},{"headSha":"HEAD","status":"queued","conclusion":"","workflowName":"Model soak"}]'; export GH_RUNS_JSON
+                           check "a soak queued on the head, its conclusion empty, is not unsettled" "$(mstate)" 0
+  GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"success","workflowName":"CI"},{"headSha":"HEAD","status":"in_progress","conclusion":null,"workflowName":"Model soak"}]'; export GH_RUNS_JSON
+                           check "the stub refuses a run list's null conclusion, which gh never gives" "$(mstate)" 3
   night failure
   GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"failure","workflowName":"CI"}]'; export GH_RUNS_JSON
                            check "another red on the head answers 1" "$(mstate)" 1
                            check "  ...while the verdict still blocks" "$(vstate)" 4
-  GH_RUNS_JSON='[{"headSha":"HEAD","status":"in_progress","conclusion":null,"workflowName":"Release"}]'; export GH_RUNS_JSON
+  GH_RUNS_JSON='[{"headSha":"HEAD","status":"in_progress","conclusion":"","workflowName":"Release"}]'; export GH_RUNS_JSON
                            check "another run in progress answers 2" "$(mstate)" 2
   GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"success","workflowName":"CI"}]'; export GH_RUNS_JSON
                            check "the verdict alone answers 4" "$(mstate)" 4
@@ -222,11 +233,11 @@ if want calls; then
   night failure success; Qs main-state >/dev/null 2>&1
   calls="$(cat "$GH_LOG")"
   has "the head's runs: headSha,status,conclusion,workflowName" "$calls" \
-    'run list --branch main --limit 30 --json headSha,status,conclusion,workflowName --jq .[] | "\(.headSha) \(.status) \(.conclusion) \(.workflowName)"'
+    'run list --branch main --limit 30 --json headSha,status,conclusion,workflowName --jq .[] | [.headSha, .status, .conclusion, .workflowName] | map(if . == null or . == "" then "-" else tostring end) | join(" ")'
   has "the soak's scheduled runs, any status" "$calls" \
-    'run list --workflow model-soak.yml --event schedule --limit 30 --json databaseId,attempt --jq .[] | "\(.databaseId) \(.attempt)"'
+    'run list --workflow model-soak.yml --event schedule --limit 30 --json databaseId,attempt --jq .[] | [.databaseId, .attempt] | map(if . == null or . == "" then "-" else tostring end) | join(" ")'
   has "each attempt through the API" "$calls" \
-    'api repos/{owner}/{repo}/actions/runs/101/attempts/2 --jq "\(.conclusion) \(.updated_at)"'
+    'api repos/{owner}/{repo}/actions/runs/101/attempts/2 --jq [.conclusion, .updated_at] | map(if . == null or . == "" then "-" else tostring end) | join(" ")'
   hasnt "no --status filter on the soak's runs" "$calls" "--status"
 fi
 
@@ -329,6 +340,11 @@ b.py"; echo b >> tests/soak_known.py; git add -A; git commit -qm nl
   o="$(cd tests && turnout SPEC-22)"
   check "src, turn run from tests/" "${o%% *}" 1; has "  ...src, turn run from tests/" "$o" "$W"
   git config --unset diff.relative; git config --unset color.ui; git config --unset diff.external; git config --unset diff.noprefix; git config --unset diff.renames
+  newbranch sub;     echo d >> tests/soak_known.py; git add tests/soak_known.py
+  git update-index --add --cacheinfo 160000,"$(git rev-parse HEAD)",vendor/evil; git commit -qm sub
+  git config diff.ignoreSubmodules all; git config status.submoduleSummary false
+  rt 23 "a gitlink added beside a filing, under diff.ignoreSubmodules all" 1 "$W"
+  git config --unset diff.ignoreSubmodules; git config --unset status.submoduleSummary
 fi
 
 if want acquire; then
@@ -497,6 +513,8 @@ plant "an unreadable verdict read as clear by main-state" queue.sh 's#4) return 
 plant "the mode not held" queue.sh 's#^    \[ "\$mode" = 100644 \] || return 1#    true || return 1#' turn "docs/architecture.md deleted" "tests/soak_known.py made executable" "tests/soak_known.py made a symlink" "tests/soak_known.py made a gitlink"
 plant "the path not held" queue.sh 's#^    \[ "\$path" = tests/soak_known.py \] || \[ "\$path" = docs/architecture.md \] || return 1#    true#' turn "src beside a clearing file" "a top-level soak_known.py" "tests/soak_ceilings.py beside a filing"
 plant "names matched inside a path" queue.sh 's#\[ "\$path" = tests/soak_known.py \] ||#[[ "$path" == *soak_known.py* ]] ||#' turn "a path holding both names, in order" "a top-level soak_known.py"
+plant "the head's fields read space-separated, empty conclusion and all" queue.sh 's#--jq ".\[\] | \[.headSha, .status, .conclusion, .workflowName\] | \$GH_FIELDS"#--jq ".[] | \\"\\\\(.headSha) \\\\(.status) \\\\(.conclusion) \\\\(.workflowName)\\""#' head "a soak running on the head is not unsettled" "a soak queued on the head, its conclusion empty, is not unsettled"
+plant "the clearing range read through porcelain diff" queue.sh 's#diff-tree -r -z --no-abbrev --no-renames --ignore-submodules=none#diff --raw -z --no-abbrev --no-renames#' turn "a gitlink added beside a filing, under diff.ignoreSubmodules all"
 plant "renames detected" queue.sh 's#--no-abbrev --no-renames#--no-abbrev -M#' turn "tests/soak_known.py renamed out"
 plant "an empty range accepted" queue.sh 's#^  \[ "\$n" -gt 0 \]$#  true#' turn "no commits" "a commit and its revert"
 plant "turn admits any branch" queue.sh 's#^    4) if clearing_branch; then#    4) if true; then#' turn "src beside a clearing file" "no commits"

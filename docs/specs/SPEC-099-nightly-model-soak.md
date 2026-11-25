@@ -551,7 +551,7 @@ mutation-tested.
 
 #### Acceptance Criteria:
 
-- [ ] The report's fixture corpus asserts the exit status and the reason for each of thirteen rows:
+- [ ] The report's fixture corpus asserts the exit status and the reason for each of fourteen rows:
       - clean;
       - known;
       - new, with its re-run command, exiting 0;
@@ -564,7 +564,8 @@ mutation-tested.
       - wiring items failed;
       - one known item over a ceiling;
       - exactly at a ceiling;
-      - one known item naming one shape on two sinks, counted once.
+      - one known item naming one shape on two sinks, counted once;
+      - a known item whose property names no row, exit 1.
 - [ ] One mutant per check is planted, and each is reddened by a named row or test:
       - the count floor;
       - the skipped-or-unexplained floor;
@@ -733,11 +734,13 @@ its id and that it will fail. It still answers that night.
 
 **The clearing branch.** A clearing branch changes `tests/soak_known.py` and
 `docs/architecture.md` and nothing else, leaving each a regular file (mode 100644). `queue.sh
-clearing-range <from> <to>` decides it from `git diff --raw -z --no-abbrev --no-renames
---no-ext-diff --no-relative --no-color --no-textconv`:
+clearing-range <from> <to>` decides it from the plumbing `git diff-tree -r -z --no-abbrev
+--no-renames --ignore-submodules=none`:
 - names are read NUL-delimited and compared whole;
 - a rename reads as a deletion and an addition;
-- no `diff.*` or `color.*` setting can change what is read;
+- no `diff.*` or `color.*` setting can change what is read: the porcelain `git diff --raw` hid
+  an added gitlink under `diff.ignoreSubmodules all` (the code round's review, reproduced), so
+  the plumbing is read, with submodules never ignored;
 - an empty range, or one whose changes revert each other, is not clearing.
 
 `turn`, `acquire` and the hook decide a branch with `clearing_range` from its merge base with
@@ -844,10 +847,17 @@ it lists neither queue test today, and the always-loaded budget is better kept.
         the local `origin/main` is stale first, with `origin/main` and every other
         `refs/remotes/` ref asserted unchanged afterwards;
       - a valid clearing branch read `READY` while the local `origin/main` is stale;
-      - `turn` for 22 branch shapes, among them renames onto and off a clearing file, a deletion,
+      - `turn` for 23 branch shapes, among them renames onto and off a clearing file, a deletion,
         a mode change, a symlink, a gitlink, paths with a space, both names in one path, a top-level `soak_known.py`, a newline or a glob
         character,
-        `tests/soak_ceilings.py`, a merge bringing in `src/`, and hostile `diff.*` settings;
+        `tests/soak_ceilings.py`, a merge bringing in `src/`, hostile `diff.*` settings, and a
+        gitlink added under `diff.ignoreSubmodules all`;
+      - an in-progress and a queued `Model soak` run on the head whose conclusion `gh run list`
+        renders as `""`, read as neither red nor unsettled. The stub renders a missing conclusion
+        as the real client does (`""` from `gh run list --json`, measured with gh 2.93.0; `null`
+        from the API) and refuses the other shape, and the queue renders every field of a line it
+        reads from `gh` with a `-` token for a missing value, so an empty field cannot shift the
+        fields after it;
       - `acquire` by a holder onto each kind of branch;
       - `turn`'s note for a verdict 48 hours old and for none, and its silence otherwise;
       - the hook on a clearing push, an added `src` commit, another red, `gh` failing or absent
@@ -1353,6 +1363,13 @@ nothing.
 
 ## Revision history
 
+- **2026-11-24, corrected in the code round** after the first diff review: `gh run list --json`
+  renders a run with no conclusion as `""`, which collapsed under the queue's space-separated
+  `read` and made an in-progress `Model soak` run on the head read as building; the queue now
+  renders every field with a `-` token for a missing value, and the stub matches the real client's
+  rendering and refuses the other. `clearing_range` reads the plumbing `diff-tree`, since
+  `diff.ignoreSubmodules all` hid an added gitlink from `git diff --raw`. The report corpus gains a
+  row for a known item naming no row (fourteen rows), and `turn` a twenty-third branch shape.
 - **2026-11-24, completed.** The build landed on this branch at `da095631`. Two corrections make
   the spec true of what shipped: FR-002's ceiling derivation no longer claims "x2 under" holds for
   every rate measured, since the build's own macOS runs measured 21.7 a night at loads 19 to 34;

@@ -74,28 +74,52 @@ ORPHAN_LATE: list[SinkEvent] = [Note(T1), LOG_ARM, Write(T1), Note(T2), OWED, _c
 
 
 @pytest.mark.parametrize(
-    ("events", "matches"),
+    ("events", "closes", "matches"),
     [
-        (ORPHAN_LATE, True),
-        ([Note(WORKER), Write(WORKER), OWED, _close(1), Write(WORKER)], False),
-        ([Note(T1), LOG_ARM, Write(T1), OWED, _close(1), Note(T2), Write(T2)], False),
+        (ORPHAN_LATE, LATE, True),
+        ([Note(WORKER), Write(WORKER), OWED, _close(1), Write(WORKER)], LATE, False),
+        ([Note(T1), LOG_ARM, Write(T1), OWED, _close(1), Note(T2), Write(T2)], LATE, False),
         (
             [Note(T1), LOG_ARM, Write(T1), Note(T2), OWED, _close(1), LOG_ARM, Write(T2)],
+            LATE,
+            False,
+        ),
+        (
+            [
+                Note(T1),
+                LOG_ARM,
+                Write(T1),
+                Note(WORKER),
+                Note(T2),
+                OWED,
+                _close(1),
+                Write(WORKER),
+                Write(T2),
+            ],
+            Closes(3, (1,), (1,)),
             False,
         ),
     ],
-    ids=["orphan-late-write", "on-the-worker-thread", "note-after-the-last-take", "arm-after-it"],
+    ids=[
+        "orphan-late-write",
+        "on-the-worker-thread",
+        "note-after-the-last-take",
+        "arm-after-it",
+        "two-late-writes-the-earlier-on-the-worker-thread",
+    ],
 )
-def test_the_late_write_predicate(events: list[SinkEvent], matches: bool) -> None:
+def test_the_late_write_predicate(events: list[SinkEvent], closes: Closes, matches: bool) -> None:
     """FR-002: each no-match row fails exactly one of the predicate's three clauses.
 
     A late write on ``log-foundry-worker`` is never the orphan path's (invariant 6), even with a
     ``Note`` of that thread before the take; a log whose ``Note`` follows the last take entered
     after it; and anything arming the sink after the last take makes the write owed, not orphan.
+    With two late writes every one is read, not the last alone: an earlier one on the worker
+    thread makes the sink's late writes not the orphan item's.
     """
-    assert soak_known.orphan_late_write(events, LATE) is matches
+    assert soak_known.orphan_late_write(events, closes) is matches
     expected = [soak_known.ORPHAN_LATE_WRITE] if matches else []
-    assert soak_verdict.explain_run([(events, LATE)]) == expected
+    assert soak_verdict.explain_run([(events, closes)]) == expected
 
 
 _WORKER_LATE: list[SinkEvent] = [Write(WORKER), OWED, _close(1), Write(WORKER)]
@@ -110,8 +134,35 @@ _UNTAKEN: list[SinkEvent] = [Write(T1), _close(1)]
         ([(ORPHAN_LATE, LATE), (_WORKER_LATE, LATE)], []),
         ([(_UNTAKEN, Closes(1, (1,), (1,)))], []),
         ([([Write(T1), OWED, _close(1)], Closes(1, (1,), (1,)))], []),
+        (
+            [
+                (
+                    [
+                        Note(T1),
+                        LOG_ARM,
+                        Write(T1),
+                        Note(T2),
+                        OWED,
+                        _close(1),
+                        Arm(by_writer=False, by="_swap_sink"),
+                        OWED,
+                        _close(1),
+                        Write(T2),
+                    ],
+                    Closes(2, (1, 1), (1, 1)),
+                )
+            ],
+            [],
+        ),
     ],
-    ids=["known", "known-on-two-sinks", "known-beside-new", "untaken", "clean"],
+    ids=[
+        "known",
+        "known-on-two-sinks",
+        "known-beside-new",
+        "untaken",
+        "clean",
+        "a-known-late-write-beside-shape-a-on-one-sink",
+    ],
 )
 def test_a_run_is_known_only_when_every_finding_is(
     sinks: list[tuple[list[SinkEvent], Closes]], expected: list[str]
@@ -439,27 +490,43 @@ def test_every_ceiling_names_a_row_and_carries_its_derivation() -> None:
     ("old", "new", "says"),
     [
         ("measured 10 a night", "10 a night", "no measurement"),
-        ("eda19f32", "a commit", None),
         ("macOS; x2 under, x3 over", "macOS; doubled", 'no "x2 under, x3 over"'),
         ('"orphan-write-after-close":', '"renamed-row":', "names no row"),
     ],
-    ids=["no-measurement", "one-commit-lost", "no-derivation", "no-row"],
+    ids=["no-measurement", "no-derivation", "no-row"],
 )
-def test_the_ceiling_check_can_actually_fail(old: str, new: str, says: str | None) -> None:
-    """Each planted fault in a copy of ``tests/soak_ceilings.py`` is named, with its line.
-
-    Losing one of the two commits leaves the other, which still anchors the line; losing both is
-    the ``no commit`` fault, planted second below.
-    """
+def test_the_ceiling_check_can_actually_fail(old: str, new: str, says: str) -> None:
+    """Each planted fault in a copy of ``tests/soak_ceilings.py`` is named, with its line."""
     assert _CEILINGS_TEXT.count(old) == 1, old
     planted = _CEILINGS_TEXT.replace(old, new)
-    if says is None:
-        assert ceiling_findings(planted, _ROWS) == []
-        planted = planted.replace("d9f2f097", "a commit")
-        says = "no commit"
     findings = ceiling_findings(planted, _ROWS)
     assert any(says in finding for finding in findings), findings
     assert all("orphan-write-after-close" in f or "renamed-row" in f for f in findings), findings
+
+
+_ANCHOR = re.compile(r"\b[0-9a-f]{8,40}\b")
+
+
+def test_a_ceiling_with_no_commit_is_named_however_many_it_cited() -> None:
+    """A ceiling's line loses every commit it cites: ``no commit``; any one alone still anchors it.
+
+    The anchors are derived from the line, so the row tests "no commit" whatever number of
+    measurements the comment cites, rather than assuming two.
+    """
+    (line,) = [entry[0] for entry in _CEILING_LINE.finditer(_CEILINGS_TEXT)]
+    anchors = sorted(set(_ANCHOR.findall(line.split("#", 1)[1])))
+    assert anchors, line
+    stripped = line
+    for anchor in anchors:
+        stripped = stripped.replace(anchor, "a commit")
+    findings = ceiling_findings(_CEILINGS_TEXT.replace(line, stripped), _ROWS)
+    assert findings and all("no commit" in finding for finding in findings), findings
+    for kept in anchors if len(anchors) > 1 else ():
+        others = line
+        for anchor in anchors:
+            if anchor != kept:
+                others = others.replace(anchor, "a commit")
+        assert ceiling_findings(_CEILINGS_TEXT.replace(line, others), _ROWS) == [], kept
 
 
 _FILED_LINE = re.compile(r'^    "[0-9]+-[0-9]+": ".+",$')

@@ -126,6 +126,12 @@ main_green() {
 # head_green  main_green's reading of the runs on main's head, as it was before SPEC-099, with the
 #             nightly soak's runs left out: a soak run on the head is a dispatch's or a night's, and
 #             only soak_verdict reads those. A red dispatch is someone's experiment, not a red main.
+#
+#             Every multi-field line read from gh renders each field through GH_FIELDS: `gh run list
+#             --json` gives a run with no conclusion yet as "" and the API gives null, and an empty
+#             field between two others vanishes under `read`, shifting every field after it (an
+#             in-progress `Model soak` run read as `conclusion=Model wf=soak`). So no field is ever
+#             empty: a missing value is the token "-".
 head_green() {
   local sha runs rsha status conclusion wf any=0 building=0 red=0
   # ls-remote rather than a fetch: it reads the remote's head without touching local refs, which
@@ -134,7 +140,7 @@ head_green() {
   [ -n "$sha" ] || return 3
   runs="$( cd "$REPO" && gh run list --branch "$MAIN" --limit 30 \
              --json headSha,status,conclusion,workflowName \
-             --jq '.[] | "\(.headSha) \(.status) \(.conclusion) \(.workflowName)"' )" || return 3
+             --jq ".[] | [.headSha, .status, .conclusion, .workflowName] | $GH_FIELDS" )" || return 3
   while read -r rsha status conclusion wf; do
     [ "$rsha" = "$sha" ] || continue
     [ "$wf" = "$SOAK_WORKFLOW" ] && continue
@@ -193,7 +199,7 @@ soak_verdict() {
   local runs id attempts n a c t blocked bad when good goodwhen
   runs="$( cd "$REPO" && gh run list --workflow "$SOAK_FILE" --event schedule \
              --limit "$SOAK_LOOKBACK" --json databaseId,attempt \
-             --jq '.[] | "\(.databaseId) \(.attempt)"' </dev/null )" || { echo "3 unreadable"; return 3; }
+             --jq ".[] | [.databaseId, .attempt] | $GH_FIELDS" </dev/null )" || { echo "3 unreadable"; return 3; }
   while read -r id attempts; do
     [ -n "$id" ] || continue
     case "$id/$attempts" in *[!0-9/]*|/*|*/) echo "3 unreadable"; return 3 ;; esac
@@ -201,7 +207,7 @@ soak_verdict() {
     n=1
     while [ "$n" -le "$attempts" ]; do
       a="$( cd "$REPO" && gh api "repos/{owner}/{repo}/actions/runs/$id/attempts/$n" \
-              --jq '"\(.conclusion) \(.updated_at)"' </dev/null )" || { echo "3 unreadable"; return 3; }
+              --jq "[.conclusion, .updated_at] | $GH_FIELDS" </dev/null )" || { echo "3 unreadable"; return 3; }
       c="${a%% *}"; t="${a#* }"
       case "$c" in
         failure|timed_out) blocked=1; bad="$n"; when="$t" ;;
@@ -247,8 +253,10 @@ filed() {
 # clearing_range <from> <to>  0 when the commits from..to in $PWD change something, and only
 #             tests/soak_known.py and docs/architecture.md, each left a regular file (100644).
 #             Names are read NUL-delimited and compared whole; a rename reads as a deletion and an
-#             addition; no diff.* or color.* setting can change what is read; an empty range, or
-#             one whose changes revert each other, is not clearing.
+#             addition; an empty range, or one whose changes revert each other, is not clearing.
+#             Read with the plumbing `diff-tree`, not porcelain `diff`, so no diff.* or color.*
+#             setting can change what is read: `diff.ignoreSubmodules all` hid an added gitlink
+#             from `git diff --raw`, and --ignore-submodules=none says so for the plumbing too.
 clearing_range() {
   local meta path mode n=0
   while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
@@ -256,8 +264,7 @@ clearing_range() {
     read -r _ mode _ <<< "${meta#:}"
     [ "$mode" = 100644 ] || return 1
     [ "$path" = tests/soak_known.py ] || [ "$path" = docs/architecture.md ] || return 1
-  done < <(git -C "$PWD" -c core.quotepath=false diff --raw -z --no-abbrev --no-renames \
-             --no-ext-diff --no-relative --no-color --no-textconv "$1" "$2" -- 2>/dev/null)
+  done < <(git -C "$PWD" diff-tree -r -z --no-abbrev --no-renames --ignore-submodules=none "$1" "$2" -- 2>/dev/null)
   [ "$n" -gt 0 ]
 }
 
@@ -290,6 +297,10 @@ soak_note() {
   fi
   return 0
 }
+
+# GH_FIELDS  joins a jq array of fields with single spaces, each null or "" rendered as "-", so a line
+#            of gh output always has every field, whatever the client renders for a missing value.
+GH_FIELDS='map(if . == null or . == "" then "-" else tostring end) | join(" ")'
 
 # --- the holder file --------------------------------------------------------------------------
 # `key value` lines, one fact per line, read by field name. The branch is compared as a STRING,

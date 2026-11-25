@@ -53,19 +53,28 @@
 
 ## Verification
 
-- **Gates at `da095631`:**
-  - All exit 0: ruff, mypy, pytest (13311 passed, 48 skipped, 10 xfailed), spec-lint and its
+- **Gates after the code round** (the commit on top of `764f26d6`):
+  - All exit 0: ruff, mypy, pytest (13314 passed, 48 skipped, 10 xfailed), spec-lint and its
     corpus, docs-lint, docstring-lint, `pr-queue-test.sh` (23 plants), `install-test.sh` (44 cases)
-    and `pr-queue-soak-test.sh` (151 cases, 33 plants).
-  - Python 3.12.12: 13310 passed with `PYTHONPATH=src`.
+    and `pr-queue-soak-test.sh` (155 cases, 35 plants).
+  - Python 3.12.12: 13313 passed with `PYTHONPATH=src`, which child interpreters need to import
+    the uninstalled package.
   - zizmor 1.32.0 `--offline` reports the same one low `self-repository` finding on this workflow
     as on `ci.yml`.
 - **Mutation sweeps:** every mutant was reddened by a named row — Phase 1 29 of 29, Phase 2 13 of
   13 plus a permanent planted row per workflow check, Phase 3 33 shell plants, and Phase 4 4 of 4.
+  The code round added 4 of 4 Python mutants (a signature with no shape skipped in `explain`, the
+  predicate reading only the last late write, the report's no-row exit dropped, every commit
+  anchor removed from a ceiling) and 2 shell plants (the head's fields read space-separated, the
+  clearing range read through porcelain `diff`), each reddened by its new row.
 - **Measured runs:**
   - The workflow's soak step at seeds 0 to 99 ran 307 passed and 1 known; the report read
     `300 of 300` and `8 of 8` and exited 0.
-  - Forks over the nightly selection: 0.
+  - Forks, counted by a `-p` plugin that registers `os.register_at_fork(before=...)`, at `-n 0`:
+    0 over the nightly selection at seeds 0 to 99 (308 items), and 15 over its positive control,
+    the sequential half's first four seeds (4 items). The commands:
+    `LOG_FOUNDRY_MODEL_SOAK=1 LOG_FOUNDRY_MODEL_SEEDS=0-99 PYTHONPATH=<plugin dir> poetry run pytest -n 0 -p forkcount tests/test_invariants_model.py -k "<the workflow's -k>"`
+    and `LOG_FOUNDRY_MODEL_SEEDS=0-3 PYTHONPATH=<plugin dir> poetry run pytest -n 0 -p forkcount tests/test_invariants_model.py -k test_the_sequential_driver_holds_the_state_table`.
   - The live `fenced` test passed 20 of 20, both in parallel and serially under load.
   - The real `gh` read through `soak_verdict`'s lines against `integration.yml` printed
     `0 45246571727-1 2026-11-23T19:20:28Z`.
