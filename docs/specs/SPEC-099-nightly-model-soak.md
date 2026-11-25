@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-099
 title: "A Nightly Soak of the Model Test: Known Findings Named by Their Open Item, New Ones Block the Queue Until Filed"
 description: "Runs SPEC-086's soak of the model test's close count every night on main, reads a second close that a log entering after the first take owes as owed, names each red item whose shape an open item of architecture.md §12 already records as known by that item until the item closes or its nightly ceiling is passed, and turns the run red for anything else; a scheduled night that fails stops the PR queue until a pull request files that night, so that what the soak finds is seen and answered rather than learned to be ignored."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-085, SPEC-086, SPEC-097]
 arc: audit-2026-11-14
 arc_order: 15
@@ -290,16 +290,20 @@ A default-suite test fails:
   "x2 under, x3 over".
 
 Each ceiling is set from its shape's rate in one night of 15,000 items, so that a rate that
-doubles stays under it and one that triples passes it, for every rate measured. The late-write
-row has two macOS rates: 10 a night at `eda19f32` (24 in 36,000 items) and 7.5 a night at
-`d9f2f097` (6 in 12,000). Its ceiling is 21. Doubled, 20 and 15 stay under it; tripled, 30 and 22.5
-pass it. The comment beside the number gives both measurements and their commits, and the test
-above holds it there.
+doubles stays under it and one that triples passes it. The late-write row's rate on macOS depends
+on the machine's load: 10 a night at `eda19f32` (24 in 36,000 items, loads up to 15), 7.5 a night
+at `d9f2f097` (6 in 12,000, load about 10), and, on the build's own tree (`beaf9403`, the library
+unchanged from `d9f2f097`), 2 to 8 per 3,000 items at loads 19 to 34, which is 21.7 a night over
+all three runs and about 40 at load 34. Its ceiling, 21, is derived from the moderate-load macOS
+figures: doubled, 20 and 15 stay under it, and tripled, 30 and 22.5 pass it. It does not hold
+"x2 under" for the heavily loaded runs, and it is not meant to: the ceiling applies to scheduled
+nights, which run on Linux. The comment beside the number gives the measurements and their
+commits, and the test above holds it there.
 
 On Linux the ceiling is loose. The stand-in met none in 18,000 items at `eda19f32`, and 1 in
 30,000 at `d9f2f097`, about 0.5 a night, so only a rate some forty times that would pass 21 there.
-The first scheduled nights on a real runner, which FR-003 already owes, are where its Linux rate is
-read; a ceiling set from them is an ordinary reviewed pull request.
+The first scheduled nights on a real runner, which FR-003 already owes, are where the ceiling is
+re-derived, by an ordinary reviewed pull request.
 
 **A row's life.** A known item stays visible: it is counted and listed in every run's summary
 (FR-004). It drops out only when its item closes. A default-suite test reads §12 with SPEC-085's
@@ -498,7 +502,9 @@ than through a pipe, because a pipe would hide its exit status under the runner'
 
 A known item's full record is in the XML and the log.
 
-**The floor and the ceilings.** The report exits 1, and says why, in each of these cases:
+**The floor and the ceilings.** A new finding does not make the report exit 1: the report lists it
+with its re-run command and exits 0, and pytest's own non-zero exit is what makes that run red
+(FR-003). The report exits 1, and says why, in each of these cases:
 - the soak items run are not exactly `3 × |seeds|`;
 - a soak item was skipped;
 - a soak item is an expected failure without both the `soak_known` property and a reason starting
@@ -548,7 +554,7 @@ mutation-tested.
 - [ ] The report's fixture corpus asserts the exit status and the reason for each of thirteen rows:
       - clean;
       - known;
-      - new, with its re-run command;
+      - new, with its re-run command, exiting 0;
       - one soak item short;
       - all skipped by a skip mark;
       - an `xfail` with neither the property nor the known text;
@@ -1347,6 +1353,13 @@ nothing.
 
 ## Revision history
 
+- **2026-11-24, completed.** The build landed on this branch at `da095631`. Two corrections make
+  the spec true of what shipped: FR-002's ceiling derivation no longer claims "x2 under" holds for
+  every rate measured, since the build's own macOS runs measured 21.7 a night at loads 19 to 34;
+  it now says the macOS rate is load-dependent, that 21 is derived from the moderate-load figures
+  and applies to Linux nights, where it is loose, and that the first real-runner nights re-derive
+  it. FR-004 now says plainly that a new finding leaves the report at exit 0 and pytest's exit makes
+  the run red.
 - **2026-11-24, corrected after the plan review**, on the orchestrator's rulings:
   - every soak fetch of the queue carries `--refmap=`, since without it the private fetch also
     moved `origin/main` (git 2.54.0, measured); the unmoved case now runs with `origin/main` stale

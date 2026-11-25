@@ -2678,9 +2678,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
   counts, and holding a declined batch apart from a failed run. SPEC-099's build starts only once
   this item is closed on `main`, because until then its nightly run is red on it every night.
   **Closed by** #393 (`4b7e4b86`): `_WORKER_LOST` is now built by `_worker_lost_shapes()`
-  (`tests/test_invariants_model.py:2110`) from every `_diag.lost("event", …)` in `worker.py`,
-  `_TALLY_WRITER` (`:2079`) names the writer of both exit lines, and
-  `test_an_exit_drain_tally_balances_the_worker_ledger` (`:2342`) holds a declined batch apart from
+  (`tests/test_invariants_model.py:2556` at SPEC-099's merge) from every `_diag.lost("event", …)`
+  in `worker.py`, `_TALLY_WRITER` (`:2525`) names the writer of both exit lines, and
+  `test_an_exit_drain_tally_balances_the_worker_ledger` (`:2788`) holds a declined batch apart from
   a failed run. Found still listed as open by the 2026-11-18 sweep of §12 and moved here then;
   SPEC-099's start condition is met.
 
