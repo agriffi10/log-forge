@@ -1856,9 +1856,7 @@ def test_after_a_delivered_exit_batch_the_next_fits_the_time_left(
     assert 0.328125 - run.clock.now - _FIT_MARGIN == 0.0
     assert run.worker is not None
     assert run.worker._target == 128.0, "the guard kept the rate rule's target, not zero"
-    declined = _declined(run.err)
-    assert len(declined) == 1, run.err
-    assert run.sink.events() + declined[0][0] == 1_000, run.err
+    assert _declined(run.err) == [(926, 8)], run.err
 
 
 def test_the_engine_twin_is_handed_the_same_fitted_batches(
@@ -2058,6 +2056,92 @@ def test_a_batch_ending_inside_the_last_margin_is_trimmed_and_its_tail_declined(
     run = _fit_exit(monkeypatch, capsys, deadline=0.6, spans=74)
     assert run.sink.handed[1:] == [20, 122], run.sink.handed
     assert _declined(run.err) == [(6, 1)], run.err
+
+
+_TAKE = 2.0**-20
+"""Seconds that pass between a fit and the next prediction: the take of the next batch's items."""
+
+
+def _take_after(index: int) -> Any:
+    """A ``between`` hook that moves the clock on by ``_TAKE`` after exit batch ``index``."""
+
+    def between(run: _FitRun, i: int) -> None:
+        if i == index:
+            run.clock.now += _TAKE
+
+    return between
+
+
+@pytest.mark.parametrize("engine", [False, True], ids=["1x", "engine"])
+def test_a_batch_declined_after_the_guard_passed_restores_the_rate_rules_target(
+    engine: bool, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003, diff review frame 2 (invariants 2 and 6): the guard and the prediction differ.
+
+    The guard is asked when an exit batch returns and the prediction when the next one is
+    emitted, after its items were taken. With a 0.1953125 deadline the room after the first exit
+    batch equals its 0.078125 attempt exactly, so the guard passes and lowers the target to 20;
+    ``_TAKE`` later the prediction declines the next batch. That batch was already taken at the
+    lowered target, so it is 20 events, and the decline then restores the rate rule's 128.0, so
+    the rest is cut as ``main`` cuts it: 9 declined batches where ``main`` names 8, and 49
+    without the restore.
+    """
+    run = _fit_exit(
+        monkeypatch, capsys, deadline=0.1953125, spans=500, engine=engine, between=_take_after(1)
+    )
+    assert run.sink.handed[1:] == [20], run.sink.handed
+    assert _declined(run.err) == [(980, 9)], run.err
+    assert run.worker is not None
+    assert run.worker._target == 128.0
+
+
+def test_the_guard_admits_a_batch_whose_room_equals_the_longest_attempt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003, diff review frame 2 (invariant 3): the guard's boundary is ``>=``.
+
+    The same 0.1953125 deadline with no time between the fit and the prediction: the room
+    after the first exit batch equals its attempt, so the bound gives 20 and the prediction
+    starts a batch of 20, which returns at 0.15625. A guard of ``room > longest`` would leave
+    the rate rule's 128, which the prediction also starts, and which ends at 0.578125.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.1953125, spans=500)
+    assert run.sink.handed[1:] == [20, 20], run.sink.handed
+    assert run.snapshots[2]["now"] == 0.15625, run.snapshots
+    assert _declined(run.err) == [(960, 8)], run.err
+
+
+def test_the_first_declined_batch_is_cut_at_the_rate_rules_target(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003, diff review frame 2 (invariants 2 and 3): the guard's refusal is visible.
+
+    The second exit batch, 122 events, ends at 0.5546875 under a 0.6 deadline; the room left is
+    then positive but below the longest attempt, so the guard leaves the rate rule's 128 and the
+    256 events left are declined in 2 batches. A guard weakened to ``room > 0``, or none, would
+    lower the target to about 1.6, so the first declined batch would be ten spans and the
+    decline's restore would cut the 236 behind it in 2 more: 3 batches.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.6, spans=199)
+    assert run.sink.handed[1:] == [20, 122], run.sink.handed
+    assert _declined(run.err) == [(256, 2)], run.err
+
+
+def test_a_declined_exit_batch_with_no_rate_recorded_leaves_the_target_as_it_was(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-090 FR-001 rule 4 under SPEC-105: a decline restores nothing when no rate exists.
+
+    The first exit batch costs no time, so it records no rate and ``_set_target`` gives the cap.
+    Under a 0.03125 deadline, inside the margin, every later batch is declined, and the 1,980
+    events left go at the cap in 2 batches. A restore made without a rate would set the target
+    to zero after the first, and cut the 980 behind it into 49 more.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.03125, spans=1_000, free=frozenset({2}))
+    assert run.sink.handed[1:] == [20], run.sink.handed
+    assert _declined(run.err) == [(1_980, 2)], run.err
+    assert run.worker is not None
+    assert run.worker._target == 1_000.0
 
 
 def test_a_pre_stop_batch_delivered_while_the_stop_is_claimed_records_no_rate(

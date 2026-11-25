@@ -1008,8 +1008,13 @@ class Worker:
         batch under a backlog is the count trigger's, measured afresh against the child's sink.
         The exit fields and both tallies go to their unstarted values, so a child neither
         declines against nor announces an exit the parent was making; ``_exit_rate`` among them
-        goes to ``0.0`` before the resume split, beside ``_exit_longest``, so a child never
-        bounds a batch by the rate of a parent's exit (SPEC-105 FR-001), and ``_exit_fold`` is
+        goes to ``0.0`` before the resume split, beside ``_exit_longest``, so a child starts with
+        no rate of a parent's exit (SPEC-105 FR-001). Not quite never: a fork from inside an exit
+        batch's ``emit`` on the drain thread leaves the child a copy of that thread, which
+        returns from the forking ``emit`` after this reset and writes ``_exit_rate`` and
+        ``_exit_longest`` from the parent's batch, as ``_exit_longest`` already could. Such a
+        rate can only lower a later target while a deadline stands, and the stale longest only
+        declines sooner, so neither can make the child overrun a budget. ``_exit_fold`` is
         emptied and reopened in place (SPEC-103), by the time ``_fork`` has already withdrawn the
         fold window the forking thread may have had open. ``_sink_generation`` is
         **not** reset: the child inherits it harmlessly, as it inherits ``sink``, and
@@ -2783,9 +2788,10 @@ class Worker:
         join records its own deadline (:meth:`claim_stop`), which can be ``None`` after a batch
         was declined, and the decline line would then claim a deadline there is not (diff
         review, 2026-11-16). A declined batch was not emitted and leaves the target as it was,
-        so the batches the rest of the backlog is cut into are the rule's. The size is summed
-        from the list rather than read from ``_pending_events``, so the measurement holds on any
-        path that appends without :meth:`_take`.
+        so the batches the rest of the backlog is cut into are the rule's — refined by SPEC-105:
+        once a rate is recorded it restores the rate rule's target instead, below. The size is
+        summed from the list rather than read from ``_pending_events``, so the measurement holds
+        on any path that appends without :meth:`_take`.
 
         **After an exit batch the next is held to what fits the time left** (SPEC-105). The
         prediction assumes the next attempt is no longer than the longest seen, and the rate
@@ -2799,7 +2805,24 @@ class Worker:
         change (FR-002), :meth:`_fit_exit_target` lowers the target to what that rate fits in
         the time left before the deadline less ``_JOIN_MARGIN``, when the prediction would let
         the next batch start (FR-003). A failed exit batch that straddled a change keeps its
-        target as it was. The bound acts only on an exit batch, so :meth:`_drain` and
+        target as it was.
+
+        **A declined exit batch restores the rate rule's target the bound lowered** (diff
+        review, 2026-11-24). The guard is asked when an exit batch returns and the prediction
+        here, after the next batch's items were taken, so the guard can pass and the batch still
+        be declined; on the real clock any time between the two can do it. That batch was
+        already taken at the lowered target, but every later one is declined too, so the decline
+        sets the target back to ``min(cap, _exit_rate * flush_interval / 2)``, which is exactly
+        what :meth:`_set_target` gave the batch that recorded the rate, the same expression in
+        the same order, and the rest of the backlog is cut at the rate rule's target: at most one
+        declined batch more than that target alone would cut the same backlog into, where
+        without the restore it went out in ``batch_size``-submission batches. Measured on
+        SPEC-105's fake clock: 9 declined batches, against 8 at the rate rule's target and 49
+        without the restore. With no rate recorded the decline leaves
+        the target as it was, as SPEC-090 has it; the one target this restores that the bound
+        did not lower is one an empty exit batch zeroed after the rate was recorded, which only
+        cuts the declined backlog into fewer batches. The bound acts only on an exit batch, so
+        :meth:`_drain` and
         :meth:`_final_drain` share every other rule here: the batch ahead of a carry, ahead of a
         flush marker and the exit drain's last batch all reach it through this method, on the
         1.x ``emit`` loop and the delivery engine alike.
@@ -2829,6 +2852,10 @@ class Worker:
             and (self._exit_declining or self._retry_declined(self._exit_longest))
         ):
             self._decline_exit_batch(size)
+            if self._exit_rate > 0:
+                self._target = min(
+                    float(_BACKLOG_BATCH_CAP), self._exit_rate * self.flush_interval / 2
+                )
             pending.clear()
             self._pending_events = 0
             return
@@ -3011,6 +3038,12 @@ class Worker:
         the zero that :meth:`_set_target`'s rule reads as unmeasured. Without the guard, or with
         it weakened to ``room > 0``, no event is lost or delivered differently; only the count of
         declined batches in the existing line changes, which is why each mutant has a test.
+        The guard agrees with the prediction only at this moment: the prediction is asked again
+        before the next batch, after its items were taken, so a batch the guard admitted can
+        still be declined, already cut at the lowered target. :meth:`_emit_pending` then
+        restores the rate rule's target, so the batches behind it are cut as they would have
+        been, and since that restore the guard decides only the size of the first declined
+        batch.
 
         **Its limits.** It trusts the recorded rate, so a sink that slows during the exit, a
         retry predicted from a call that failed at once, and a first exit batch longer than the
@@ -3351,9 +3384,10 @@ class Worker:
         same margin, as far as its ``batch_size`` submissions allow, and it bounds only when
         this rule, asked at that moment, would let the batch start: the two agree as of the
         moment the bound is computed, when the previous exit batch returns. This rule is asked
-        again later, before the next batch, so on the real clock a batch the bound has lowered
-        can still be declined here; that costs nothing, since the bound then left the target at
-        least the rate times ``longest``.
+        again later, before the next batch and after its items were taken, so a batch the bound
+        has lowered can still be declined here, already cut at the lowered target. The decline
+        then restores the rate rule's target (:meth:`_emit_pending`), so every later declined
+        batch is cut at it, and the disagreement costs at most one declined batch.
 
         Args:
           longest: The longest attempt of the current batch so far, in seconds, or, before a
