@@ -1011,10 +1011,16 @@ class Worker:
         goes to ``0.0`` before the resume split, beside ``_exit_longest``, so a child starts with
         no rate of a parent's exit (SPEC-105 FR-001). Not quite never: a fork from inside an exit
         batch's ``emit`` on the drain thread leaves the child a copy of that thread, which
-        returns from the forking ``emit`` after this reset and writes ``_exit_rate`` and
-        ``_exit_longest`` from the parent's batch, as ``_exit_longest`` already could. Such a
-        rate can only lower a later target while a deadline stands, and the stale longest only
-        declines sooner, so neither can make the child overrun a budget. ``_exit_fold`` is
+        returns from the forking ``emit`` after this reset. It writes ``_exit_longest`` from the
+        parent's batch, as it already could, and ``_exit_rate`` only when ``failed_batches``
+        reads the same after that emit as before it: the reset zeroed the child's count, so that
+        is only when the parent had counted no failed batch before the emit, and otherwise the
+        batch reads as failed and records no rate. Such a rate is read only while a deadline
+        stands: by :meth:`_fit_exit_target`, which only lowers a target, and by a declined
+        batch's restore in :meth:`_emit_pending`, which can raise one to the rate rule's from
+        that rate, but only once every later batch is declined, so it changes only how the
+        declined backlog is cut. The stale longest only declines sooner. Neither can make the
+        child overrun a budget. ``_exit_fold`` is
         emptied and reopened in place (SPEC-103), by the time ``_fork`` has already withdrawn the
         fold window the forking thread may have had open. ``_sink_generation`` is
         **not** reset: the child inherits it harmlessly, as it inherits ``sink``, and
@@ -2764,7 +2770,8 @@ class Worker:
         anything: it is no attempt, and declining it would count a failed batch of nothing.
 
         **An abandoned exit batch leaves the target as it was** (SPEC-090 FR-001 rule 4, diff
-        review, 2026-11-16), as a declined one does — refined by SPEC-105 FR-002: it keeps the
+        review, 2026-11-16), as a declined one does until a rate is recorded (a declined one then
+        restores the rate rule's target, below) — refined by SPEC-105 FR-002: it keeps the
         target rather than resetting it, and then, once a rate is recorded, the bound below
         lowers what it kept to the time now left. On the steady drain a failure resets the
         target so a failing sink is retried with small batches while it may recover; at exit
@@ -2818,12 +2825,14 @@ class Worker:
         declined batch more than that target alone would cut the same backlog into, where
         without the restore it went out in ``batch_size``-submission batches. Measured on
         SPEC-105's fake clock: 9 declined batches, against 8 at the rate rule's target and 49
-        without the restore. With no rate recorded the decline leaves
-        the target as it was, as SPEC-090 has it; the one target this restores that the bound
-        did not lower is one an empty exit batch zeroed after the rate was recorded, which only
-        cuts the declined backlog into fewer batches. The bound acts only on an exit batch, so
-        :meth:`_drain` and
-        :meth:`_final_drain` share every other rule here: the batch ahead of a carry, ahead of a
+        without the restore. With no rate recorded the decline leaves the target as it was, as
+        SPEC-090 has it. The restore can also set a target the bound did not lower, and each such
+        case changes only how a backlog already declined is cut: one an empty exit batch zeroed
+        after the rate was recorded, which it cuts into fewer batches; a ``flush_interval`` a
+        caller changed since that rate was recorded, which the restore reads where
+        :meth:`_set_target` read the old one; and a forked child's stale rate, which
+        :meth:`_reinit_after_fork` describes. The bound acts only on an exit batch, so
+        :meth:`_drain` and :meth:`_final_drain` share every other rule here: the batch ahead of a
         flush marker and the exit drain's last batch all reach it through this method, on the
         1.x ``emit`` loop and the delivery engine alike.
 
@@ -2969,7 +2978,9 @@ class Worker:
         Zero when the batch was counted in ``failed_batches``, when the sink generation moved
         while it was emitted, or when it held no events: the next batch is then the count
         trigger's. An exit batch counted in ``failed_batches`` never reaches here:
-        :meth:`_emit_pending` leaves the target as it was, as for a declined one. The cap when
+        :meth:`_emit_pending` leaves the target as it was, as for a declined one until a rate is
+        recorded; once one is, it lowers the kept target to the time left, and a declined one
+        restores this method's target from that rate (SPEC-105). The cap when
         ``elapsed`` is zero or negative: an emit the clock cannot see took less than its
         resolution, which is the limit of an unbounded rate, and the cap is
         what bounds that limit; keeping the previous target instead would let a frozen clock pin

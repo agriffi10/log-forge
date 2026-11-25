@@ -998,7 +998,14 @@ def test_once_an_exit_batch_is_declined_every_later_one_is() -> None:
 def test_a_declined_exit_batch_leaves_the_target_as_it_was(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """FR-001 rule 4's last sentence: a batch declined unattempted sets no target."""
+    """FR-001 rule 4's last sentence: a batch declined unattempted sets no target.
+
+    It calls no ``_set_target``, which is what this counts. Refined by SPEC-105: once an exit
+    batch has recorded a rate, a declined one restores the rate rule's target from that rate,
+    which ``test_a_batch_declined_after_the_guard_passed_restores_the_rate_rules_target`` holds;
+    with no rate recorded it leaves the target as it was, as
+    ``test_a_declined_exit_batch_with_no_rate_recorded_leaves_the_target_as_it_was`` holds.
+    """
     _ten_span_batches(monkeypatch)
     measured: list[int] = []
     real = Worker._set_target
@@ -1759,6 +1766,7 @@ def _fit_exit(
     pre_stop_cost: float | None = None,
     hook: Any = None,
     between: Any = None,
+    per_event: float = _COST,
 ) -> _FitRun:
     """Runs one exit on SPEC-105 FR-001's clock and returns what it saw.
 
@@ -1767,8 +1775,9 @@ def _fit_exit(
     interval 1.0 s, ``max_retries`` 0 and ``batch_size`` 10 two-event spans. The pre-stop call
     costs nothing and fails, so the target is zero at the stop, unless ``pre_stop_cost`` is
     given, when it costs that, before the stop, and is delivered. Every later call costs
-    0.00390625 s an event, a call in ``fail`` costs 0.0625 s and raises, and one in ``free``
-    costs nothing; calls are numbered from 1, the pre-stop call first.
+    ``per_event`` an event, 0.00390625 s unless a test says otherwise, a call in ``fail`` costs
+    0.0625 s and raises, and one in ``free`` costs nothing; calls are numbered from 1, the
+    pre-stop call first.
 
     **The deadline is the shipped path's.** ``retire_process(worker, deadline)`` runs once the
     pre-stop call is charged, so ``claim_stop`` records the clock's reading plus ``deadline``:
@@ -1794,7 +1803,7 @@ def _fit_exit(
     if not engine:
         sink.first_fails = pre_stop_cost is None
     sink.fail_calls = set(fail)
-    _charging(run, sink, costs, main=True, hook=hook)
+    _charging(run, sink, costs, per_event=per_event, main=True, hook=hook)
     real = Worker._emit_pending
 
     def snapshotting(self: Worker, pending: list[list[dict[str, object]]]) -> None:
@@ -2140,6 +2149,24 @@ def test_a_declined_exit_batch_with_no_rate_recorded_leaves_the_target_as_it_was
     run = _fit_exit(monkeypatch, capsys, deadline=0.03125, spans=1_000, free=frozenset({2}))
     assert run.sink.handed[1:] == [20], run.sink.handed
     assert _declined(run.err) == [(1_980, 2)], run.err
+    assert run.worker is not None
+    assert run.worker._target == 1_000.0
+
+
+def test_a_declined_exit_batch_restores_the_rate_rules_target_no_higher_than_the_cap(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105, diff review (invariants 2 and 3): the restore is the rate rule's, cap included.
+
+    A sink at 2**-12 s an event delivers 4,096 events a second, so half an interval of its rate
+    is 2,048 events, above the 1,000-event cap. Under a 0.045 deadline every batch after the
+    first exit batch is declined, and the restore sets the cap, as ``_set_target`` did, so the
+    9,980 events left are declined in 10 batches; a restore without the cap would cut all but
+    the first at 2,048, in 6.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.045, spans=5_000, per_event=2.0**-12)
+    assert run.sink.handed[1:] == [20], run.sink.handed
+    assert _declined(run.err) == [(9_980, 10)], run.err
     assert run.worker is not None
     assert run.worker._target == 1_000.0
 
