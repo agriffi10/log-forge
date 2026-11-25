@@ -803,3 +803,119 @@ def test_the_open_item_check_can_actually_fail() -> None:
         "\n### Resolved\n", "\n### Resolved\n\n" + bullet + "\n", 1
     )
     assert unknown_rows(moved) == [_SHAPE]
+
+
+PHRASES = (
+    "no workflow sets",
+    "set by no workflow",
+    "run only on request",
+    "soak run on request",
+    "run on request",
+    "gating nothing",
+    "gates nothing",
+)
+"""What SPEC-086's record said of the soak before SPEC-099 reversed it (FR-005)."""
+
+_PHRASE_ROOTS = ("docs/invariants.md", "docs/architecture.md", "docs/decisions", "tests")
+_BINARY = (".pyc", ".png", ".jpg", ".gif", ".ico", ".gz", ".zip")
+
+
+def phrase_findings(name: str, text: str) -> list[str]:
+    """Returns each place a reversed phrase still stands in one file's text.
+
+    The text is read a paragraph at a time, a paragraph being a run of non-blank lines, joined
+    across its line breaks with its whitespace collapsed, so a phrase split by a wrap is still
+    found. A phrase passes only inside a ``~~...~~`` span of a paragraph that also names
+    ``SPEC-099``: struck, and marked with the spec that struck it.
+
+    Args:
+      name: The file's path, for the finding.
+      text: The file's text.
+
+    Returns:
+      One finding per phrase that stands, naming the file.
+
+    Raises:
+      None.
+    """
+    findings = []
+    for paragraph in re.split(r"\n[ \t]*\n", text):
+        joined = " ".join(paragraph.split())
+        struck = [m.span() for m in re.finditer(r"~~.+?~~", joined)]
+        marked = "SPEC-099" in joined
+        for phrase in PHRASES:
+            for found in re.finditer(re.escape(phrase), joined):
+                inside = any(low <= found.start() and found.end() <= high for low, high in struck)
+                if not (inside and marked):
+                    findings.append(f"{name}: {phrase!r} stands in {joined[:120]!r}")
+    return findings
+
+
+def _tracked_text_files() -> dict[str, str]:
+    """Returns the tracked text files FR-005 reads, by path, without the file holding the list.
+
+    ``git ls-files`` names only what is tracked, so nothing untracked, ``__pycache__`` included, is
+    read.
+
+    Returns:
+      Each file's path and text.
+
+    Raises:
+      None.
+    """
+    listed = subprocess.run(  # noqa: S603
+        ["git", "ls-files", "-z", "--", *_PHRASE_ROOTS],  # noqa: S607
+        cwd=ROOT,
+        capture_output=True,
+        check=True,
+        timeout=60,
+    ).stdout.decode("utf-8")
+    own = pathlib.Path(__file__).resolve().relative_to(ROOT).as_posix()
+    texts = {}
+    for path in filter(None, listed.split("\0")):
+        if path == own or path.endswith(_BINARY):
+            continue
+        try:
+            texts[path] = (ROOT / path).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, FileNotFoundError):
+            continue
+    return texts
+
+
+def test_the_record_no_longer_says_the_soak_runs_only_on_request() -> None:
+    """FR-005: no reversed phrase stands in the record, except struck and marked with SPEC-099.
+
+    The files read are the tracked text files under ``docs/invariants.md``,
+    ``docs/architecture.md``, ``docs/decisions/`` and ``tests/``, except this one, which holds
+    the list.
+    """
+    texts = _tracked_text_files()
+    assert "docs/invariants.md" in texts and "tests/test_invariants_model.py" in texts, sorted(
+        texts
+    )
+    findings = [f for path, text in sorted(texts.items()) for f in phrase_findings(path, text)]
+    assert findings == [], findings
+
+
+@pytest.mark.parametrize(
+    ("text", "stands"),
+    [
+        ("The soak gates\nnothing at all.\n", True),
+        ("It ~~gates nothing~~, reversed by SPEC-099.\n", False),
+        ("It ~~gates nothing~~, reversed.\n\nSPEC-099 says so in another paragraph.\n", True),
+        ("SPEC-099 runs it nightly; before, it gates nothing.\n", True),
+    ],
+    ids=[
+        "bare-across-a-wrap",
+        "struck-and-marked",
+        "struck-marked-only-in-another-paragraph",
+        "bare-in-a-paragraph-naming-spec-099",
+    ],
+)
+def test_the_phrase_check_can_actually_fail(text: str, stands: bool) -> None:
+    """FR-005: only a phrase struck in a paragraph that names SPEC-099 passes.
+
+    A bare phrase fails, across a wrap too, and a struck one whose own paragraph does not name
+    SPEC-099 fails though another paragraph of the same text does: the mark is read per paragraph.
+    """
+    assert bool(phrase_findings("x.md", text)) is stands

@@ -1917,7 +1917,8 @@ an item leaves this list when a spec closes it, not because the arc names it.
   but not two closes with no write between them~~ — SPEC-086 holds every call in both halves to its
   own timeout plus one second, and its sequential half to no close at the write count of the close
   before it and no write after a sink's last close returned; under four callers that count is a
-  soak run on request that reads the library's arms and takes, and gates nothing. The sink is still
+  soak that reads the library's arms and takes, which SPEC-099 runs every night on `main` and
+  which stops the PR queue on a failed night until it is filed. The sink is still
   passive, which is what this item is about. By the verification frame's calibration, none of
   the twelve lifecycle and sink fixes from `95945c0f` to `717d0c68` was found by it, eight of the
   twelve needed a sink that waits on its signal or calls back, and those fixes added no line to it.
@@ -1940,7 +1941,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
   offered and declined* (`docs/decisions/working-rules/`), so the two macOS-only defects in the
   record (`2ff9de9e`, `01fd73cd`) remain something only a developer's machine shows and that part of
   this item is not open. **Closed by** those two in the workflows and `pyproject.toml`, for the hang
-  and the soak; the rest of this item stays open until it is decided or built. Coverage measurement,
+  and the soak: the soak half by SPEC-099 (`.github/workflows/model-soak.yml`, every night on
+  `main`) and the hang half by PR #370; the rest of this item stays open until it is decided or
+  built. Coverage measurement,
   a job timeout, `ResourceWarning` as an error and a property-based sink-graph generator, whose
   `hypothesis` dependency is noted in `CLAUDE.md` before it is added, are the orchestrating
   session's plan for the arc's CI track and not his decision: that coverage is unmeasured was stated
