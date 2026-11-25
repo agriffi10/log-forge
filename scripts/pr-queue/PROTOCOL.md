@@ -1,5 +1,11 @@
 # The PR queue — one PR on the remote at a time, taken in order
 
+> **This changed on 2026-11-25 (SPEC-099).** A failed scheduled night of `Model soak` that has not
+> been filed now makes `turn` answer `WAIT`, and the hook refuse every push but a clearing
+> branch's, until a pull request files that night in `tests/soak_known.py`. `Model soak` runs on
+> `main`'s head no longer count toward `IS RED`. The change takes effect only once `install.sh` is
+> re-run after the merge.
+
 Several agent sessions build different specs against one repo. Each works in its own worktree, so
 their trees never collide — but the remote is still shared. Two PRs open at once means each is
 tested against a `main` the other is about to move, and a merge race turns a green PR red for a
