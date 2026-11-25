@@ -21,7 +21,9 @@ seven sinks, and every finding was a write after the sink's last close on a call
 its signature and thread that is an orphan log writing after its sink's close, an open item no
 spec owns yet; whether each one meets that item's predicate cannot be read from today's record,
 which drops what came after the last close (FR-001 adds it). At that rate a night's 15,000 items
-would hold about seven or eight on macOS, and on a Linux stand-in about one in two nights. The
+would hold about seven or eight on macOS, and on a Linux stand-in about one in two nights; on the
+real `ubuntu-latest` runner, measured once this spec's pull request ran, it is about 1.8% of
+items, some 270 a night (FR-002 sets the ceiling from that). The
 soak's rule also misreads a second close the library owes. When this spec was written at
 `eda19f32` the soak was red for two more reasons, and both have since closed. SPEC-097 closed a
 swap arming a sink that a `shutdown()` already closed, so a record of that shape is now either a
@@ -298,20 +300,25 @@ A default-suite test fails:
   "x2 under, x3 over".
 
 Each ceiling is set from its shape's rate in one night of 15,000 items, so that a rate that
-doubles stays under it and one that triples passes it. The late-write row's rate on macOS depends
-on the machine's load: 10 a night at `eda19f32` (24 in 36,000 items, loads up to 15), 7.5 a night
-at `d9f2f097` (6 in 12,000, load about 10), and, on the build's own tree (`beaf9403`, the library
-unchanged from `d9f2f097`), 2 to 8 per 3,000 items at loads 19 to 34, which is 21.7 a night over
-all three runs and about 40 at load 34. Its ceiling, 21, is derived from the moderate-load macOS
-figures: doubled, 20 and 15 stay under it, and tripled, 30 and 22.5 pass it. It does not hold
-"x2 under" for the heavily loaded runs, and it is not meant to: the ceiling applies to scheduled
-nights, which run on Linux. The comment beside the number gives the measurements and their
-commits, and the test above holds it there.
+doubles stays under it and one that triples passes it. **The late-write ceiling is 800, derived
+from the real runner** the scheduled nights run on (Andrew's decision of 2026-11-25). This spec's
+pull request ran its own `Model soak` job on `ubuntu-latest` at seeds 0 to 99, 300 soak items an
+attempt (run 45561346799, attempts 1 to 3, at `12d4472a`), and met the orphan late write in 6, 3
+and 7 of 300 items: 300, 150 and 350 a night, 267 over the three. The most measured rate, 350,
+doubled is 700, under 800, and tripled is 1,050, over it. The rule holds for the 6 and 7 samples;
+for the 3 sample tripled (450) and for the three together tripled (800, at the ceiling and not
+over it) it does not, so a tripling of the lowest measured rate would not by itself break the
+ceiling. The ceiling was 21, derived from macOS rates, until that run showed every real night
+would pass it many times over and stop the queue.
 
-On Linux the ceiling is loose. The stand-in met none in 18,000 items at `eda19f32`, and 1 in
-30,000 at `d9f2f097`, about 0.5 a night, so only a rate some forty times that would pass 21 there.
-The first scheduled nights on a real runner, which FR-003 already owes, are where the ceiling is
-re-derived, by an ordinary reviewed pull request.
+The other rates the spec records are far below 800, and **the ceiling is loose for them**: macOS
+measured 10 a night at `eda19f32` (24 in 36,000 items, loads up to 15), 7.5 at `d9f2f097` (6 in
+12,000, load about 10) and, on the build's tree (`beaf9403`), 21.7 over three runs at loads 19 to
+34 and about 40 at load 34; the Docker stand-in measured none in 18,000 items at `eda19f32` and 1
+in 30,000 at `d9f2f097`, about 0.5 a night. The stand-in under-measured this shape by about two
+orders of magnitude, and its rate is no longer what the ceiling rests on. The first scheduled
+nights, which FR-003 already owes, confirm the ceiling at the full window. The comment beside the
+number gives the measurement and its commit, and the test above holds it there.
 
 **Tests about the machinery never read the live table.** Every clearing pull request edits
 `tests/soak_known.py` and §12, and a clearing branch cannot touch `tests/`, so a test that judged
@@ -1137,6 +1144,22 @@ That is 6 red items in 12,000, on seven sinks, every finding `late-write` and ev
 each meets FR-002's late-write predicate cannot be read from these runs; FR-001's record tail is
 what makes that readable, and Phase 1's soak reads it.
 
+**On the real runner, measured 2026-11-25.** This spec's pull request ran its own `Model soak`
+job on `ubuntu-latest` (run 45561346799, branch head `12d4472a`, seeds 0 to 99, 300 soak items
+an attempt, three attempts, all green):
+
+| Attempt | Known (orphan late write) | New | Wiring | pytest step |
+|---|---|---|---|---|
+| 1 | 6 of 300 | 0 | 8 of 8 | 12.0 s |
+| 2 | 3 of 300 | 0 | 8 of 8 | 14.0 s |
+| 3 | 7 of 300 | 0 | 8 of 8 | 18.4 s |
+
+About 1.8% of items: roughly 270 a night of 15,000, and 350 at the most measured rate, where the
+stand-in below measured about 0.5. The Docker stand-in under-measured this shape by about two
+orders of magnitude, so it is no longer what the late-write ceiling rests on (FR-002). These small
+runs cost about 33 to 55 ms an item with the job's startup included, above the stand-in's 18.7 ms,
+so the first night's pytest step duration re-checks `WINDOW` and `MAX_SEEDS` (FR-003, owed).
+
 **On the Linux stand-in.** Docker `python:3.12-slim`, `--cpus=4 --memory=16g`, the pinned
 `pytest` 9.2.0, `pytest-xdist` 3.8.0, `pytest-asyncio` 1.4.1.post1 and `opentelemetry-proto`
 1.45.2, over `git archive d9f2f097`, at `-n 12`, with `-k
@@ -1416,6 +1439,13 @@ nothing.
 
 ## Revision history
 
+- **2026-11-25, the late-write ceiling re-derived from the real runner** on Andrew's decision. The
+  pull request's own `Model soak` job on `ubuntu-latest` met the orphan late write in 6, 3 and 7
+  of 300 items, about 1.8%, where the Docker stand-in had measured about 1 in 30,000: a ceiling of
+  21 would have turned every night red and stopped the queue. By FR-002's rule the most measured
+  rate, 350 a night, sets it at 800 (700 under, 1,050 over); FR-002 says which rates it is loose
+  for. The Overview's Linux rate, a real-runner Evidence subsection and the owed re-check of
+  `WINDOW` and `MAX_SEEDS` against the real runner's per-item cost follow.
 - **2026-11-25, corrected in the third code round** after the execution-frame review: the
   future-edit check's edits matched the clearing file's literal text and would have failed on the
   first real filing; they now locate the dict and the tuple through the AST, the clearing scenario

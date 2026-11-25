@@ -10,7 +10,7 @@
 - **The known shapes** (FR-002): `tests/soak_known.py` is a clearing file. It holds the one `KNOWN`
   row, `orphan-write-after-close`, with its predicate, and `FILED_NIGHTS`. `tests/soak_verdict.py`
   holds the matching code (`signatures_of`, `explain`, `explain_run`, `reason`) and is not a
-  clearing file. `tests/soak_ceilings.py` holds `CEILINGS` (21 for the one row) and
+  clearing file. `tests/soak_ceilings.py` holds `CEILINGS` (800 for the one row, re-derived from the real runner) and
   `UNMEASURED_CEILING` (3). A soak item whose every finding is known ends `xfailed` with the
   `soak_known` property. `tests/test_soak_known.py` holds the predicate's corpus, the write-site
   roster, the open-item and ceiling checks, and `test_no_known_row_explains_shape_a`.
@@ -98,6 +98,12 @@
     read from the list with no API call; `main-state` 0 through the same lines).
   - Phase 1 soak on macOS, seeds 0 to 999: 8, 3 and 2 known items at loads 34, 21 and 19, every one
     the orphan late write; no `repeat`, `untaken` or gating failure.
+- **The real runner** (2026-11-25): the pull request's own `Model soak` job on `ubuntu-latest`,
+  run 45561346799 at `12d4472a`, seeds 0 to 99, three attempts all green: 6, 3 and 7 known items of
+  300 (every one `orphan-write-after-close`), 0 new, wiring 8 of 8, pytest step 12.0, 14.0 and
+  18.4 s. That is about 1.8% of items against the Docker stand-in's 1 in 30,000, so a ceiling of 21
+  would have stopped the queue every night; on Andrew's decision the ceiling is 800, from the most
+  measured rate (350 a night: 700 under, 1,050 over).
 - **Owed:**
   - **Before the merge:** this pull request's own Model soak run, reading `0-99` and `300 of 300`.
   - **After the merge**, recorded by a docs-only follow-up pull request cut from fresh `main`:
@@ -106,4 +112,9 @@
       `gh run list --workflow model-soak.yml` answers HTTP 404, so every session reads 3 and waits;
     - a no-input `workflow_dispatch` on `main`;
     - the first scheduled night within 26 hours, with its summary and the pytest step's duration;
-    - the late-write ceiling re-derived from the Linux nights.
+    - ~~the late-write ceiling re-derived from the Linux nights~~: re-derived before the merge from
+      the pull request's own real-runner runs (below); the first scheduled nights confirm the
+      ceiling;
+    - the first night's pytest step duration re-checks `WINDOW` and `MAX_SEEDS`: the real runner's
+      per-item cost from the pull request's small runs, about 33 to 55 ms an item with the job's
+      startup included, is above the stand-in's 18.7 ms the two rest on.
