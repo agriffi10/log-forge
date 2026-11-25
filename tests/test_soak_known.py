@@ -73,6 +73,60 @@ ORPHAN_LATE: list[SinkEvent] = [Note(T1), LOG_ARM, Write(T1), Note(T2), OWED, _c
 """§12's orphan late write: thread 2's log passed its owed check before the last take."""
 
 
+def _fixture_late_write(events: Sequence[SinkEvent], closes: Closes) -> bool:
+    """A fixture row's predicate: the sink's last write is late and on ``Thread-2 (runner)``.
+
+    Args:
+      events: One sink's events.
+      closes: Its close record.
+
+    Returns:
+      Whether the last write is a late write on thread 2.
+
+    Raises:
+      None.
+    """
+    writes = [event for event in events if isinstance(event, Write)]
+    late = bool(closes.at_return) and closes.writes > closes.at_return[-1]
+    return late and bool(writes) and writes[-1].thread == T2
+
+
+FIXTURE_ROW = Known("fixture-late-write", "A fixture lead", "late-write", _fixture_late_write)
+FIXTURE: tuple[Known, ...] = (FIXTURE_ROW,)
+"""A fixed known table for every test that is about the machinery rather than the live table.
+
+The live ``KNOWN`` changes in every clearing pull request and when a spec closes an item, and a
+clearing branch cannot touch ``tests/``, so a test judging the machinery against the live table
+would block the very filing the queue waits for. Only the tests whose job is the live content
+read it: the live row's predicate corpus, ``test_no_known_row_explains_shape_a``, the ceilings and
+filings over the live files, and the open-item check in ``tests/test_model_soak_workflow.py``.
+"""
+
+LIVE_LATE_WRITE = "orphan-write-after-close"
+"""The live row whose predicate :func:`test_the_late_write_predicate` holds to its corpus."""
+
+
+def _live_row(name: str) -> Known:
+    """Returns the live ``KNOWN`` row by name, failing the test, not the module, when it is gone.
+
+    Looked up at test time rather than imported by name, so the spec that closes the row's item
+    and removes it fails this row's corpus alone, which that spec removes with it.
+
+    Args:
+      name: The row's name.
+
+    Returns:
+      The row.
+
+    Raises:
+      None.
+    """
+    rows = {row.name: row for row in soak_known.KNOWN}
+    if name not in rows:
+        pytest.fail(f"the live row {name!r} is gone: remove its corpus with it")
+    return rows[name]
+
+
 @pytest.mark.parametrize(
     ("events", "closes", "matches"),
     [
@@ -117,9 +171,10 @@ def test_the_late_write_predicate(events: list[SinkEvent], closes: Closes, match
     With two late writes every one is read, not the last alone: an earlier one on the worker
     thread makes the sink's late writes not the orphan item's.
     """
-    assert soak_known.orphan_late_write(events, closes) is matches
-    expected = [soak_known.ORPHAN_LATE_WRITE] if matches else []
-    assert soak_verdict.explain_run([(events, closes)]) == expected
+    row = _live_row(LIVE_LATE_WRITE)
+    assert row.predicate(events, closes) is matches
+    expected = [row] if matches else []
+    assert soak_verdict.explain_run([(events, closes)], (row,)) == expected
 
 
 _WORKER_LATE: list[SinkEvent] = [Write(WORKER), OWED, _close(1), Write(WORKER)]
@@ -129,8 +184,8 @@ _UNTAKEN: list[SinkEvent] = [Write(T1), _close(1)]
 @pytest.mark.parametrize(
     ("sinks", "expected"),
     [
-        ([(ORPHAN_LATE, LATE)], ["orphan-write-after-close"]),
-        ([(ORPHAN_LATE, LATE), (ORPHAN_LATE, LATE)], ["orphan-write-after-close"]),
+        ([(ORPHAN_LATE, LATE)], ["fixture-late-write"]),
+        ([(ORPHAN_LATE, LATE), (ORPHAN_LATE, LATE)], ["fixture-late-write"]),
         ([(ORPHAN_LATE, LATE), (_WORKER_LATE, LATE)], []),
         ([(_UNTAKEN, Closes(1, (1,), (1,)))], []),
         ([([Write(T1), OWED, _close(1)], Closes(1, (1,), (1,)))], []),
@@ -167,13 +222,24 @@ _UNTAKEN: list[SinkEvent] = [Write(T1), _close(1)]
 def test_a_run_is_known_only_when_every_finding_is(
     sinks: list[tuple[list[SinkEvent], Closes]], expected: list[str]
 ) -> None:
-    """FR-002: one known sink beside an unknown one, and ``untaken``, are never known."""
-    assert [row.name for row in soak_verdict.explain_run(sinks)] == expected
+    """FR-002: one known sink beside an unknown one, and ``untaken``, are never known.
+
+    Judged against :data:`FIXTURE`, so a clearing pull request's new row cannot change it.
+    """
+    assert [row.name for row in soak_verdict.explain_run(sinks, FIXTURE)] == expected
+
+
+def test_a_row_of_another_kind_is_never_honoured() -> None:
+    """FR-002: a planted row claiming ``untaken`` explains nothing; only repeat and late-write do."""
+    planted = Known("explains-untaken", "A fixture lead", "untaken", lambda _events, _closes: True)
+    untaken = [(_UNTAKEN, Closes(1, (1,), (1,)))]
+    assert soak_verdict.signatures_of(*untaken[0]) == ["CloseBroken:untaken@1"]
+    assert soak_verdict.explain_run(untaken, (*FIXTURE, planted)) == []
 
 
 def test_a_reason_names_each_shape_once() -> None:
     """FR-002: the reason's first line names each shape and its §12 item, once each."""
-    row = soak_known.ORPHAN_LATE_WRITE
+    row = FIXTURE_ROW
     text = soak_verdict.reason([row, row])
     assert text == f"known soak finding: {row.name} (§12: {row.item})", text
 
@@ -264,7 +330,7 @@ def test_a_planted_fenced_row_is_refused_though_its_item_is_open() -> None:
     admit it, since the ``fenced`` item is open.
     """
     assert PLANTED.item in open_item_leads()
-    planted = (*soak_known.KNOWN, PLANTED)
+    planted = (*FIXTURE, PLANTED)
     assert _shape_a_explainers(planted) == {"shape-a": ["fenced-rearm"], "fenced": ["fenced-rearm"]}
 
 
@@ -486,22 +552,33 @@ def test_every_ceiling_names_a_row_and_carries_its_derivation() -> None:
     assert soak_ceilings.ceiling_of("no-such-row") == soak_ceilings.UNMEASURED_CEILING == 3
 
 
+_FIXTURE_CEILINGS = (
+    "CEILINGS: dict[str, int] = {\n"
+    '    "fixture-late-write": 9,  # measured 3 a night at 0123abcd and 2 at 4567cdef; '
+    "x2 under, x3 over\n"
+    "}\n"
+)
+"""A fixed ceilings file for the check's own corpus, so it does not depend on the live entries."""
+_FIXTURE_ROWS = frozenset({"fixture-late-write"})
+
+
 @pytest.mark.parametrize(
     ("old", "new", "says"),
     [
-        ("measured 10 a night", "10 a night", "no measurement"),
-        ("macOS; x2 under, x3 over", "macOS; doubled", 'no "x2 under, x3 over"'),
-        ('"orphan-write-after-close":', '"renamed-row":', "names no row"),
+        ("measured 3 a night", "3 a night", "no measurement"),
+        ("; x2 under, x3 over", "; doubled", 'no "x2 under, x3 over"'),
+        ('"fixture-late-write":', '"renamed-row":', "names no row"),
     ],
     ids=["no-measurement", "no-derivation", "no-row"],
 )
 def test_the_ceiling_check_can_actually_fail(old: str, new: str, says: str) -> None:
-    """Each planted fault in a copy of ``tests/soak_ceilings.py`` is named, with its line."""
-    assert _CEILINGS_TEXT.count(old) == 1, old
-    planted = _CEILINGS_TEXT.replace(old, new)
-    findings = ceiling_findings(planted, _ROWS)
+    """Each planted fault in a fixed ceilings file is named, with its line."""
+    assert ceiling_findings(_FIXTURE_CEILINGS, _FIXTURE_ROWS) == []
+    assert _FIXTURE_CEILINGS.count(old) == 1, old
+    planted = _FIXTURE_CEILINGS.replace(old, new)
+    findings = ceiling_findings(planted, _FIXTURE_ROWS)
     assert any(says in finding for finding in findings), findings
-    assert all("orphan-write-after-close" in f or "renamed-row" in f for f in findings), findings
+    assert all("fixture-late-write" in f or "renamed-row" in f for f in findings), findings
 
 
 _ANCHOR = re.compile(r"\b[0-9a-f]{8,40}\b")
@@ -513,20 +590,20 @@ def test_a_ceiling_with_no_commit_is_named_however_many_it_cited() -> None:
     The anchors are derived from the line, so the row tests "no commit" whatever number of
     measurements the comment cites, rather than assuming two.
     """
-    (line,) = [entry[0] for entry in _CEILING_LINE.finditer(_CEILINGS_TEXT)]
+    (line,) = [entry[0] for entry in _CEILING_LINE.finditer(_FIXTURE_CEILINGS)]
     anchors = sorted(set(_ANCHOR.findall(line.split("#", 1)[1])))
     assert anchors, line
     stripped = line
     for anchor in anchors:
         stripped = stripped.replace(anchor, "a commit")
-    findings = ceiling_findings(_CEILINGS_TEXT.replace(line, stripped), _ROWS)
+    findings = ceiling_findings(_FIXTURE_CEILINGS.replace(line, stripped), _FIXTURE_ROWS)
     assert findings and all("no commit" in finding for finding in findings), findings
     for kept in anchors if len(anchors) > 1 else ():
         others = line
         for anchor in anchors:
             if anchor != kept:
                 others = others.replace(anchor, "a commit")
-        assert ceiling_findings(_CEILINGS_TEXT.replace(line, others), _ROWS) == [], kept
+        assert ceiling_findings(_FIXTURE_CEILINGS.replace(line, others), _FIXTURE_ROWS) == [], kept
 
 
 _FILED_LINE = re.compile(r'^    "[0-9]+-[0-9]+": ".+",$')
@@ -564,6 +641,10 @@ def filed_night_findings(text: str) -> list[str]:
 
 
 _KNOWN_TEXT = (_ROOT / "tests" / "soak_known.py").read_text(encoding="utf-8")
+_FIXTURE_KNOWN_TEXT = (
+    'KNOWN: tuple[Known, ...] = ()\n\nFILED_NIGHTS: dict[str, str] = {}\n"""Filings."""\n'
+)
+"""A fixed clearing-file text for the filing check's own corpus."""
 
 
 def test_every_filed_night_is_one_line_the_queue_can_read() -> None:
@@ -586,7 +667,11 @@ def test_every_filed_night_is_one_line_the_queue_can_read() -> None:
     ids=["wrong-indent-inside", "a-filing-outside"],
 )
 def test_the_filing_check_can_actually_fail(old: str, new: str, says: str) -> None:
-    """A filing at the wrong indent, and a filing-shaped line outside the dict, are each named."""
-    assert _KNOWN_TEXT.count(old) == 1, old
-    findings = filed_night_findings(_KNOWN_TEXT.replace(old, new))
+    """A filing at the wrong indent, and a filing-shaped line outside the dict, are each named.
+
+    Planted in a fixed text, so a populated live ``FILED_NIGHTS`` changes nothing here.
+    """
+    assert filed_night_findings(_FIXTURE_KNOWN_TEXT) == []
+    assert _FIXTURE_KNOWN_TEXT.count(old) == 1, old
+    findings = filed_night_findings(_FIXTURE_KNOWN_TEXT.replace(old, new))
     assert len(findings) == 1 and says in findings[0], findings

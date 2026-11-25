@@ -11,7 +11,8 @@
 # conclusion exactly as the real client does, and refuses canned data in the other shape:
 # `gh run list --json` gives "" (measured, gh 2.93.0) and the API gives null, and a stub that canned
 # null for a run list once hid a read that an empty field broke. "HEAD" in a canned headSha is
-# the trunk's head. GH_FAIL fails every call, GH_API_FAIL only `gh api`. Every call is logged.
+# the trunk's head. GH_FAIL fails every call, GH_API_FAIL only `gh api`, GH_DELAY sleeps that many
+# seconds in every call, and GH_PRS_JSON cans the open pull requests. Every call is logged.
 #
 # Every case asserts where it lands AND why: the state or exit, and a line of what the queue said,
 # including the cases that must stay silent. Sections build their own fixture, so the sweep runs
@@ -49,6 +50,7 @@ STUB="$WORK/bin"; mkdir -p "$STUB"
 cat > "$STUB/gh" <<'GH'
 #!/bin/sh
 printf '%s\n' "$*" >> "$GH_LOG"
+[ -n "${GH_DELAY:-}" ] && sleep "$GH_DELAY"
 [ -n "${GH_FAIL:-}" ] && { echo "gh: stub failure" >&2; exit 1; }
 cmd="$1"; shift
 sub=""; [ "$cmd" = run ] || [ "$cmd" = pr ] && { sub="$1"; shift; }
@@ -90,7 +92,7 @@ case "$cmd/$sub" in
     printf '%s' "$obj" | "$JQ" -e '.conclusion != ""' >/dev/null \
       || { echo "stub: the API renders a missing conclusion as null, never \"\"" >&2; exit 2; }
     printf '%s' "$obj" | "$JQ" -r "$jqx" ;;
-  pr/list) printf '[]' | "$JQ" -r "$jqx" ;;
+  pr/list) printf '%s' "${GH_PRS_JSON:-[]}" | "$JQ" -r "$jqx" ;;
   *) echo "stub: unknown call $cmd $sub" >&2; exit 1 ;;
 esac
 GH
@@ -123,7 +125,7 @@ fixture() {
   GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"success","workflowName":"CI"}]'
   GH_SCHED_JSON='[]'; GH_ATT_JSON='{}'
   export GH_LOG STUB_REPO GH_RUNS_JSON GH_SCHED_JSON GH_ATT_JSON
-  unset GH_FAIL GH_API_FAIL
+  unset GH_FAIL GH_API_FAIL GH_DELAY GH_PRS_JSON PR_QUEUE_GH_TIMEOUT
   cd "$R" || exit 1
 }
 Qs() { bash "$Q/queue.sh" "$@"; }
@@ -131,24 +133,30 @@ vstate() { Qs soak-verdict >/dev/null 2>&1; echo $?; }
 verdict() { Qs soak-verdict 2>/dev/null; }
 mstate() { Qs main-state >/dev/null 2>&1; echo $?; }
 
-# run_json <id> <sha> <status> <event> — one canned soak run.
-run_json() { printf '{"databaseId":%s,"attempt":%s,"headSha":"%s","status":"%s","conclusion":"","workflowName":"Model soak","event":"%s"}' "$1" "$2" "$3" "$4" "$5"; }
+# run_json <id> <attempts> <sha> <status> <event> [conclusion] [createdAt] — one canned soak run,
+# its conclusion the latest attempt's as `gh run list` reports it ("" while unfinished).
+run_json() { printf '{"databaseId":%s,"attempt":%s,"headSha":"%s","status":"%s","conclusion":"%s","workflowName":"Model soak","event":"%s","createdAt":"%s"}' "$1" "$2" "$3" "$4" "${6:-}" "$5" "${7:-$NOW}"; }
 att_json() { printf '"%s/%s":{"conclusion":%s,"updated_at":"%s"}' "$1" "$2" "$3" "$4"; }
 q() { case "$1" in null) printf 'null' ;; *) printf '"%s"' "$1" ;; esac; }
 # night C...: scheduled run 101 on HEAD whose attempts concluded C (null for one still running).
 night() {
   n=0; atts=""; last=""
   for c in "$@"; do n=$((n+1)); atts="$atts${atts:+,}$(att_json 101 $n "$(q "$c")" "$NOW")"; last="$c"; done
-  st=completed; [ "$last" = null ] && st=in_progress
-  GH_SCHED_JSON="[$(run_json 101 $n HEAD $st schedule)]"; GH_ATT_JSON="{$atts}"
+  st=completed; lc="$last"; [ "$last" = null ] && { st=in_progress; lc=""; }
+  GH_SCHED_JSON="[$(run_json 101 $n HEAD $st schedule "$lc")]"; GH_ATT_JSON="{$atts}"
   export GH_SCHED_JSON GH_ATT_JSON
 }
 # nights C1 C2: run 102 (one attempt, C1) newest, then run 101 (one attempt, C2).
 nights() {
-  s1=completed; [ "$1" = null ] && s1=in_progress
-  GH_SCHED_JSON="[$(run_json 102 1 HEAD $s1 schedule),$(run_json 101 1 HEAD completed schedule)]"
+  s1=completed; c1="$1"; [ "$1" = null ] && { s1=in_progress; c1=""; }
+  GH_SCHED_JSON="[$(run_json 102 1 HEAD $s1 schedule "$c1"),$(run_json 101 1 HEAD completed schedule "$2")]"
   GH_ATT_JSON="{$(att_json 102 1 "$(q "$1")" "$NOW"),$(att_json 101 1 "$(q "$2")" "$NOW")}"
   export GH_SCHED_JSON GH_ATT_JSON
+}
+# sched ID:C ...: one-attempt completed scheduled runs, newest first, each concluded C.
+sched() {
+  js=""; for r in "$@"; do js="$js${js:+,}$(run_json "${r%%:*}" 1 HEAD completed schedule "${r#*:}")"; done
+  GH_SCHED_JSON="[$js]"; GH_ATT_JSON='{}'; export GH_SCHED_JSON GH_ATT_JSON
 }
 # file <id-n> [indent] [prefix]: a peer merges a line into main's tests/soak_known.py.
 file() {
@@ -178,7 +186,7 @@ if want verdict; then
     nights "$c" success;   check "a $c night falls back to a passed one" "$(vstate)" 0
   done
   night failure null;      check "a red night being re-run still blocks" "$(vstate)" 4
-  GH_SCHED_JSON="[$(run_json 101 1 0123456789012345678901234567890123456789 completed schedule)]"
+  GH_SCHED_JSON="[$(run_json 101 1 0123456789012345678901234567890123456789 completed schedule failure)]"
   GH_ATT_JSON="{$(att_json 101 1 '"failure"' "$NOW")}"; export GH_SCHED_JSON GH_ATT_JSON
                            check "a red night on an older sha still blocks" "$(vstate)" 4
   GH_SCHED_JSON='[]'; export GH_SCHED_JSON
@@ -186,9 +194,15 @@ if want verdict; then
                            check "  ...and prints 0 none" "$(verdict)" "0 none"
   nights cancelled cancelled; check "only verdict-less nights do not block" "$(vstate)" 0
                            check "  ...and print 0 none" "$(verdict)" "0 none"
-  GH_SCHED_JSON="[$(run_json 103 1 HEAD completed workflow_dispatch),$(run_json 101 1 HEAD completed schedule)]"
+  GH_SCHED_JSON="[$(run_json 103 1 HEAD completed workflow_dispatch failure),$(run_json 101 1 HEAD completed schedule success)]"
   GH_ATT_JSON="{$(att_json 103 1 '"failure"' "$NOW"),$(att_json 101 1 '"success"' "$NOW")}"; export GH_SCHED_JSON GH_ATT_JSON
                            check "a red dispatch carries no verdict" "$(vstate)" 0
+  # Only a night's own filing clears it: a newer green night clears nothing.
+  sched 103:success 102:failure 101:success
+                           check "an unfiled red night under a newer green night still blocks" "$(vstate)" 4
+                           has   "  ...naming the red night" "$(verdict)" "4 102-1 "
+  sched 103:success 102:cancelled 101:failure
+                           check "an unfiled red night under a green and a cancelled night still blocks" "$(vstate)" 4
 fi
 
 if want head; then
@@ -217,7 +231,7 @@ fi
 if want unreadable; then
   echo "== unreadable: a verdict that cannot be read is 3, never clear"
   fixture unreadable
-  night failure
+  night failure success
   check "gh failing: main-state 3" "$(GH_FAIL=1 Qs main-state >/dev/null 2>&1; echo $?)" 3
   check "gh's API failing: soak-verdict 3" "$(GH_API_FAIL=1 Qs soak-verdict >/dev/null 2>&1; echo $?)" 3
   check "  ...and main-state reads it as 3, not clear" "$(GH_API_FAIL=1 Qs main-state >/dev/null 2>&1; echo $?)" 3
@@ -235,10 +249,14 @@ if want calls; then
   has "the head's runs: headSha,status,conclusion,workflowName" "$calls" \
     'run list --branch main --limit 30 --json headSha,status,conclusion,workflowName --jq .[] | [.headSha, .status, .conclusion, .workflowName] | map(if . == null or . == "" then "-" else tostring end) | join(" ")'
   has "the soak's scheduled runs, any status" "$calls" \
-    'run list --workflow model-soak.yml --event schedule --limit 30 --json databaseId,attempt --jq .[] | [.databaseId, .attempt] | map(if . == null or . == "" then "-" else tostring end) | join(" ")'
+    'run list --workflow model-soak.yml --event schedule --limit 30 --json databaseId,attempt,status,conclusion,createdAt --jq .[] | [.databaseId, .attempt, .status, .conclusion, .createdAt] | map(if . == null or . == "" then "-" else tostring end) | join(" ")'
   has "each attempt through the API" "$calls" \
     'api repos/{owner}/{repo}/actions/runs/101/attempts/2 --jq [.conclusion, .updated_at] | map(if . == null or . == "" then "-" else tostring end) | join(" ")'
   hasnt "no --status filter on the soak's runs" "$calls" "--status"
+  : > "$GH_LOG"; night failure; Qs main-state >/dev/null 2>&1
+  hasnt "a one-attempt night costs no API call" "$(cat "$GH_LOG")" "api repos/"
+  : > "$GH_LOG"; sched 105:success 104:success 103:success 102:success 101:success; turnout SPEC-X >/dev/null
+  check "an ordinary green poll costs three gh calls: the open PRs, the head, the nights" "$(grep -c "" "$GH_LOG")" 3
 fi
 
 if want filing; then
@@ -248,7 +266,7 @@ if want filing; then
   file "101-1";            check "filing an earlier attempt does not clear" "$(vstate)" 4
   file "101-2";            check "filing the blocking attempt clears" "$(vstate)" 0
                            check "  ...and says so" "$(verdict)" "0 101-2 $NOW filed"
-  GH_SCHED_JSON="[$(run_json 103 1 HEAD completed schedule)]"; GH_ATT_JSON="{$(att_json 103 1 '"failure"' "$NOW")}"; export GH_SCHED_JSON GH_ATT_JSON
+  sched 103:failure
                            check "another run's filing does not clear" "$(vstate)" 4
   file "103-1" "    " "# "; check "a filing in a comment does not clear" "$(vstate)" 4
   file "103-1" "  ";       check "a filing at the wrong indent does not clear" "$(vstate)" 4
@@ -259,6 +277,11 @@ if want filing; then
                            check "an unreadable origin: 3" "$(vstate)" 3
   mv "$F/origin.off" "$F/origin.git"
   file "103-1";            check "a peer's filing not yet fetched here clears" "$(vstate)" 0
+  sched 105:failure 104:failure
+  file "105-1";            check "two red nights, the newer filed, block on the older" "$(vstate)" 4
+                           has   "  ...naming the older" "$(verdict)" "4 104-1 "
+  file "104-1";            check "both filed, the window is clear" "$(vstate)" 0
+                           has   "  ...naming the newest night, filed" "$(verdict)" "0 105-1 $NOW filed"
 fi
 
 if want refs; then
@@ -362,7 +385,7 @@ if want acquire; then
   Qs release SPEC-900 >/dev/null
   # One reading per decision: turn's reading is the one acquire checks, even if a second would differ.
   newbranch other; echo f >> src/x.py; git commit -qam other
-  night success; GH_SCHED2_JSON="[$(run_json 104 1 HEAD completed schedule)]"
+  night success; GH_SCHED2_JSON="[$(run_json 104 1 HEAD completed schedule failure)]"
   GH_ATT_JSON="{$(att_json 101 1 '"success"' "$NOW"),$(att_json 104 1 '"failure"' "$NOW")}"; export GH_ATT_JSON
   mv "$STUB/gh" "$STUB/gh.real"
   cat > "$STUB/gh" <<'FLIPGH'
@@ -389,10 +412,10 @@ if want note; then
   hasnt "  ...and names no soak" "$o" "nightly soak"
   GH_SCHED_JSON='[]'; export GH_SCHED_JSON; o="$(turnout SPEC-2)"
   has   "no verdict in 30 nights: turn says so" "$o" "the nightly soak has no verdict in its last 30 scheduled runs"
-  GH_SCHED_JSON="[$(run_json 101 1 HEAD completed schedule)]"; GH_ATT_JSON="{$(att_json 101 1 '"success"' "$OLD")}"; export GH_SCHED_JSON GH_ATT_JSON
+  GH_SCHED_JSON="[$(run_json 101 1 HEAD completed schedule success "$OLD")]"; export GH_SCHED_JSON
   o="$(turnout SPEC-3)"
   has   "an old verdict: turn names its date" "$o" "the nightly soak's newest verdict is from $OLD"
-  o="$(GH_API_FAIL=1 Qs status)"
+  night success success; o="$(GH_API_FAIL=1 Qs status)"
   has   "status: an unreadable verdict says so" "$o" "the nightly soak's verdict could not be read"
   has   "  ...and prints the reading" "$o" "SOAK: 3 unreadable"
   night failure; o="$(Qs status)"
@@ -458,6 +481,41 @@ if want hook; then
   has   "  ...refused for the soak" "$(last)" "$S"
 fi
 
+if want prs; then
+  echo "== prs: an open PR while the verdict blocks: turn names the remedy"
+  fixture prs
+  newbranch filing; echo b >> tests/soak_known.py; git commit -qam filing
+  GH_PRS_JSON='[{"number":7,"headRefName":"dependabot/pip/x","title":"Bump x","isDraft":false}]'; export GH_PRS_JSON
+  night failure; o="$(turnout SPEC-1)"
+  check "a clearing branch behind an open PR waits" "${o%% *}" 1
+  has   "  ...naming the remedy, every open PR to a draft" "$o" "converts every open non-draft PR, a bot's included, to a draft (gh pr ready --undo <n>)"
+  night success; o="$(turnout SPEC-2)"
+  check "an open PR with nothing blocking waits as before" "${o%% *}" 1
+  hasnt "  ...naming no soak" "$o" "nightly soak"
+  GH_PRS_JSON='[{"number":8,"headRefName":"x","title":"y","isDraft":true}]'; export GH_PRS_JSON
+  night failure; o="$(turnout SPEC-3)"
+  check "a draft does not hold the clearing branch" "${o%% *}" 0
+  has   "  ...which is READY as a branch that files a night" "$o" "this branch only files a night"
+fi
+
+if want slow; then
+  echo "== slow: a gh that hangs is bounded, read as unreadable, and the hook fails open"
+  fixture slow
+  if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+    night failure
+    start="$(date +%s)"
+    check "soak-verdict with gh hanging past the bound: 3" "$(GH_DELAY=5 PR_QUEUE_GH_TIMEOUT=1 Qs soak-verdict >/dev/null 2>&1; echo $?)" 3
+    check "  ...within the bound, not the hang" "$([ $(( $(date +%s) - start )) -lt 5 ] && echo bounded || echo hung)" bounded
+    mkdir -p "$Q/lock"; printf 'spec SPEC-1\nbranch sl\nsince x\n' > "$Q/lock/holder"
+    newbranch sl; echo s >> src/x.py; git commit -qam sl
+    o="$(GH_DELAY=5 PR_QUEUE_GH_TIMEOUT=1 git push origin sl 2>&1)"
+    check "a push while gh hangs fails open" "$?" 0
+    hasnt "  ...saying nothing of the soak" "$o" "nightly soak"
+  else
+    echo "note  no timeout(1) or gtimeout here: the queue's gh calls are unbounded, as PROTOCOL.md says"
+  fi
+fi
+
 if want reap; then
   echo "== reap: a dead holder's lock is kept while the verdict blocks, and broken once it is filed"
   fixture reap
@@ -495,15 +553,20 @@ plant() {  # <name> <file> <sed-expression> <sections> <case>...
   if [ -z "$missed" ]; then splant=$((splant+1)); echo "ok    plant $pname"
   else sfail=$((sfail+1)); echo "FAIL  plant $pname: these cases still pass:$missed"; fi
 }
-plant "a green attempt clears a red one" queue.sh 's#^        success)           good="\$n"; goodwhen="\$t" ;;#        success)           blocked=0; good="$n"; goodwhen="$t" ;;#' verdict "a green re-run does not clear a red attempt"
+plant "a green attempt clears a red one" queue.sh 's#good="\$n"; goodwhen="\$t" ;;#bad=""; good="$n"; goodwhen="$t" ;;#' verdict "a green re-run does not clear a red attempt"
 plant "the hook refuses when the verdict is unreadable" pre-push 's#^  if \[ \$? -eq 4 \]; then#  if [ $? -ne 0 ]; then#' hook "the same push with gh failing (fails open)" "the same push with gh absent (fails open)"
 plant "soak runs on the head read as any run" queue.sh 's#^    \[ "\$wf" = "\$SOAK_WORKFLOW" \] && continue#    :#' head "a red dispatch on the head does not block" "a soak running on the head is not unsettled"
-plant "only the latest attempt read" queue.sh 's#^    n=1$#    n=$attempts#' verdict "a green re-run does not clear a red attempt" "a red night being re-run still blocks"
+plant "only the latest attempt read" queue.sh 's#^      n=1$#      n=$attempts#' verdict "a green re-run does not clear a red attempt" "a red night being re-run still blocks"
 plant "timed_out not blocking" queue.sh 's#^        failure|timed_out) #        failure) #' verdict "a timed-out night blocks"
-plant "a verdict-less night read as passed" queue.sh 's#^        success)  #        *)  #' verdict "a cancelled night falls back to a failed one" "a null night falls back to a failed one"
+plant "a verdict-less night read as passed" queue.sh 's#^        success)  #        *)  #' verdict "  ...and print 0 none"
 plant "a verdict-less night read as failed" queue.sh 's#^        failure|timed_out) #        failure|timed_out|cancelled|startup_failure|action_required|skipped|neutral|stale|null) #' verdict "a cancelled night falls back to a passed one" "a stale night falls back to a passed one"
 plant "only completed runs listed" queue.sh 's#--limit "\$SOAK_LOOKBACK" --json databaseId,attempt#--limit "$SOAK_LOOKBACK" --status completed --json databaseId,attempt#' "verdict calls" "a red night being re-run still blocks" "no --status filter on the soak's runs"
-plant "the newest night only, with no fallback" queue.sh 's#^    \[ -n "\$good" \] && { echo "0 \$id-\$good \$goodwhen"; return 0; }#    echo "0 $id-$good $goodwhen"; return 0#' verdict "a cancelled night falls back to a failed one"
+plant "a verdict-less night ends the scan" queue.sh 's#^    if \[ -n "\$bad" \]; then#    [ -n "$bad$good" ] || { echo "0 none"; return 0; }; if [ -n "$bad" ]; then#' verdict "a cancelled night falls back to a failed one"
+plant "a newer green night clears an older red one" queue.sh 's#^      \[ -n "\$newest" \] || newest="0 \$id-\$good \$goodwhen"#      echo "0 $id-$good $goodwhen"; return 0#' verdict "an unfiled red night under a newer green night still blocks" "an unfiled red night under a green and a cancelled night still blocks"
+plant "a filed night ends the scan" queue.sh 's#0) \[ -n "\$newest" \] || newest="0 \$id-\$bad \$when filed" ;;#0) echo "0 $id-$bad $when filed"; return 0 ;;#' filing "two red nights, the newer filed, block on the older"
+plant "a one-attempt night read through the API" queue.sh 's#^    if \[ "\$attempts" -eq 1 \]; then#    if false; then#' calls "a one-attempt night costs no API call"
+plant "the gh calls unbounded" queue.sh 's#^bounded() {$#bounded() { "$@"; return $?;#' slow "soak-verdict with gh hanging past the bound: 3" "a push while gh hangs fails open"
+plant "turn's open-PR WAIT names no remedy" queue.sh 's#^      echo "  The nightly soak.s verdict blocks (.*#      :#' prs "  ...naming the remedy, every open PR to a draft"
 plant "a filing of any attempt clears" queue.sh 's#^      filed "\$id-\$bad"$#      filed "$id-1"#' filing "filing an earlier attempt does not clear"
 plant "the filing's format not held" queue.sh 's#grep -qE "^    \\"\$1\\": \\".+\\",\\\$"#grep -qE "\\"$1\\""#' filing "a filing in a comment does not clear" "a filing at the wrong indent does not clear"
 plant "the queue's ref not fetched" queue.sh 's#^  fetch_queue_ref || return 2$#  true || return 2#' filing "a peer's filing not yet fetched here clears" "filing the blocking attempt clears"
@@ -524,7 +587,7 @@ plant "the quiet note never printed" queue.sh "s#^    echo \"  note: the nightly
 plant "turn on 0 says nothing of a quiet soak" queue.sh 's#green"; soak_note; return 0 ;;#green"; return 0 ;;#' note "no verdict in 30 nights: turn says so" "an old verdict: turn names its date"
 plant "the unreadable note dropped" queue.sh "s#^    3\*)        echo \"  note: the nightly soak's verdict could not be read\"; return 0 ;;#    3*) return 0 ;;#" note "status: an unreadable verdict says so"
 plant "the override reaching only main_green" queue.sh 's#^  \[ -x "\$Q/main-green" \] && { echo "0 off"; return 0; }#  :#' override "soak-verdict reads it as off" "the hook passes the push"
-plant "a --json field changed" queue.sh 's#--json databaseId,attempt #--json databaseId,attempts #' "calls verdict" "the soak's scheduled runs, any status" "a failed night blocks"
+plant "a --json field changed" queue.sh 's#--json databaseId,attempt,status#--json databaseId,attempts,status#' "calls verdict" "the soak's scheduled runs, any status" "a failed night blocks"
 plant "the hook not reading the verdict" pre-push 's#^  "\$Q/queue.sh" soak-verdict >/dev/null 2>&1#  false#' hook "the holder adds src to its clearing branch" "a trunk push with src while it blocks" "a push of a path with a space"
 plant "the hook reading main-state instead" pre-push 's#^  "\$Q/queue.sh" soak-verdict >/dev/null 2>&1#  "$Q/queue.sh" main-state >/dev/null 2>\&1#' hook "the same push while another red is on the head"
 plant "the hook reading stale refs for the soak" pre-push 's#case " \$stale " in \*" \$branch "\*) ;;#case " $stale " in *" none "*) ;;#' hook "  ...and not the soak's"

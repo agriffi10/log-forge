@@ -180,52 +180,80 @@ soak_read() {
   SOAK_LINE="$(soak_verdict)"; SOAK_RC=$?
 }
 
-# soak_verdict  0 nothing blocks · 4 the newest scheduled night with a verdict failed and its
-#               failing attempt is not filed · 3 the verdict could not be read. Prints "0 none"
-#               when no night has a verdict, "0 off" under a main-green override (a project whose
-#               CI is not GitHub Actions has no nightly soak), "3 unreadable", and otherwise
-#               "<state> <run id>-<attempt> <time>", with "filed" after it when that attempt is.
+# soak_verdict  0 nothing blocks · 4 a scheduled night in the window failed and its failing
+#               attempt is not filed · 3 the verdict could not be read. Prints "0 none" when no
+#               night has a verdict, "0 off" under a main-green override (a project whose CI is not
+#               GitHub Actions has no nightly soak), "3 unreadable", "4 <run id>-<attempt> <time>"
+#               for the newest unfiled failing night, and otherwise "0 <run id>-<attempt> <time>"
+#               for the newest night with a verdict, with "filed" after it when that night failed
+#               and is filed. The time is when the night ran (a run's createdAt) for a one-attempt
+#               night, and the attempt's updated_at for a re-run one.
 #
 # Only SCHEDULED runs carry a verdict: a dispatch or a pull request's run is someone's experiment.
-# The newest run with a verdict is read, on any sha, so a merge made while the night ran cannot
-# step past it. `gh run list` reports only a run's latest attempt, so every attempt is read
-# through the API: one that concluded failure or timed_out blocks, whatever a re-run did later,
-# and a run is listed whatever its status, so a re-run in progress hides none of the attempts
-# before it. A night whose every attempt has no verdict (in progress, cancelled, startup_failure,
-# action_required, skipped, neutral, stale) is passed over for the one before it. The attempt a
-# blocking night names is its last failing one.
+# Every night in the last SOAK_LOOKBACK scheduled runs is read, on any sha, newest first, and the
+# first failing night not filed blocks: a later green night clears nothing, since only a night's
+# own filing does. A red night older than SOAK_LOOKBACK scheduled runs falls out of the window
+# unfiled; that is the residue of a bounded read, and PROTOCOL.md says so. A failure or timed_out
+# in ANY attempt makes a night failing, whatever a re-run did later. `gh run list` reports only a
+# run's latest attempt, so a run with more than one is read attempt by attempt through the API; a
+# one-attempt run's listed conclusion is that attempt's, so it costs no API call. A run is listed
+# whatever its status, so a re-run in progress hides none of the attempts before it. A night with
+# no verdict (in progress, cancelled, startup_failure, action_required, skipped, neutral, stale)
+# blocks nothing and is passed over. The attempt a failing night names is its last failing one.
 soak_verdict() {
   [ -x "$Q/main-green" ] && { echo "0 off"; return 0; }
-  local runs id attempts n a c t blocked bad when good goodwhen
-  runs="$( cd "$REPO" && gh run list --workflow "$SOAK_FILE" --event schedule \
-             --limit "$SOAK_LOOKBACK" --json databaseId,attempt \
-             --jq ".[] | [.databaseId, .attempt] | $GH_FIELDS" </dev/null )" || { echo "3 unreadable"; return 3; }
-  while read -r id attempts; do
+  local runs id attempts status conc created n a c t bad when good goodwhen newest=""
+  runs="$( cd "$REPO" && bounded gh run list --workflow "$SOAK_FILE" --event schedule \
+             --limit "$SOAK_LOOKBACK" --json databaseId,attempt,status,conclusion,createdAt \
+             --jq ".[] | [.databaseId, .attempt, .status, .conclusion, .createdAt] | $GH_FIELDS" \
+             </dev/null )" || { echo "3 unreadable"; return 3; }
+  while read -r id attempts status conc created; do
     [ -n "$id" ] || continue
     case "$id/$attempts" in *[!0-9/]*|/*|*/) echo "3 unreadable"; return 3 ;; esac
-    blocked=0; bad=""; when=""; good=""; goodwhen=""
-    n=1
-    while [ "$n" -le "$attempts" ]; do
-      a="$( cd "$REPO" && gh api "repos/{owner}/{repo}/actions/runs/$id/attempts/$n" \
-              --jq "[.conclusion, .updated_at] | $GH_FIELDS" </dev/null )" || { echo "3 unreadable"; return 3; }
-      c="${a%% *}"; t="${a#* }"
-      case "$c" in
-        failure|timed_out) blocked=1; bad="$n"; when="$t" ;;
-        success)           good="$n"; goodwhen="$t" ;;
+    bad=""; when=""; good=""; goodwhen=""
+    if [ "$attempts" -eq 1 ]; then
+      [ "$status" = completed ] || conc="-"
+      case "$conc" in
+        failure|timed_out) bad=1; when="$created" ;;
+        success)           good=1; goodwhen="$created" ;;
       esac
-      n=$((n + 1))
-    done
-    if [ "$blocked" -eq 1 ]; then
+    else
+      n=1
+      while [ "$n" -le "$attempts" ]; do
+        a="$( cd "$REPO" && bounded gh api "repos/{owner}/{repo}/actions/runs/$id/attempts/$n" \
+                --jq "[.conclusion, .updated_at] | $GH_FIELDS" </dev/null )" || { echo "3 unreadable"; return 3; }
+        c="${a%% *}"; t="${a#* }"
+        case "$c" in
+          failure|timed_out) bad="$n"; when="$t" ;;
+          success)           good="$n"; goodwhen="$t" ;;
+        esac
+        n=$((n + 1))
+      done
+    fi
+    if [ -n "$bad" ]; then
       filed "$id-$bad"
       case $? in
-        0) echo "0 $id-$bad $when filed"; return 0 ;;
+        0) [ -n "$newest" ] || newest="0 $id-$bad $when filed" ;;
         1) echo "4 $id-$bad $when"; return 4 ;;
         *) echo "3 unreadable"; return 3 ;;
       esac
+    elif [ -n "$good" ]; then
+      [ -n "$newest" ] || newest="0 $id-$good $goodwhen"
     fi
-    [ -n "$good" ] && { echo "0 $id-$good $goodwhen"; return 0; }
   done <<< "$runs"
-  echo "0 none"; return 0
+  echo "${newest:-0 none}"; return 0
+}
+
+# bounded <command...>  runs the command under timeout(1), or gtimeout, for GH_TIMEOUT seconds when
+#             either exists, so a hung gh or fetch cannot hold a push or a turn: an expiry is a
+#             failure, which every caller reads as unreadable, and the hook then fails open. With
+#             neither installed the call is unbounded, which PROTOCOL.md says.
+GH_TIMEOUT="${PR_QUEUE_GH_TIMEOUT:-20}"
+bounded() {
+  if command -v timeout >/dev/null 2>&1; then timeout "$GH_TIMEOUT" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$GH_TIMEOUT" "$@"
+  else "$@"
+  fi
 }
 
 # fetch_queue_ref  fetches the trunk into SOAK_REF, a ref no session works on. `--refmap=` is what
@@ -233,9 +261,12 @@ soak_verdict() {
 #             same fetch (measured, git 2.54.0), and moving origin/main under a session in the
 #             middle of a rebase is a known hazard. --no-write-fetch-head, because several
 #             worktrees hitting FETCH_HEAD at once would race. Every soak fetch is this one.
+FETCHED_QUEUE_REF=0
 fetch_queue_ref() {
-  git -C "$REPO" fetch -q --no-write-fetch-head --refmap= origin \
-      "+refs/heads/$MAIN:$SOAK_REF" </dev/null 2>/dev/null
+  [ "$FETCHED_QUEUE_REF" = 1 ] && return 0
+  bounded git -C "$REPO" fetch -q --no-write-fetch-head --refmap= origin \
+      "+refs/heads/$MAIN:$SOAK_REF" </dev/null 2>/dev/null || return 1
+  FETCHED_QUEUE_REF=1
 }
 
 # filed <run id>-<attempt>  0 when tests/soak_known.py at SOAK_REF files that attempt in
@@ -422,7 +453,17 @@ cmd_turn() {
   # The lock only orders the agents that take it. Sessions outside the set push without one, so
   # ask the remote itself as well.
   pr="$(open_prs)" || { echo "WAIT — could not read the remote (the check failed). Not assuming it is clear."; return 1; }
-  [ -z "$pr" ] || { echo "WAIT — a PR is open on the remote:"; echo "$pr" | head -3; return 1; }
+  if [ -n "$pr" ]; then
+    echo "WAIT — a PR is open on the remote:"; echo "$pr" | head -3
+    # While the soak's verdict blocks, an open PR (a bot's, or one pushed before the night went
+    # red) would hold the night's filing out indefinitely, and PROTOCOL.md forbids merging it on a
+    # 4. So the WAIT names the remedy.
+    soak_read
+    if [ "$SOAK_RC" = 4 ]; then
+      echo "  The nightly soak's verdict blocks ($(printf '%s' "$SOAK_LINE" | cut -d' ' -f2,3)). Once Andrew has answered, the session filing that night converts every open non-draft PR, a bot's included, to a draft (gh pr ready --undo <n>) before its turn, and marks them ready again once the filing has merged ($Q/PROTOCOL.md)."
+    fi
+    return 1
+  fi
   main_green; rc=$?
   case $rc in
     0) echo "READY — your turn, no PR open, $MAIN green"; soak_note; return 0 ;;

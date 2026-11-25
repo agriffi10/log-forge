@@ -224,12 +224,21 @@ with `filed` after it when that attempt is filed. `$Q/queue.sh main-state` print
 - **Which runs count.** Only **scheduled** runs of `Model soak` carry a verdict. A dispatch or a pull
   request's run never affects the queue: a red dispatch is someone's experiment. Runs of `Model soak`
   on `main`'s head are left out of the head's reading entirely, so they never read `IS RED`.
-- **Which night is read.** The newest of the last 30 scheduled runs that has a verdict, on any sha,
-  so a merge made while the night ran cannot step past it.
-- **The attempt rule.** `gh run list` reports only a run's latest attempt, so the queue reads every
-  attempt through the API, and **a run blocks if any attempt concluded `failure` or `timed_out`**. A
-  re-run cannot turn a red night green. If the API cannot show an attempt, the verdict is unreadable,
-  and `turn` waits on it.
+- **Which nights are read.** Every one of the last 30 scheduled runs, on any sha, newest first:
+  the first failing night that is not filed blocks, whatever came after it. **A later green night
+  clears nothing**; only a night's own filing does. On any sha, so a merge made while the night ran
+  cannot step past it. The residue: a red night older than 30 scheduled runs falls out of the
+  window unfiled, and nothing reads it again, so a failed night is escalated the morning it fails.
+- **The attempt rule.** `gh run list` reports only a run's latest attempt, so a re-run night is
+  read attempt by attempt through the API, and **a run blocks if any attempt concluded `failure` or
+  `timed_out`**. A re-run cannot turn a red night green. A one-attempt run's listed conclusion is
+  its own, so it costs no API call: an ordinary `turn` costs three `gh` calls (the open pull
+  requests, the head, the nights). If the API cannot show an attempt, the verdict is unreadable, and
+  `turn` waits on it.
+- **Bounded.** Each `gh` call and fetch the verdict makes runs under `timeout` (or `gtimeout`) for
+  20 s, `PR_QUEUE_GH_TIMEOUT` overriding it; an expiry reads as unreadable, so the hook lets the
+  push through as it does whenever it cannot read the verdict. Where neither command is installed
+  the calls are unbounded, and a hung `gh` holds the push until it returns.
 - **Which conclusions block.** `failure` and `timed_out` block; a timeout may be a hang the guard
   could not catch. `success` is a verdict that does not block. `cancelled`, `startup_failure`,
   `action_required`, `skipped`, `neutral`, `stale` and an attempt not yet finished are no verdict,
@@ -253,6 +262,12 @@ with `filed` after it when that attempt is filed. `$Q/queue.sh main-state` print
   (a new item under `### Open` when it is new), and adds a `KNOWN` row when the finding is a soak
   signature of a new shape — never for a `repeat` whose record is Shape A's (`tests/soak_known.py`
   says why). `tests/soak_ceilings.py` is not a clearing file, so it cannot raise a ceiling.
+- **Open pull requests.** An open non-draft pull request, a bot's included, or one pushed before
+  the night went red, holds every `turn`, a clearing branch's too, and nothing may merge on a 4. So
+  `turn`'s `WAIT` names the remedy while the verdict blocks: **the session filing the night, once
+  Andrew has answered, converts every open non-draft pull request to a draft with
+  `gh pr ready --undo <n>` before taking its turn, and marks each ready again with
+  `gh pr ready <n>` once the filing has merged.**
 - **Who writes it.** A session that reads the soak's `WAIT` escalates the night to Andrew, naming
   the run, as it does any red. **A clearing pull request is written only once Andrew has answered
   that escalation.** A finding no row can explain, a gating failure among them, is filed the same

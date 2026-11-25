@@ -22,6 +22,14 @@ if TYPE_CHECKING:
 KNOWN_PREFIX = "known soak finding:"
 """How a known soak item's reason starts; the nightly report's floor reads it."""
 
+KINDS = ("repeat", "late-write")
+"""The signature kinds a row may explain. Any other row, ``untaken`` above all, is never honoured.
+
+``untaken`` is a close with no take to discharge, a wiring failure of the soak itself, and a row
+in the clearing file claiming to explain it would excuse a broken record; the kinds are held here,
+outside the clearing file, so a clearing pull request cannot widen them.
+"""
+
 
 def signatures_of(events: Sequence[SinkEvent], closes: Closes) -> list[str]:
     """Returns one sink's soak signatures, from both of the soak's rules.
@@ -56,8 +64,9 @@ def explain(
 ) -> list[Known]:
     """Returns the known shape behind each of one sink's signatures, or ``[]`` if any is new.
 
-    A signature is explained by the first row of its kind whose predicate holds for the sink.
-    ``untaken`` has no row, so it is never explained.
+    A signature is explained by the first row of its kind whose predicate holds for the sink. Only
+    rows of a kind in :data:`KINDS` are read, so ``untaken`` is never explained, whatever row a
+    clearing pull request plants.
 
     Args:
       signatures: The sink's ``CloseBroken:<kind>@<count>`` signatures.
@@ -75,7 +84,12 @@ def explain(
     for signature in signatures:
         kind = signature.removeprefix("CloseBroken:").split("@", 1)[0]
         shape = next(
-            (row for row in known if row.kind == kind and row.predicate(events, closes)), None
+            (
+                row
+                for row in known
+                if row.kind in KINDS and row.kind == kind and row.predicate(events, closes)
+            ),
+            None,
         )
         if shape is None:
             return []

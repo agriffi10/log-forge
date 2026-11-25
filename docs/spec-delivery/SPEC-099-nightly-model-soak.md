@@ -53,11 +53,11 @@
 
 ## Verification
 
-- **Gates after the code round** (the commit on top of `764f26d6`):
-  - All exit 0: ruff, mypy, pytest (13314 passed, 48 skipped, 10 xfailed), spec-lint and its
+- **Gates after the second code round** (the commit on top of `0fd36316`):
+  - All exit 0: ruff, mypy, pytest (13343 passed, 48 skipped, 10 xfailed), spec-lint and its
     corpus, docs-lint, docstring-lint, `pr-queue-test.sh` (23 plants), `install-test.sh` (44 cases)
-    and `pr-queue-soak-test.sh` (155 cases, 35 plants).
-  - Python 3.12.12: 13313 passed with `PYTHONPATH=src`, which child interpreters need to import
+    and `pr-queue-soak-test.sh` (174 cases, 40 plants).
+  - Python 3.12.12: 13342 passed with `PYTHONPATH=src`, which child interpreters need to import
     the uninstalled package.
   - zizmor 1.32.0 `--offline` reports the same one low `self-repository` finding on this workflow
     as on `ci.yml`.
@@ -66,7 +66,16 @@
   The code round added 4 of 4 Python mutants (a signature with no shape skipped in `explain`, the
   predicate reading only the last late write, the report's no-row exit dropped, every commit
   anchor removed from a ceiling) and 2 shell plants (the head's fields read space-separated, the
-  clearing range read through porcelain `diff`), each reddened by its new row.
+  clearing range read through porcelain `diff`), each reddened by its new row. The second code
+  round added 5 of 5 Python mutants (a row of any kind honoured, the generic phrases read
+  everywhere, and three reversions of machinery tests to the live table, each reddened by the
+  future-edit check) and 6 shell plants (a newer green night clearing an older red one, a filed
+  night ending the scan, a verdict-less night ending it, a one-attempt night read through the API,
+  the gh calls unbounded, the open-PR remedy dropped), each reddened by its new case. The second
+  review's reproductions re-run against the fix: a red night under a newer green one now blocks;
+  a clearing pull request's three edits pass SPEC-099's tests whole, and the orphan item's closure
+  fails only its row's five predicate rows; an open Dependabot PR's `WAIT` names the remedy; a
+  planted `untaken` row explains nothing; an ordinary `turn` costs three `gh` calls, not five.
 - **Measured runs:**
   - The workflow's soak step at seeds 0 to 99 ran 307 passed and 1 known; the report read
     `300 of 300` and `8 of 8` and exited 0.
@@ -77,13 +86,16 @@
     and `LOG_FOUNDRY_MODEL_SEEDS=0-3 PYTHONPATH=<plugin dir> poetry run pytest -n 0 -p forkcount tests/test_invariants_model.py -k test_the_sequential_driver_holds_the_state_table`.
   - The live `fenced` test passed 20 of 20, both in parallel and serially under load.
   - The real `gh` read through `soak_verdict`'s lines against `integration.yml` printed
-    `0 45246571727-1 2026-11-23T19:20:28Z`.
+    `0 45246571727-1 2026-11-23T19:12:53Z` (a one-attempt night's time is the run's `createdAt`,
+    read from the list with no API call; `main-state` 0 through the same lines).
   - Phase 1 soak on macOS, seeds 0 to 999: 8, 3 and 2 known items at loads 34, 21 and 19, every one
     the orphan late write; no `repeat`, `untaken` or gating failure.
 - **Owed:**
   - **Before the merge:** this pull request's own Model soak run, reading `0-99` and `300 of 300`.
   - **After the merge**, recorded by a docs-only follow-up pull request cut from fresh `main`:
-    - `install.sh` re-run, and `queue.sh soak-verdict` printing its pinned form;
+    - `install.sh` re-run, **only after the merge has put `model-soak.yml` on `main`**, and
+      `queue.sh soak-verdict` printing its pinned form. Installed any earlier, the queue's
+      `gh run list --workflow model-soak.yml` answers HTTP 404, so every session reads 3 and waits;
     - a no-input `workflow_dispatch` on `main`;
     - the first scheduled night within 26 hours, with its summary and the pytest step's duration;
     - the late-write ceiling re-derived from the Linux nights.

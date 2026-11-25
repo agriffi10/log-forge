@@ -121,6 +121,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
+import soak_known
 import soak_verdict
 from conftest import install_worker, retire_process, run_concurrently
 from log_foundry import _diag, _lifecycle
@@ -158,11 +159,12 @@ from model_oracles import (
 )
 from model_oracles import Ledger as OracleLedger
 from model_sinks import span_ends_queued
+from soak_known import Known
 from test_fork_lifecycle import CHILD_TIMEOUT, run_in_child
 from test_sinks_http import FakeResponse
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
 FORMS = FORMS_SOAKED
 DEFAULT_SEEDS = range(16)
@@ -1321,6 +1323,7 @@ def _soak_item(
     request: pytest.FixtureRequest,
     record_property: Callable[[str, object], None],
     run: Callable[..., object] | None = None,
+    known: Sequence[Known] | None = None,
 ) -> None:
     """The soak item's body, defined whatever the switch says so the default suite can drive it.
 
@@ -1339,6 +1342,7 @@ def _soak_item(
       request: The item's request, for its id.
       record_property: The item's property recorder.
       run: What runs the interleaving; :func:`_interleaving` when ``None``.
+      known: The known table to read a red run against; the live ``KNOWN`` when ``None``.
 
     Returns:
       None.
@@ -1351,7 +1355,7 @@ def _soak_item(
     interleave = _interleaving if run is None else run
     with _rerun_on_failure(request, seed, concurrent=True, soak=True):
         interleave(seed, form, monkeypatch, capfd, soak)
-    _soak_verdict(soak, request, seed, record_property)
+    _soak_verdict(soak, request, seed, record_property, known)
 
 
 def _soak_verdict(
@@ -1359,6 +1363,7 @@ def _soak_verdict(
     request: pytest.FixtureRequest,
     seed: int,
     record_property: Callable[[str, object], None],
+    known: Sequence[Known] | None = None,
 ) -> None:
     """Ends a soak item: clean, an expected failure of known shapes, or a failure (FR-002).
 
@@ -1373,6 +1378,8 @@ def _soak_verdict(
       request: The item's request, for its id.
       seed: The item's seed.
       record_property: The item's property recorder.
+      known: The known table to read against; the live ``KNOWN`` when ``None``. The tests of this
+        machinery pass a fixed table, so a clearing pull request's new row changes none of them.
 
     Returns:
       None.
@@ -1382,10 +1389,10 @@ def _soak_verdict(
     """
     if not soak.report:
         return
-    known = soak_verdict.explain_run(soak.judged)
-    if known:
-        record_property(SOAK_KNOWN, ",".join(shape.name for shape in known))
-        pytest.xfail(f"{soak_verdict.reason(known)}\n{soak.report}")
+    shapes = soak_verdict.explain_run(soak.judged, soak_known.KNOWN if known is None else known)
+    if shapes:
+        record_property(SOAK_KNOWN, ",".join(shape.name for shape in shapes))
+        pytest.xfail(f"{soak_verdict.reason(shapes)}\n{soak.report}")
     rerun = rerun_command(request.node.nodeid, seed, soak=True)
     raise AssertionError(f"{soak.report}\nRe-run it alone: {rerun}")
 
@@ -1682,6 +1689,28 @@ _UNTAKEN_SINK: tuple[list[SinkEvent], Closes] = (
 _GATING = "invariant 2 (spans): stand-in gating failure"
 
 
+def _fixture_late_write(events: Sequence[SinkEvent], closes: Closes) -> bool:
+    """The fixture row's predicate: the sink's last write is late and on ``_LATE``'s thread.
+
+    Args:
+      events: One sink's events.
+      closes: Its close record.
+
+    Returns:
+      Whether it has that shape.
+
+    Raises:
+      None.
+    """
+    writes = [event for event in events if isinstance(event, Write)]
+    late = bool(closes.at_return) and closes.writes > closes.at_return[-1]
+    return late and bool(writes) and writes[-1].thread == _LATE
+
+
+_FIXTURE_KNOWN = (Known("fixture-late-write", "A fixture lead", "late-write", _fixture_late_write),)
+"""A fixed known table: these tests are about the verdict, not the live ``KNOWN`` a filing edits."""
+
+
 def _stand_in(judged: list[tuple[list[SinkEvent], Closes]], *, raises: bool) -> Any:
     """Returns a stand-in for :func:`_interleaving` that leaves a judged soak record behind.
 
@@ -1748,23 +1777,23 @@ def test_a_gating_failure_in_a_soak_item_is_never_excused(
 
     run = _stand_in([_KNOWN_SINK], raises=raises)
     ending, raised = _ending(
-        lambda: _soak_item(7, "emit", monkeypatch, capfd, request, record, run)
+        lambda: _soak_item(7, "emit", monkeypatch, capfd, request, record, run, _FIXTURE_KNOWN)
     )
     if raises:
         assert ending == "fail", f"a gating failure ended {ending}: {raised}"
         assert str(raised) == _GATING, raised
-        assert (SOAK_KNOWN, "orphan-write-after-close") not in recorded, recorded
+        assert (SOAK_KNOWN, "fixture-late-write") not in recorded, recorded
     else:
         assert ending == "xfail", f"a known record ended {ending}: {raised}"
         assert str(raised).startswith(soak_verdict.KNOWN_PREFIX), raised
-        assert (SOAK_KNOWN, "orphan-write-after-close") in recorded, recorded
+        assert (SOAK_KNOWN, "fixture-late-write") in recorded, recorded
 
 
 @pytest.mark.parametrize(
     ("judged", "ends", "says"),
     [
-        ([_KNOWN_SINK], "xfail", "known soak finding: orphan-write-after-close (§12: An orphan"),
-        ([_KNOWN_SINK, _KNOWN_SINK], "xfail", "known soak finding: orphan-write-after-close ("),
+        ([_KNOWN_SINK], "xfail", "known soak finding: fixture-late-write (§12: A fixture lead)"),
+        ([_KNOWN_SINK, _KNOWN_SINK], "xfail", "known soak finding: fixture-late-write ("),
         ([_NEW_SINK], "fail", "Re-run it alone: LOG_FOUNDRY_MODEL_SOAK=1"),
         ([_KNOWN_SINK, _NEW_SINK], "fail", "Re-run it alone: LOG_FOUNDRY_MODEL_SOAK=1"),
         ([_UNTAKEN_SINK], "fail", "Re-run it alone: LOG_FOUNDRY_MODEL_SOAK=1"),
@@ -1790,15 +1819,15 @@ def test_a_known_soak_item_is_an_expected_failure_and_anything_else_fails(
     def record(name: str, value: object) -> None:
         recorded.append((name, value))
 
-    ending, raised = _ending(lambda: _soak_verdict(soak, request, 7, record))
+    ending, raised = _ending(lambda: _soak_verdict(soak, request, 7, record, _FIXTURE_KNOWN))
     assert ending == ends, f"ended {ending}, wanted {ends}: {raised}"
     if ends == "clean":
         assert recorded == []
     elif ends == "xfail":
         text = str(raised)
         assert text.startswith(says), text
-        assert text.split("\n", 1)[0].count("orphan-write-after-close") == 1, text
-        assert recorded == [(SOAK_KNOWN, "orphan-write-after-close")], recorded
+        assert text.split("\n", 1)[0].count("fixture-late-write") == 1, text
+        assert recorded == [(SOAK_KNOWN, "fixture-late-write")], recorded
     else:
         assert says in str(raised), raised
         assert recorded == [], recorded

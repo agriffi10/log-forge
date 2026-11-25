@@ -24,6 +24,7 @@ import pytest
 import soak_ceilings
 import soak_known
 from model_oracles import SEEDS_VARIABLE, SOAK_VARIABLE
+from soak_known import Known
 from test_model_oracles import open_item_leads
 
 if TYPE_CHECKING:
@@ -582,8 +583,26 @@ def test_a_dispatch_is_bounded_before_its_seeds_are_built() -> None:
     assert peak < 1_000_000, peak
 
 
-_SHAPE = soak_known.ORPHAN_LATE_WRITE.name
-_CEILING = soak_ceilings.ceiling_of(_SHAPE)
+_SHAPE = "fixture-late-write"
+_CEILING = 4
+_FIXTURE_KNOWN = (Known(_SHAPE, "A fixture lead", "late-write", lambda _events, _closes: True),)
+"""A fixed known table and ceiling for the report's corpus, which is about the report, not the
+live rows: a clearing pull request's new row, or a spec closing an item, changes none of it."""
+
+
+def _fixture_ceiling(name: str) -> int:
+    """The fixture rows' ceilings: 4 for the fixture row, the unmeasured 3 for anything else.
+
+    Args:
+      name: A row's name.
+
+    Returns:
+      Its ceiling.
+
+    Raises:
+      None.
+    """
+    return _CEILING if name == _SHAPE else soak_ceilings.UNMEASURED_CEILING
 
 
 def _known(shapes: str = _SHAPE) -> str:
@@ -735,7 +754,7 @@ def test_the_report(
     """
     xml = tmp_path / "soak.xml"
     xml.write_text(_xml(bodies, wiring), encoding="utf-8")
-    text, got = report_mod.report(xml, seeds)
+    text, got = report_mod.report(xml, seeds, _FIXTURE_KNOWN, _fixture_ceiling)
     assert got == status, text
     assert says in text, text
 
@@ -752,10 +771,7 @@ def test_the_report_writes_its_summary_and_exits_with_its_status(tmp_path: pathl
     assert missing.returncode == 1 and "no readable JUnit XML" in missing.stdout, missing
 
 
-_ARCHITECTURE = (ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
-
-
-def unknown_rows(text: str | None = None) -> list[str]:
+def unknown_rows(text: str | None = None, known: tuple[Known, ...] | None = None) -> list[str]:
     """Returns every ``KNOWN`` row whose item is not an open lead of §12 in ``text``.
 
     Args:
@@ -768,7 +784,8 @@ def unknown_rows(text: str | None = None) -> list[str]:
       None.
     """
     leads = open_item_leads(text)
-    return [row.name for row in soak_known.KNOWN if " ".join(row.item.split()) not in leads]
+    rows = soak_known.KNOWN if known is None else known
+    return [row.name for row in rows if " ".join(row.item.split()) not in leads]
 
 
 def test_every_known_shape_names_an_open_item() -> None:
@@ -788,23 +805,30 @@ def _lead_bullet(text: str) -> tuple[int, int]:
     Raises:
       None.
     """
-    start = text.index(
-        "- **An orphan log that passed its owed check before a `shutdown()` took its sink"
-    )
+    start = text.index("- **A fixture lead**")
     end = text.index("\n- ", start + 1)
     return start, end
 
 
+_FIXTURE_ARCHITECTURE = (
+    "## 12. Open items\n\n### Open\n\n- **A fixture lead** (the fixture row's item).\n"
+    "- **Another open item** (x).\n\n### Resolved\n\n- ~~**An old item**~~ closed.\n"
+)
+"""A fixed §12 for the open-item check's own corpus, so closing a live item changes none of it."""
+
+
 def test_the_open_item_check_can_actually_fail() -> None:
     """FR-002: the row is reported when its item is struck through, or moved under Resolved."""
-    start, end = _lead_bullet(_ARCHITECTURE)
-    struck = _ARCHITECTURE[:start] + "- ~~**" + _ARCHITECTURE[start + len("- **") :]
-    assert unknown_rows(struck) == [_SHAPE]
-    bullet = _ARCHITECTURE[start:end]
-    moved = (_ARCHITECTURE[:start] + _ARCHITECTURE[end:]).replace(
+    text = _FIXTURE_ARCHITECTURE
+    assert unknown_rows(text, _FIXTURE_KNOWN) == []
+    start, end = _lead_bullet(text)
+    struck = text[:start] + "- ~~**" + text[start + len("- **") :]
+    assert unknown_rows(struck, _FIXTURE_KNOWN) == [_SHAPE]
+    bullet = text[start:end]
+    moved = (text[:start] + text[end:]).replace(
         "\n### Resolved\n", "\n### Resolved\n\n" + bullet + "\n", 1
     )
-    assert unknown_rows(moved) == [_SHAPE]
+    assert unknown_rows(moved, _FIXTURE_KNOWN) == [_SHAPE]
 
 
 PHRASES = (
@@ -818,6 +842,9 @@ PHRASES = (
 )
 """What SPEC-086's record said of the soak before SPEC-099 reversed it (FR-005)."""
 
+GENERIC = frozenset({"run on request", "gating nothing", "gates nothing"})
+"""The phrases ordinary prose uses of other things, read only in a paragraph about the soak."""
+
 _PHRASE_ROOTS = ("docs/invariants.md", "docs/architecture.md", "docs/decisions", "tests")
 _BINARY = (".pyc", ".png", ".jpg", ".gif", ".ico", ".gz", ".zip")
 
@@ -828,7 +855,9 @@ def phrase_findings(name: str, text: str) -> list[str]:
     The text is read a paragraph at a time, a paragraph being a run of non-blank lines, joined
     across its line breaks with its whitespace collapsed, so a phrase split by a wrap is still
     found. A phrase passes only inside a ``~~...~~`` span of a paragraph that also names
-    ``SPEC-099``: struck, and marked with the spec that struck it.
+    ``SPEC-099``: struck, and marked with the spec that struck it. The generic phrases in
+    :data:`GENERIC` are read only in a paragraph that mentions the soak, so a later, unrelated use
+    of "gates nothing" is not refused.
 
     Args:
       name: The file's path, for the finding.
@@ -845,7 +874,10 @@ def phrase_findings(name: str, text: str) -> list[str]:
         joined = " ".join(paragraph.split())
         struck = [m.span() for m in re.finditer(r"~~.+?~~", joined)]
         marked = "SPEC-099" in joined
+        about_the_soak = "soak" in joined.lower()
         for phrase in PHRASES:
+            if phrase in GENERIC and not about_the_soak:
+                continue
             for found in re.finditer(re.escape(phrase), joined):
                 inside = any(low <= found.start() and found.end() <= high for low, high in struck)
                 if not (inside and marked):
@@ -903,15 +935,17 @@ def test_the_record_no_longer_says_the_soak_runs_only_on_request() -> None:
     ("text", "stands"),
     [
         ("The soak gates\nnothing at all.\n", True),
-        ("It ~~gates nothing~~, reversed by SPEC-099.\n", False),
-        ("It ~~gates nothing~~, reversed.\n\nSPEC-099 says so in another paragraph.\n", True),
-        ("SPEC-099 runs it nightly; before, it gates nothing.\n", True),
+        ("The soak ~~gates nothing~~, reversed by SPEC-099.\n", False),
+        ("The soak ~~gates nothing~~, reversed.\n\nSPEC-099 says so in another paragraph.\n", True),
+        ("SPEC-099 runs the soak nightly; before, it gates nothing.\n", True),
+        ("The exporter gates nothing until it is configured.\n", False),
     ],
     ids=[
         "bare-across-a-wrap",
         "struck-and-marked",
         "struck-marked-only-in-another-paragraph",
         "bare-in-a-paragraph-naming-spec-099",
+        "a-generic-phrase-in-a-paragraph-not-about-the-soak",
     ],
 )
 def test_the_phrase_check_can_actually_fail(text: str, stands: bool) -> None:

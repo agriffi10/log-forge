@@ -132,6 +132,12 @@ second. Nothing else between the takes owes the second close: not a `Note` alone
 whose thread has no `Note` before it in the stretch, and not a `Note` on one thread with a `Write`
 on another.
 
+**The rule fails closed.** A write on the worker's drain thread between the takes, after a sink
+change's arm, carries no `Note`, because only the orphan path makes one. So such a write never
+reads as owed: the pair stays a `repeat`, red, and is never masked as an owed close. A worker
+write that really did owe the second close would be reported, not hidden, which is the side to
+err on (the code round's second review).
+
 **Not any write.** The hand-over suggested excusing any `Write` between the takes. That hides a
 record whose second close only a sink change's arm made. When the writer passed its owed check
 *before* the first take and wrote after it, the write is the race of the orphan-log item, and
@@ -265,7 +271,9 @@ matched against the table. If every one has a shape, the item records the shapes
 JUnit property `soak_known` and ends in `pytest.xfail`. The reason's first line is `known soak
 finding: <name> (§12: <item>)` for each shape, and the record follows. Anything else fails:
 - a signature with no shape;
-- `untaken@<count>`;
+- `untaken@<count>`: `tests/soak_verdict.py`, which is not a clearing file, honours rows of the
+  kinds `repeat` and `late-write` only, so a row a clearing pull request plants for any other
+  kind explains nothing;
 - any gating assertion `_interleaving` makes;
 - a run in which one sink's finding is known and another's is not.
 
@@ -304,6 +312,20 @@ On Linux the ceiling is loose. The stand-in met none in 18,000 items at `eda19f3
 30,000 at `d9f2f097`, about 0.5 a night, so only a rate some forty times that would pass 21 there.
 The first scheduled nights on a real runner, which FR-003 already owes, are where the ceiling is
 re-derived, by an ordinary reviewed pull request.
+
+**Tests about the machinery never read the live table.** Every clearing pull request edits
+`tests/soak_known.py` and §12, and a clearing branch cannot touch `tests/`, so a test that judged
+the verdict, the report or the checks against the live `KNOWN`, `FILED_NIGHTS` or §12 would fail
+the very filing the queue waits for. Those tests use fixed fixture tables and texts. Only the
+tests whose job is the live content read it: the live row's predicate corpus, which looks its row
+up by name at test time, `test_no_known_row_explains_shape_a`, the open-item check, the
+ceilings-name-a-row check and the filing-format check over the live file, which accepts a
+populated `FILED_NIGHTS`. `tests/test_soak_future_edits.py` holds this in the default suite: it
+copies the tracked tree, applies a clearing edit (one `FILED_NIGHTS` entry, one new `### Open`
+item, one new `KNOWN` row with a worker-thread predicate) and the orphan item's closing edit (struck
+and moved under `### Resolved`, its row and ceiling removed), runs SPEC-099's test modules against
+each copy in a subprocess, and asserts the first passes whole and the second fails exactly the live
+row's corpus, by name.
 
 **A row's life.** A known item stays visible: it is counted and listed in every run's summary
 (FR-004). It drops out only when its item closes. A default-suite test reads §12 with SPEC-085's
@@ -647,7 +669,9 @@ SPEC-086 and its delivery doc are frozen records and are not edited.
       such as `tests/__pycache__/*.pyc` is read, except `tests/test_model_soak_workflow.py`, which
       holds the phrase list. A phrase passes only inside a `~~...~~` span of a paragraph that also
       contains `SPEC-099`, a paragraph being a run of non-blank lines joined as above; anywhere
-      else it fails, naming the file. A corpus asserts that a bare phrase fails, a struck one in a
+      else it fails, naming the file. The three generic phrases, "run on request", "gating
+      nothing" and "gates nothing", are read only in a paragraph that mentions the soak, so a
+      later, unrelated use of one is not refused; a corpus row holds that too. A corpus asserts that a bare phrase fails, a struck one in a
       paragraph naming `SPEC-099` passes, and a struck one whose paragraph does not name it fails
       though another paragraph of the same text does. A mutant that widens the scope from the
       paragraph to the whole file reddens that third row.
@@ -676,9 +700,21 @@ request's run never affects the queue: a red dispatch is someone's experiment, a
 typo or timeout is harmless. Runs of `Model soak` on `main`'s head are left out of the head's
 reading entirely.
 
-**Which run is read.** `queue.sh`'s `soak_verdict` lists the newest 30 scheduled runs, whatever
-their status, on any sha, newest first. It reads the first run that has a verdict. So a merge made
-while the night ran cannot step past the night.
+**Which nights are read.** `queue.sh`'s `soak_verdict` lists the newest 30 scheduled runs,
+whatever their status, on any sha, newest first, and reads every one: the first failing night
+whose failing attempt is not filed blocks, whatever came after it. A later green night clears
+nothing, since only a night's own filing does (Andrew's rule; the code round's second review found
+the first-verdict reading cleared an older red night under a newer green one). On any sha, so a
+merge made while the night ran cannot step past it. The printed time of a non-blocking answer is
+the newest night with any verdict, which is what `turn`'s note ages. **The residue:** a red night
+older than 30 scheduled runs falls out of the window unfiled, and nothing reads it after that; the
+nightly escalation is what keeps a night from ageing that far.
+
+**What a poll costs.** One `gh run list` for the head, one for the nights, and one for the open
+pull requests: three calls for an ordinary `turn`. A one-attempt run's listed conclusion is that
+attempt's own, so it needs no API call; only a re-run night is read attempt by attempt through the
+API, and the trunk is fetched into `refs/pr-queue/main` once per call of the queue, only when a
+failing night is read.
 
 **Re-runs.** `gh run list` reports only a run's latest attempt: measured on run 43801629163, it
 read `attempt=2 conclusion=success`. `gh api .../actions/runs/<id>/attempts/<n>` reports each
@@ -687,6 +723,12 @@ reads every attempt through the API, and **a run blocks if any attempt concluded
 `timed_out`**. A re-run cannot turn a red night green. A re-run still in progress leaves the run
 `in_progress`, so the run is listed whatever its status and its finished attempts are still read.
 If the API cannot show an attempt, the verdict is unreadable.
+
+Every multi-field line the queue reads from `gh` renders a missing value as `-`, and every `gh`
+call and fetch the verdict makes runs under `timeout` (or `gtimeout`) for 20 s where either
+exists, `PR_QUEUE_GH_TIMEOUT` overriding it; an expiry is unreadable, so the hook fails open
+rather than hang a push. With neither installed the calls are unbounded, which `PROTOCOL.md`
+says.
 
 **Which conclusions block.**
 - `failure` and `timed_out` block. A timeout may be a hang the guard could not catch.
@@ -753,6 +795,11 @@ so a valid clearing branch would read `WAIT`.
 
 While the verdict blocks:
 - `turn` answers `READY` to a clearing branch, and `WAIT` to any other branch, naming the night;
+- an open non-draft pull request (a bot's, or one pushed before the night went red) holds even a
+  clearing branch's `turn` at `WAIT`, and nothing may merge on a 4, so that `WAIT` names the
+  remedy: the session filing the night, once Andrew has answered, converts every open non-draft
+  pull request to a draft (`gh pr ready --undo <n>`) before its turn, and marks them ready again
+  once the filing has merged;
 - `acquire` refuses to stamp the lock onto any other branch, even for the lock's holder, whose
   `turn` answers before it reads the trunk.
 
@@ -962,7 +1009,7 @@ def report(xml: pathlib.Path, seeds: str) -> tuple[str, int]: ...   # (Markdown,
 SOAK_WORKFLOW="Model soak"; SOAK_FILE="model-soak.yml"; SOAK_LOOKBACK=30; SOAK_QUIET_HOURS=48
 main_green       # 0 green · 1 RED · 2 building · 3 could not run · 4 the soak's verdict blocks
 head_green       # main_green's old reading of the head, with Model soak's runs left out
-soak_verdict     # 0 · 4 · 3, printing "<state> <run id>-<attempt> <time> [filed]", or "0 none" when no night has a verdict
+soak_verdict     # 0 · 4 · 3 over the whole window, printing "4 <run id>-<attempt> <time>" for the newest unfiled failing night, else "0 <run id>-<attempt> <time> [filed]" for the newest night with a verdict, or "0 none"
 filed ID-N       # 0 when tests/soak_known.py at refs/pr-queue/main, fetched first with --refmap=, files that attempt
 clearing_range A B   # 0 when A..B changes only the two clearing files, each left mode 100644
 clearing_branch  # clearing_range from the branch's merge base with refs/pr-queue/main (fetched, --refmap=)
@@ -1363,6 +1410,15 @@ nothing.
 
 ## Revision history
 
+- **2026-11-25, corrected in the second code round** after the second diff review. The verdict
+  scans the whole window and blocks on the newest unfiled failing night, since reading only the
+  first night with a verdict let a newer green night clear an older red one; the window's residue
+  and a poll's cost are stated. Tests about the machinery use fixture tables, and a default-suite
+  test applies a clearing edit and the orphan item's closing edit to a copy of the tree. `turn`'s
+  `WAIT` behind an open pull request names the remedy while the verdict blocks. Only `repeat` and
+  `late-write` rows are honoured. The verdict's `gh` calls are bounded by `timeout`. The generic
+  phrases of FR-005 are read only in paragraphs about the soak. FR-001 states that a worker write
+  between the takes reads as unowed, failing closed.
 - **2026-11-24, corrected in the code round** after the first diff review: `gh run list --json`
   renders a run with no conclusion as `""`, which collapsed under the queue's space-separated
   `read` and made an in-progress `Model soak` run on the head read as building; the queue now

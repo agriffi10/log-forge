@@ -19,6 +19,7 @@ import collections
 import pathlib
 import sys
 import xml.etree.ElementTree as ET
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tests"))
 
@@ -26,6 +27,11 @@ import soak_known
 from model_oracles import FORMS_SOAKED, parse_seeds, rerun_command
 from soak_ceilings import ceiling_of
 from soak_verdict import KNOWN_PREFIX
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from soak_known import Known
 
 # Measured at d9f2f097 on the 4-CPU Linux stand-in: 15,000 soak items took 307.6 s and 284.3 s.
 WINDOW = 5000
@@ -160,7 +166,12 @@ def _seed_of(name: str) -> int:
     return int(name.rsplit("seed", 1)[1].rstrip("]"))
 
 
-def report(xml: pathlib.Path, seeds_value: str) -> tuple[str, int]:
+def report(
+    xml: pathlib.Path,
+    seeds_value: str,
+    known_rows: Sequence[Known] | None = None,
+    ceiling_for: Callable[[str], int] | None = None,
+) -> tuple[str, int]:
     """Returns the run's summary in Markdown and the exit status its floor and ceilings set.
 
     The floor: exactly ``3 x |seeds|`` soak items ran; none was skipped; every expected failure
@@ -171,6 +182,9 @@ def report(xml: pathlib.Path, seeds_value: str) -> tuple[str, int]:
     Args:
       xml: The soak step's JUnit XML.
       seeds_value: The seeds the run was asked for.
+      known_rows: The known rows, the live ``KNOWN`` when ``None``; the report's own tests pass a fixed
+        table, so a clearing pull request's new row changes none of them.
+      ceiling_for: Each row's ceiling, ``soak_ceilings.ceiling_of`` when ``None``.
 
     Returns:
       The Markdown, and 0 or 1.
@@ -228,12 +242,13 @@ def report(xml: pathlib.Path, seeds_value: str) -> tuple[str, int]:
     lines.append(f"- clean: {clean}; known: {known_items}; new: {new_items}")
     lines.append(f"- wiring items passed: {sum(wiring.values())} of {len(WIRING)}")
     status = 0
-    rows = {row.name: row for row in soak_known.KNOWN}
+    rows = {row.name: row for row in (soak_known.KNOWN if known_rows is None else known_rows)}
+    ceiling_of_row = ceiling_of if ceiling_for is None else ceiling_for
     if known:
         lines += ["", "### Known, each an open item of `docs/architecture.md` §12", ""]
         for shape, count in sorted(known.items()):
             row = rows.get(shape)
-            ceiling = ceiling_of(shape)
+            ceiling = ceiling_of_row(shape)
             item = row.item if row is not None else "(no such row)"
             lines.append(f"- {count} x {shape}, ceiling {ceiling}: {item}")
             if row is None:

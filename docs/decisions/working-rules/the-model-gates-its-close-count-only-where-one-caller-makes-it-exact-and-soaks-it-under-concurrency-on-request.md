@@ -89,10 +89,16 @@ dispatch cleared or dodged (SPEC-099's execution-frame review).
 non-writer's arm, or any write between the takes; a known row without an open item; a known row
 that explains Shape A's record; a ceiling in a clearing file; a gating assertion excused as known;
 a window drawn from the clock; a queue that reads the soak from `main`'s head, clears a night by a
-time or a re-run, or lets a dispatch's or a pull request's run block it; or a model switch that
+time, a re-run or a later green night, or lets a dispatch's or a pull request's run block it; or a model switch that
 falls back on a value it cannot parse.
 
 ## History
+
+### 2026-11-25
+
+- **Refined** in SPEC-099's second code round: the queue reads every night in its 30-run window and
+  blocks on the newest unfiled failing one, so a later green night clears nothing; a red night
+  older than the window falls out of it unfiled, which `scripts/pr-queue/PROTOCOL.md` states.
 
 ### 2026-11-24
 
