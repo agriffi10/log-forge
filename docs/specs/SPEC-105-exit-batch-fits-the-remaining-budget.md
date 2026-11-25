@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-105
 title: "Once an Exit Batch Is Delivered, Each Later One Fits the Remaining Shutdown Budget"
 description: "Records the rate of the exit drain's most recent delivered batch and, after every exit batch from then on, delivered or failed, holds the next batch to what that rate fits into the time left before the shutdown() deadline less the join margin, whenever the exit budget's prediction would let that batch start, so a sink healthy or flapping at exit is never handed a batch the prediction did not allow for, and a tight shutdown() completes its join and closes the sink, with no setting, line, tally or Health field added."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-062, SPEC-090]
 ---
 
@@ -86,11 +86,15 @@ keep sharing every rule but this one, which, like the exit budget it serves, exi
   The §12 item stays open for those three, with no closer named.
 - **A failed exit batch whose emit straddled a sink change.** It keeps its target, as `main` has
   it, and the bound is not applied after it.
-- **Keying the rate by sink generation.** After a `retarget` between exit batches, the rate recorded
-  from the old sink stands until the new sink delivers an exit batch, which records its own. A
-  bound applied in between, after the new sink's failed batch, can lower only a target stamped with
-  the old generation, which `_size_target` already reads as zero, so it changes no batch; keying the
-  rate by generation would need a second attribute for no effect (FR-002 holds this).
+- **Keying the rate by sink generation.** No `retarget` can reassign during a `shutdown()`'s exit
+  drain: `_shutdown_worker` bumps `retirements` and claims the stop in one `_state._lock` section,
+  and `retarget` checks `retirements > self._epoch` under `Worker._lock` before its reassign. So
+  the sink-change handling on the exit path is defensive. Were the sink changed between exit
+  batches, the rate recorded from the old sink would stand until the new sink delivers an exit
+  batch, which records its own, and a bound applied in between, after the new sink's failed batch,
+  could lower only a target stamped with the old generation, which `_size_target` already reads as
+  zero, so it would change no batch; keying the rate by generation would need a second attribute
+  for no effect (FR-002 pins this through a stand-in for `retarget`'s locked reassign).
 - **A declined exit batch.** It is not emitted, records nothing and is followed only by declined
   batches while the deadline stands, so no bound is applied after it.
 - **The first exit batch.** Its size is whatever the target read at the stop, and its first attempt
@@ -197,13 +201,14 @@ minimum, so it never raises the kept target; a target that reads zero stays zero
 - [ ] Removing the bound from the failed path makes that test fail: the exit batches are 20, 118,
       118, 118 and 118, and the fifth ends at 0.7265625, past the deadline. This is mutation-tested
       (invariants 3 and 5).
-- [ ] An exit batch that fails across a `retarget`, with a rate recorded and a deadline under which
-      the bound would lower the target, leaves `_target` and `_target_generation` as they were
-      before it. This pins the state rather than an outcome (a stale-generation target reads 0.0
+- [ ] An exit batch that fails across a sink change, made through a stand-in for `retarget`'s
+      locked reassign (`_reassign` in the tests, since `retarget` itself refuses during a
+      `shutdown()`'s exit drain), with a rate recorded and a deadline under which the bound would
+      lower the target, leaves `_target` and `_target_generation` as they were before it. This pins the state rather than an outcome (a stale-generation target reads 0.0
       either way, Out of Scope), so a mutant that drops the generation check is visible
       (invariant 6).
-- [ ] On FR-001's clock (the pre-stop call charged nothing), after a `retarget` between two exit
-      batches, with a rate recorded from the old sink at 0.00390625 s an event, a new sink at
+- [ ] On FR-001's clock (the pre-stop call charged nothing), after a sink change between two exit
+      batches through that stand-in, with a rate recorded from the old sink at 0.00390625 s an event, a new sink at
       0.0078125 s an event, and the new sink's first exit batch failing, `_size_target()` reads 0.0
       before the next exit batch, and after the new sink's first delivered exit batch `_exit_rate`
       reads 128.0, the new sink's rate, not the old sink's 256.0 (invariant 6).
@@ -345,7 +350,7 @@ predicted to end after the deadline is still not work the process gets, and the 
 batch it lets start one that fits. It carries two trades. At a tight budget the sink is handed
 fewer events than the rate rule would, and the join completes; that is the decision's own trade.
 In the last margin before the deadline, a batch today's code delivered by luck is trimmed and its
-tail declined, which Andrew chose on 2026-11-17. It also records that a `retarget` between exit
+tail declined, which Andrew chose on 2026-11-17. It also records that a sink change between exit
 batches costs nothing, since the old sink's rate can lower only a target `_size_target` already
 reads as zero (Out of Scope), so the next reader does not file it.
 
@@ -388,7 +393,7 @@ points at the §12 item.
       guard (serves no invariant: prose hygiene).
 - [ ] Each sentence the §12 item lists as shown false gains a qualification naming what can still
       overrun (a sink that slows during the exit, a retry after a call that failed at once, a first
-      exit batch longer than the budget) and pointing at the §12 item: the `Worker` class
+      exit batch longer than the budget) and pointing at the §12 item: `Worker.__init__`'s
       docstring's "The exit drain fits the caller's budget"; the `_JOIN_MARGIN` docstring's "so an
       attempt permitted by the rule leaves the join time to return"; `_set_target`'s "so an emit
       stays shorter than the time trigger's interval"; `_emit`'s "On the exit drain a retry fits the
@@ -698,3 +703,13 @@ design hands 100 to 110 and declines 20 to 30; at 0.5 s on 3.12.12, today hands 
       128.0, the new sink's rate, not 256.0.
     - Nit: FR-002's straddle criterion now says it pins the state rather than guarding an outcome,
       so a mutant without the generation check is visible.
+- **Build, 2026-11-24.** Two spec defects found by the build, corrected in place:
+  - FR-006 named "the `Worker` class docstring" as the home of "The exit drain fits the caller's
+    budget"; the sentence is in `Worker.__init__`'s docstring, and the criterion now says so (the
+    §12 item's own reference is corrected with it).
+  - FR-002's two `retarget` criteria could not be built as written: no `retarget` can reassign
+    during a `shutdown()`'s exit drain, since `_shutdown_worker` bumps `retirements` and claims
+    the stop in one `_state._lock` section and `retarget` checks `retirements > self._epoch` under
+    `Worker._lock` before its reassign. Both criteria now pin the state through a stand-in for
+    `retarget`'s locked reassign (`_reassign` in the tests), and Out of Scope's *Keying the rate by
+    sink generation* says the sink-change handling on the exit path is therefore defensive.

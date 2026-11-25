@@ -254,11 +254,14 @@ stops, sends whatever was queued at that moment in batches by the same rule, ans
 after the `shutdown()` deadline — judged from the longest call the exit has made so far — that
 batch and every later one are not attempted: they are counted in `failed_batches` and in
 `health().events.batch_lost`, and one stderr line names them, so the exit normally finishes
-inside its budget and the sink is closed. The first batch of the exit is always attempted. The
-prediction assumes no call runs much longer than the longest one so far: a first batch that alone
-takes longer than the budget, a batch the exit has grown since, a retry after a call that failed
-at once, or a sink that turns much slower partway through the exit can still run past the
-deadline, and then `shutdown()` returns at its timeout and leaves the sink open. Once one batch
+inside its budget and the sink is closed. The first batch of the exit is always attempted. Once
+a batch of the exit has been delivered, each later batch is also held to what that batch's rate
+fits in the time left before the deadline, less a 0.1 s margin, so a tight budget hands the sink
+fewer events and still closes it, and a healthy sink's batch does not outgrow the time left. The
+prediction still assumes no call runs much longer than the sink's recent pace: a first batch that
+alone takes longer than the budget, a retry after a call that failed at once, or a sink that turns
+much slower partway through the exit can still run past the deadline, and then `shutdown()`
+returns at its timeout and leaves the sink open. Once one batch
 of the exit has been abandoned, the stderr lines a sink writes for each later batch are folded:
 each distinct line is written once more at the end of the exit, with its summed count and
 `; <k> line(s) folded at exit`, so a sink that died while the process ran writes a few lines at

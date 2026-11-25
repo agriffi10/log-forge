@@ -472,7 +472,7 @@ areas:
         status: "stable"
         path: "docs/decisions/sink-lifecycle/a-value-on-the-wire-is-measured-on-the-clock-that-cannot-move.md"
       - title: "The exit drain declines a retry, or a later batch, predicted to end past the shutdown deadline"
-        fence: "the first attempt of the exit drain's first batch is always made; a retry is declined when the batch's longest attempt plus a 0.1 s join margin is predicted to end past the `shutdown()` deadline, and a later exit batch is declined unattempted once an exit batch has declined a retry or the longest attempt any exit batch has made predicts it would overrun; each declined batch is counted, and the budget is the caller's `timeout`, so there is no knob. (SPEC-062, SPEC-090)"
+        fence: "the first attempt of the exit drain's first batch is always made; a retry is declined when the batch's longest attempt plus a 0.1 s join margin is predicted to end past the `shutdown()` deadline, and a later exit batch is declined unattempted once an exit batch has declined a retry or the longest attempt any exit batch has made predicts it would overrun; once an exit batch is delivered, each later one is held to what that batch's rate fits in the time left less the margin, when the prediction would let it start; each declined batch is counted, and the budget is the caller's `timeout`, so there is no knob. (SPEC-062, SPEC-090, SPEC-105)"
         status: "stable"
         path: "docs/decisions/sink-lifecycle/the-exit-drain-declines-only-a-retry-predicted-to-end-past-the-shutdown-deadline.md"
   - name: "Trace model and context"

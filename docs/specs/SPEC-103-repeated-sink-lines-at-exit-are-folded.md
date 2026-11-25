@@ -69,6 +69,7 @@ or the deadline changes, and no setting is added.
   measured earlier, and predicts its next attempt from the longest one it has seen, so an attempt
   the exit budget never saw can outrun the `shutdown()` deadline and leave the sink open", by
   another session's docs change (branch `s12-exit-slowdown`). SPEC-105 is its spec.
+  > **SPEC-105 closes only that item's first shape**, a sink that recovers by exit; the item stays open in §12 for the rest.
 - **That item's retry-predicate twin.** Take a target measured before the stop, a first exit
   attempt that fails at once, and a slow retry. That shape expires the join at 0.5, 2 and 5 s on
   `main`. The same §12 item records it, with no closer named. It is not this spec's.
