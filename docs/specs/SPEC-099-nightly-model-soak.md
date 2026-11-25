@@ -461,8 +461,11 @@ a soak, the red night is how the owner hears.
         --branch main` lists a completed run, and its summary reads `15000 of 15000`.
       - A `workflow_dispatch` run on `main` with no input is made the day of the merge, and its
         summary is recorded too.
-      - Both are recorded in the delivery doc, with the pytest step's duration, which is at most
-        10 minutes.
+      - Both are recorded, with the pytest step's duration, which is at most 10 minutes. The
+        build's delivery doc is written before the push, so it names them as owed. After the
+        merge the orchestrator makes the dispatch and records it, and the first scheduled night
+        once it has run, in a docs-only follow-up pull request cut from fresh `main`, never
+        stacked on the build's.
 
       A missing scheduled run is a finding for the owner, not a pass.
 - [ ] This FR serves no invariant: it decides when the soak runs and where its verdict goes. What
@@ -515,6 +518,11 @@ YAML parser is a dependency. It asserts:
 - `persist-credentials: false`;
 - every `uses:` pinned to a 40-character SHA with a `# vX.Y.Z` comment, or local;
 - Python `"3.12"`;
+- `timeout-minutes: 30`;
+- that the workflow's `name:` and its file name equal `SOAK_WORKFLOW` and `SOAK_FILE` as
+  `scripts/pr-queue/queue.sh` sets them, read from it as text. Renaming `name: Model soak` alone
+  would otherwise put the soak's runs back into the head's reading, and a red dispatch on the head
+  would read `IS RED` with nothing to say why;
 - that the `pull_request` path filter names, as a literal path, every module of FR-003's derived
   set. The set is read from the AST: every `import` and `from ... import` with no leading dot,
   anywhere in `tests/test_invariants_model.py` and `tests/conftest.py`, whose top-level name is a
@@ -551,7 +559,7 @@ mutation-tested.
       - the window from the run number;
       - the dispatch bound, read before the set is built;
       - the normalised output;
-      - each of the fourteen workflow assertions, including the selection narrowed to
+      - each of the sixteen workflow assertions, including the selection narrowed to
         `test_soak_the_close_count_under_concurrency`, and the derived set read from the two
         roots' direct imports only.
 - [ ] The path-filter check passes against the workflow, and fails, naming the path, when the
@@ -616,8 +624,11 @@ SPEC-086 and its delivery doc are frozen records and are not edited.
       whitespace collapsed: "no workflow sets", "set by no workflow", "run only on request",
       "soak run on request", "run on request", "gating nothing", "gates nothing". The files read
       are `docs/invariants.md`, `docs/architecture.md`, every file under `docs/decisions/`, and
-      every file under `tests/`. None contains any of the phrases except where it is struck
-      through and marked with SPEC-099.
+      every file under `tests/` except `tests/test_model_soak_workflow.py`, which holds the phrase
+      list. A phrase passes only inside a `~~...~~` span of a paragraph that also contains
+      `SPEC-099`, a paragraph being a run of non-blank lines joined as above; anywhere else it
+      fails, naming the file. A corpus asserts that a bare phrase fails, a struck one in a
+      paragraph naming `SPEC-099` passes, and a struck one in a paragraph not naming it fails.
 - [ ] §12's CI item names SPEC-099 for the soak and PR #370 for the hang, and stays under
       `### Open`.
 - [ ] This FR serves no invariant: it is the record.
@@ -679,9 +690,11 @@ not measured.
 **What clears it.** A night is cleared only by its own filing. `tests/soak_known.py` holds
 `FILED_NIGHTS`, one entry per line in the form `    "<run id>-<attempt>": "<§12 lead>",`. A
 night that blocks names its last failing attempt. `soak_verdict` then:
-1. fetches `main` into `origin/main` with `--no-write-fetch-head`, because several worktrees
-   hitting `FETCH_HEAD` at once would race;
-2. reads `tests/soak_known.py` there;
+1. fetches `main` into a private ref, `refs/pr-queue/main`, with `--no-write-fetch-head`, because
+   several worktrees hitting `FETCH_HEAD` at once would race. It never moves `origin/main`: the
+   hook reaches this step, `pre-push` states that the hook never moves a ref, and moving
+   `origin/main` under a session in the middle of a rebase is a known hazard here;
+2. reads `tests/soak_known.py` at `refs/pr-queue/main`;
 3. clears the night only if that attempt's own entry is present.
 
 Nothing else clears a night. A commit touching `tests/soak_known.py` for another night does not
@@ -762,6 +775,11 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
   takes effect only when `install.sh` is run again after the merge. Until then a red scheduled run
   on the head reads `IS RED` and escalates as today, which still blocks.
 
+**Two other descriptions of the queue go stale with this change.**
+`docs/process/operational-traps.md` (its CodeQL upload-stall trap) and
+`.claude/skills/supervise/SKILL.md` (its `ALERT main` entry) describe the queue stopping the line
+on `IS RED` alone. Each gains the soak's `WAIT` and how a night clears.
+
 #### Acceptance Criteria:
 
 - [ ] `scripts/pr-queue-soak-test.sh` runs with a stub `gh` (run lists and per-attempt API answers
@@ -782,6 +800,7 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
       - filings of the blocking attempt, of an earlier attempt and of another run;
       - a filing in a comment, at the wrong indent, and on a local branch only;
       - an unreadable origin, and a peer's filing not yet fetched;
+      - a filing read with `origin/main` and every `refs/remotes/` ref left where they were;
       - `turn` for 22 branch shapes, among them renames onto and off a clearing file, a deletion,
         a mode change, a symlink, a gitlink, paths with a space, both names in one path, a top-level `soak_known.py`, a newline or a glob
         character,
@@ -797,6 +816,11 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
       reddened: a green attempt clearing a red one, and the hook refusing when the verdict cannot
       be read.
 - [ ] `sh scripts/pr-queue-test.sh` and `sh scripts/pr-queue/install-test.sh` still pass.
+- [ ] `docs/process/operational-traps.md` (its CodeQL upload-stall trap, which says the stall is
+      handled as an `IS RED`) and `.claude/skills/supervise/SKILL.md` (its `ALERT main` entry,
+      which says the queue stops the line on `IS RED`) each also say that a failed scheduled night
+      of the soak answers `WAIT` naming the night, and that only that night's filing on `main`
+      clears it.
 - [ ] `PROTOCOL.md` states:
       - which runs count;
       - the attempt rule;
@@ -806,8 +830,9 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
       - that a clearing pull request is written only after Andrew has answered;
       - the three consequences above.
 - [ ] **Owed after the merge:** `install.sh` is run once, and `queue.sh soak-verdict` from the
-      installed directory exits 0, 3 or 4 against the real repository. The delivery doc records
-      both.
+      installed directory exits 0, 3 or 4 against the real repository. The build's delivery doc
+      names both as owed; the orchestrator runs them after the merge and records them in FR-003's
+      docs-only follow-up pull request.
 - [ ] This FR serves no invariant: it is the repository's process, not the library's behaviour.
 
 ---
@@ -842,6 +867,7 @@ class Known:
     name: str
     item: str                # the bold lead of a bullet under ### Open in architecture.md §12
     kind: str                # "repeat" | "late-write"
+    predicate: Callable[[Sequence[SinkEvent], Closes], bool] = field(compare=False)
 
 KNOWN: tuple[Known, ...]
 FILED_NIGHTS: dict[str, str] # "<run id>-<attempt>" -> the §12 lead it was filed under, one a line
@@ -873,7 +899,7 @@ SOAK_WORKFLOW="Model soak"; SOAK_FILE="model-soak.yml"; SOAK_LOOKBACK=30; SOAK_Q
 main_green       # 0 green · 1 RED · 2 building · 3 could not run · 4 the soak's verdict blocks
 head_green       # main_green's old reading of the head, with Model soak's runs left out
 soak_verdict     # 0 · 4 · 3, printing "<state> <run id>[-<attempt>] <time> [filed]"
-filed ID-N       # 0 when origin/main's tests/soak_known.py files that attempt
+filed ID-N       # 0 when tests/soak_known.py at refs/pr-queue/main, fetched first, files that attempt
 clearing_range A B   # 0 when A..B changes only the two clearing files, each left mode 100644
 clearing_branch  # clearing_range from the branch's base on origin/main
 soak_note        # turn's line for a verdict over 48 hours old, or none
@@ -905,6 +931,7 @@ scripts/pr-queue/queue.sh               # changed (FR-006): the soak's verdict, 
 scripts/pr-queue/pre-push               # changed (FR-006): the push check while the verdict blocks
 scripts/pr-queue/PROTOCOL.md            # changed (FR-006)
 scripts/pr-queue-soak-test.sh           # new (FR-006)
+.claude/skills/supervise/SKILL.md       # changed (FR-006): the soak's WAIT and how it clears
 tests/
 ├── model_oracles.py                    # changed: Note, Arm.by, Take.by, owed_between, FORMS_SOAKED
 ├── soak_known.py                       # new (FR-002, FR-006): the shapes and FILED_NIGHTS
@@ -916,6 +943,7 @@ tests/
 docs/
 ├── architecture.md                     # changed by the build: §12's CI item and model item (FR-005)
 ├── invariants.md                       # changed: invariant 5's Guarded line (FR-005)
+├── process/operational-traps.md        # changed (FR-006): the soak's WAIT and how it clears
 ├── decisions/working-rules/the-model-gates-its-close-count-only-where-one-caller-makes-it-exact-and-soaks-it-under-concurrency-on-request.md   # rewritten in place, name kept
 ├── audits/2026-11-14-probes/lifecycle/spec099_rule_corpus.py   # on main since #391; not changed
 ├── audits/2026-11-14-probes/lifecycle/spec099_prototype.patch  # on main since #391, against eda19f32;
@@ -1200,7 +1228,7 @@ said. Twenty-six mutants were planted, one per check, and each is reddened:
 | the newest night only, with no fallback | each "... falls back to a failed one" |
 | a filing of any attempt clears | "filing an earlier attempt does not clear" |
 | the filing's format not held | the comment, the wrong indent, the local branch |
-| `origin/main` not fetched | "filing the blocking attempt clears", and the unreadable origin |
+| `refs/pr-queue/main` not fetched | "filing the blocking attempt clears", and the unreadable origin |
 | an unreadable verdict read as clear by `main-state` | "...and main-state reads it as 3, not clear" |
 | the mode not held | the deletion, the executable, the symlink, the gitlink |
 | the path not held | every non-clearing branch shape |
@@ -1266,6 +1294,21 @@ nothing.
 
 ## Revision history
 
+- **2026-11-24, corrected after the implementation plan**, on the orchestrator's rulings, with the
+  spec In Progress:
+  - FR-006's `filed` step fetches `main` into the private ref `refs/pr-queue/main`, not
+    `origin/main`, so the hook never moves a ref; the Data Model, the mutant row and a new case
+    say so. The stale-branch base check still reads `origin/main`.
+  - FR-005's phrase check skips only `tests/test_model_soak_workflow.py`, which holds the list, and
+    defines "struck and marked" as a `~~...~~` span in a paragraph that names `SPEC-099`, held by
+    a three-row corpus.
+  - The Data Model's `Known` gains its `predicate`, with `field(compare=False)`.
+  - FR-004's workflow guard gains `timeout-minutes: 30` and the workflow's `name:` and file name
+    matching `queue.sh`'s `SOAK_WORKFLOW` and `SOAK_FILE`, making sixteen workflow assertions.
+  - FR-006 names `docs/process/operational-traps.md` and `.claude/skills/supervise/SKILL.md` as
+    changed, with a criterion that each says the soak's `WAIT` and how it clears.
+  - FR-003's and FR-006's after-merge results are named as owed in the delivery doc and recorded
+    by the orchestrator in a docs-only follow-up pull request from fresh `main`.
 - **2026-11-24, re-validated against `d9f2f097`**, after SPEC-087 to SPEC-101 landed. Re-checked
   and still true: the workflow names and crons, `ci.yml`'s concurrency group and pins, the
   install-poetry action, the four wrapped names, the 14-item selection at seeds 0 to 1 and 15
