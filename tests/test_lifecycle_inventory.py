@@ -1179,6 +1179,9 @@ INVENTORY: dict[Key, Row] = {
     ),
     _wk("_exit_batches"): Row("Worker", (_REBUILD,), "exit batches attempted (SPEC-090 FR-003)"),
     _wk("_exit_longest"): Row("Worker", (_REBUILD,), "longest exit attempt (SPEC-090 FR-003)"),
+    _wk("_exit_rate"): Row(
+        "Worker", (_REBUILD,), "rate of the last delivered exit batch (SPEC-105 FR-001)"
+    ),
     _wk("_exit_declining"): Row(
         "Worker", (_REBUILD,), "every later exit batch is declined (SPEC-090 FR-003)"
     ),
