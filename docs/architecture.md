@@ -1523,7 +1523,8 @@ an item leaves this list when a spec closes it, not because the arc names it.
   that item's cap closure is this item's first shape made worse: the first exit batch, never
   declined, becomes 1,000 events. What this item shows false, for the closing spec to qualify: the
   ~~`Worker` class docstring's~~ `Worker.__init__` docstring's (corrected by SPEC-105's build) "The
-  exit drain fits the caller's budget" (`worker.py:787`, the line its `def` opens on), the
+  exit drain fits the caller's budget" (`worker.py:787`; every line number in this sentence is
+  at `6b9d50f6`, as the item's are), the
   `_JOIN_MARGIN` docstring (`:82-85`), `_set_target`'s "an emit stays shorter than the time
   trigger's interval" (`:2879-2881`), `_emit`'s "a retry fits the caller's budget or is not made"
   (`:3288`), the headline of `NATSSink`'s module docstring, "The exit drain fits the join"
@@ -2124,8 +2125,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   invariants 3 and 5). A sink whose last steady batch failed, so the size target read zero at the
   stop, and which was healthy at exit, delivered a 20-event first exit batch quickly; the size
   rule then grew the second to 220 to 250 events, about 0.5 s at 2 ms an event, which the exit
-  budget's prediction, allowing for the first batch's 0.04 s, let start, and at a `shutdown()`
-  budget of 0.45 to 0.65 s the join expired with the sink left open.
+  budget's prediction, allowing for the first batch's 0.04 s, let start; with the failing
+  steady batch returning about 0.2 s into the budget, which left the exit drain the timeout less
+  about 0.2 s, at a `shutdown()` budget of 0.45 to 0.65 s the join expired with the sink left
+  open.
   → **closed by SPEC-105** (2026-11-24): a delivered exit batch records its rate in `_exit_rate`,
   and after every emitted exit batch that did not straddle a sink change, delivered or failed,
   `Worker._fit_exit_target` lowers the target to what that rate fits in the time left less

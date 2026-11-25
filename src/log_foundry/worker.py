@@ -3349,8 +3349,11 @@ class Worker:
         exit batch, :meth:`_fit_exit_target` (SPEC-105) has already held that batch, by its
         size, to what the most recent delivered exit batch's rate fits by the deadline less the
         same margin, as far as its ``batch_size`` submissions allow, and it bounds only when
-        this rule, asked at that moment, would let the batch start, so the two never disagree
-        on whether one starts.
+        this rule, asked at that moment, would let the batch start: the two agree as of the
+        moment the bound is computed, when the previous exit batch returns. This rule is asked
+        again later, before the next batch, so on the real clock a batch the bound has lowered
+        can still be declined here; that costs nothing, since the bound then left the target at
+        least the rate times ``longest``.
 
         Args:
           longest: The longest attempt of the current batch so far, in seconds, or, before a
@@ -3467,9 +3470,10 @@ class Worker:
         the time left (:meth:`_fit_exit_target`). The deadline is read without the lock, as
         :attr:`draining` is read: it is written by :meth:`claim_stop` in the decision that wins
         the stop gate or takes an owed join over (SPEC-068 FR-006), and a stale read costs at
-        most one attempt, which invariant 3's observable already allows. Measured at ``71e42dd``, before the rule, a 0.5 s
-        failing sink under ``shutdown(timeout=1.2)`` made 3 attempts, the join expired and
-        ``close()`` ran 0 times; with it, 2 attempts and one close.
+        most one attempt, which invariant 3's observable already allows. Measured at
+        ``71e42dd``, before the rule, a 0.5 s failing sink under ``shutdown(timeout=1.2)`` made 3
+        attempts, the join expired and ``close()`` ran 0 times; with it, 2 attempts and one
+        close.
 
         A declined retry is counted once in ``failed_batches`` and announced once, with a reason
         distinct from the exhausted wording so a reader can tell "the sink stayed broken" from
