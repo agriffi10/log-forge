@@ -8,8 +8,8 @@
 #              branch rebased BEFORE a queue wait — during which peers merge, by design —
 #              pushed a stale base with `turn`, this hook and CI all reporting green. Prose was
 #              the only guard, and three review frames each found another place it had leaked.
-#   SOAK       while the nightly soak's newest scheduled night has failed and is not filed
-#              (`queue.sh soak-verdict` exits 4, SPEC-099), a push whose commits since the remote's
+#   SOAK       while a scheduled night of the nightly soak in its 30-run window has failed and
+#              is not filed (`queue.sh soak-verdict` exits 4, SPEC-099), a push whose commits since the remote's
 #              main change anything but tests/soak_known.py and docs/architecture.md. It holds
 #              whatever else is red, and fails OPEN only when the verdict cannot be read — `gh`
 #              missing or failing, or a queue it cannot run — as this hook did before it existed.
@@ -201,10 +201,11 @@ done
 # SOAK. Asked once per push, only when a ref reached the base check and passed it. Anything but 4
 # from queue.sh — 0, 3 for a verdict it could not read, 2 for a queue it could not run — leaves
 # the push to the checks above, as before this check existed.
-soakbad=""
+soakbad=""; soaknight=""
 if [ -n "$pushed" ] && [ -x "$Q/queue.sh" ]; then
-  "$Q/queue.sh" soak-verdict >/dev/null 2>&1
+  soakline="$("$Q/queue.sh" soak-verdict 2>/dev/null)"
   if [ $? -eq 4 ]; then
+    soaknight="$(printf '%s' "$soakline" | cut -d' ' -f2,3)"
     while read -r pb psha; do
       [ -n "$pb" ] || continue
       "$Q/queue.sh" clearing-range "$main_sha" "$psha" >/dev/null 2>&1 || soakbad="$soakbad $pb"
@@ -223,9 +224,10 @@ if [ -n "$soakbad" ]; then
 
   Refused ref(s):$soakbad
 
-  The newest scheduled night of the model soak failed: \`$Q/queue.sh soak-verdict\` names it. A
-  branch that files it changes tests/soak_known.py and docs/architecture.md and nothing else, and
-  is written only once Andrew has answered the night's escalation. Protocol: $Q/PROTOCOL.md
+  Blocking night: $soaknight — a scheduled night of the model soak in its 30-run window that
+  failed and is not filed. A branch that files it changes tests/soak_known.py and
+  docs/architecture.md and nothing else, and is written only once Andrew has answered the night's
+  escalation. Protocol: $Q/PROTOCOL.md
 
 MSG
 fi

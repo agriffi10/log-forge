@@ -26,8 +26,8 @@
 - **The record** (FR-005): the build rewrote SPEC-086's working-rules decision in place, keeping its
   file name. It also rewrote invariant 5's *Guarded* line, §12's model item and CI item, and the
   model file's docstrings.
-- **The queue** (FR-006): `scripts/pr-queue/queue.sh` reads the newest scheduled night's verdict
-  from every attempt. It clears a night only by that attempt's `FILED_NIGHTS` entry on
+- **The queue** (FR-006): `scripts/pr-queue/queue.sh` reads every scheduled night in its 30-run
+  window, every attempt of a re-run one, and blocks while one of them failed and is not filed. It clears a night only by that attempt's `FILED_NIGHTS` entry on
   `refs/pr-queue/main`, which it fetches with `--refmap=`. `main-state` answers 4 while a night
   blocks, and `turn`, `acquire` and `pre-push` then admit only a clearing branch.
   `scripts/pr-queue-soak-test.sh` is the queue's corpus, with a stub `gh` that applies the
@@ -53,10 +53,10 @@
 
 ## Verification
 
-- **Gates after the second code round** (the commit on top of `0fd36316`):
+- **Gates after the third code round** (the commit on top of `580f25e2`):
   - All exit 0: ruff, mypy, pytest (13343 passed, 48 skipped, 10 xfailed), spec-lint and its
     corpus, docs-lint, docstring-lint, `pr-queue-test.sh` (23 plants), `install-test.sh` (44 cases)
-    and `pr-queue-soak-test.sh` (174 cases, 40 plants).
+    and `pr-queue-soak-test.sh` (183 cases, 43 plants).
   - Python 3.12.12: 13342 passed with `PYTHONPATH=src`, which child interpreters need to import
     the uninstalled package.
   - zizmor 1.32.0 `--offline` reports the same one low `self-repository` finding on this workflow
@@ -76,6 +76,14 @@
   a clearing pull request's three edits pass SPEC-099's tests whole, and the orphan item's closure
   fails only its row's five predicate rows; an open Dependabot PR's `WAIT` names the remedy; a
   planted `untaken` row explains nothing; an ordinary `turn` costs three `gh` calls, not five.
+  The third code round made the future-edit check structural (the dict and the tuple found through
+  the AST, two filings in turn, the check run on the filed copy behind a recursion guard; 2 of 2
+  Python mutants, a literal anchor reintroduced and the module left out of the nested run), cut
+  the fetches per queue call to one (2 shell plants: the cache line dropped, the verdict read in a
+  subshell again), and validated the bound (1 shell plant). Frame 3's filing scenarios against it:
+  one filing then a second, two filings at once, a filing with a row, the same with its ceiling,
+  each passing SPEC-099's tests and the future-edit check; the closure failing exactly the live
+  row's corpus and the closing test.
 - **Measured runs:**
   - The workflow's soak step at seeds 0 to 99 ran 307 passed and 1 known; the report read
     `300 of 300` and `8 of 8` and exited 0.

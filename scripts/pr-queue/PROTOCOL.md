@@ -236,7 +236,8 @@ with `filed` after it when that attempt is filed. `$Q/queue.sh main-state` print
   requests, the head, the nights). If the API cannot show an attempt, the verdict is unreadable, and
   `turn` waits on it.
 - **Bounded.** Each `gh` call and fetch the verdict makes runs under `timeout` (or `gtimeout`) for
-  20 s, `PR_QUEUE_GH_TIMEOUT` overriding it; an expiry reads as unreadable, so the hook lets the
+  20 s, `PR_QUEUE_GH_TIMEOUT` overriding it (a value that is not a positive whole number, `0`
+  included, reads as 20); an expiry reads as unreadable, so the hook lets the
   push through as it does whenever it cannot read the verdict. Where neither command is installed
   the calls are unbounded, and a hung `gh` holds the push until it returns.
 - **Which conclusions block.** `failure` and `timed_out` block; a timeout may be a hang the guard

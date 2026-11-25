@@ -51,8 +51,8 @@ that does nothing but file that night. The library does not change.
   what the soak needs (FR-004).
 - The record: SPEC-086's decision rewritten in place, §12's items, invariant 5's *Guarded* line and
   the model file's docstring (FR-005).
-- **The PR queue reads the newest scheduled night's verdict**, and lets through only a branch that
-  files that night, in
+- **The PR queue reads the scheduled nights' verdicts**: while a scheduled night in the 30-run
+  window failed and is not filed, it lets through only a branch that files that night, in
   `scripts/pr-queue/queue.sh`, `scripts/pr-queue/pre-push` and `scripts/pr-queue/PROTOCOL.md`
   (FR-006). These are installed copies: the queue in use runs from the directory `install.sh`
   writes under `$HOME`, so the change reaches sessions only when `install.sh` is run again after the
@@ -321,11 +321,15 @@ tests whose job is the live content read it: the live row's predicate corpus, wh
 up by name at test time, `test_no_known_row_explains_shape_a`, the open-item check, the
 ceilings-name-a-row check and the filing-format check over the live file, which accepts a
 populated `FILED_NIGHTS`. `tests/test_soak_future_edits.py` holds this in the default suite: it
-copies the tracked tree, applies a clearing edit (one `FILED_NIGHTS` entry, one new `### Open`
-item, one new `KNOWN` row with a worker-thread predicate) and the orphan item's closing edit (struck
-and moved under `### Resolved`, its row and ceiling removed), runs SPEC-099's test modules against
-each copy in a subprocess, and asserts the first passes whole and the second fails exactly the live
-row's corpus, by name.
+copies the tracked tree, applies two clearing edits in turn (each one `FILED_NIGHTS` entry, one new
+`### Open` item and one new `KNOWN` row with a worker-thread predicate) and, separately, the orphan
+item's closing edit (struck and moved under `### Resolved`, its row and ceiling removed), and runs
+SPEC-099's test modules against each copy in a subprocess, itself included behind a recursion
+guard so a copy that already carries filings runs the future-edit test too. The filing copy passes
+whole; the closing copy fails exactly the live row's corpus and the closing test, whose job is the
+live item, by name. Every edit locates its target through the AST, so it applies to a tree that
+already carries filings and rows, and asserts it changed something: a test matching the clearing
+file's literal text would fail on the first real filing, which a clearing branch cannot repair.
 
 **A row's life.** A known item stays visible: it is counted and listed in every run's summary
 (FR-004). It drops out only when its item closes. A default-suite test reads §12 with SPEC-085's
@@ -713,8 +717,9 @@ nightly escalation is what keeps a night from ageing that far.
 **What a poll costs.** One `gh run list` for the head, one for the nights, and one for the open
 pull requests: three calls for an ordinary `turn`. A one-attempt run's listed conclusion is that
 attempt's own, so it needs no API call; only a re-run night is read attempt by attempt through the
-API, and the trunk is fetched into `refs/pr-queue/main` once per call of the queue, only when a
-failing night is read.
+API, and the trunk is fetched into `refs/pr-queue/main` at most once per call of the queue, only
+when a failing night is read: the verdict runs in the queue's own shell, not a subshell, so the
+fetch it makes is the one `clearing_branch` reuses.
 
 **Re-runs.** `gh run list` reports only a run's latest attempt: measured on run 43801629163, it
 read `attempt=2 conclusion=success`. `gh api .../actions/runs/<id>/attempts/<n>` reports each
@@ -726,7 +731,8 @@ If the API cannot show an attempt, the verdict is unreadable.
 
 Every multi-field line the queue reads from `gh` renders a missing value as `-`, and every `gh`
 call and fetch the verdict makes runs under `timeout` (or `gtimeout`) for 20 s where either
-exists, `PR_QUEUE_GH_TIMEOUT` overriding it; an expiry is unreadable, so the hook fails open
+exists, `PR_QUEUE_GH_TIMEOUT` overriding it (anything but a positive whole number, `0` included,
+reads as 20, since `0` disables GNU `timeout` and a word fails every call); an expiry is unreadable, so the hook fails open
 rather than hang a push. With neither installed the calls are unbounded, which `PROTOCOL.md`
 says.
 
@@ -1410,6 +1416,12 @@ nothing.
 
 ## Revision history
 
+- **2026-11-25, corrected in the third code round** after the execution-frame review: the
+  future-edit check's edits matched the clearing file's literal text and would have failed on the
+  first real filing; they now locate the dict and the tuple through the AST, the clearing scenario
+  files twice and runs the check itself on the filed copy. The queue's verdict runs in its own
+  shell so one call fetches at most once; `PR_QUEUE_GH_TIMEOUT` is validated; the prose that said
+  the newest night decides now says a failed night in the window that is not filed does.
 - **2026-11-25, corrected in the second code round** after the second diff review. The verdict
   scans the whole window and blocks on the newest unfiled failing night, since reading only the
   first night with a verdict let a newer green night clear an older red one; the window's residue
@@ -1533,7 +1545,8 @@ nothing.
   made while the night ran, a cancelled night or a dispatch cleared or dodged the block. FR-006 is
   restructured rather than patched case by case:
   - only scheduled runs carry a verdict;
-  - the newest night with a verdict is read on any sha;
+  - ~~the newest night with a verdict is read on any sha~~ every night in the 30-run window is read
+    on any sha, and the newest failed one not filed blocks (corrected in the second code round);
   - every attempt is read through the API;
   - `failure` and `timed_out` block;
   - only the night's own `FILED_NIGHTS` entry on `main` clears it.

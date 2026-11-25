@@ -12,8 +12,8 @@
 #   queue.sh reap               # drop dead waiters and a dead holder (also runs automatically)
 #   queue.sh main-state         # print and exit with main's state: 0 green · 1 red · 2 building
 #                               #   · 3 could not read · 4 the nightly soak's verdict blocks
-#   queue.sh soak-verdict       # the newest scheduled soak night: "0 none", or
-#                               #   "<state> <run id>-<attempt> <time> [filed]"; exits 0, 3 or 4
+#   queue.sh soak-verdict       # the soak's 30-night window: "4 <night> <time>" for a failed
+#                               #   night not filed, else "0 <night> <time> [filed]" or "0 none"
 #   queue.sh clearing-range A B # 0 when A..B changes only the soak's two clearing files
 #
 # THIS SCRIPT LIVES OUTSIDE THE REPO. Its own directory is the queue, so every session on the
@@ -110,7 +110,8 @@ all_prs() {
 }
 
 # main_green  0 green · 1 RED · 2 building or unsettled · 3 the check could not run · 4 the
-#             nightly soak's newest scheduled night failed and is not filed (SPEC-099). Only 0
+#             nightly soak has a scheduled night in its 30-run window that failed and is not
+#             filed (SPEC-099). Only 0
 #             lets the queue move, so a check that could not run is never read as evidence that
 #             it passed. The head's runs are read first; only when they are clear is the soak's
 #             verdict read, and a verdict that cannot be read is 3.
@@ -174,10 +175,15 @@ SOAK_REF="refs/pr-queue/$MAIN"
 SOAK_LINE=""; SOAK_RC=""
 
 # soak_read  reads soak_verdict once per queue.sh process into SOAK_LINE and SOAK_RC, so turn,
-#            acquire, the note and status all decide on one reading of the night.
+#            acquire, the note and status all decide on one reading of the night. It runs
+#            soak_verdict in this shell, through a temp file, not a $( ) subshell, so the fetch
+#            cache (FETCHED_QUEUE_REF) it sets survives and clearing_branch does not fetch again.
 soak_read() {
   [ -n "$SOAK_RC" ] && return 0
-  SOAK_LINE="$(soak_verdict)"; SOAK_RC=$?
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/queue-soak.XXXXXX")" || { SOAK_LINE="3 unreadable"; SOAK_RC=3; return 0; }
+  soak_verdict > "$tmp"; SOAK_RC=$?
+  SOAK_LINE="$(cat "$tmp")"; rm -f "$tmp"
 }
 
 # soak_verdict  0 nothing blocks · 4 a scheduled night in the window failed and its failing
@@ -249,6 +255,9 @@ soak_verdict() {
 #             failure, which every caller reads as unreadable, and the hook then fails open. With
 #             neither installed the call is unbounded, which PROTOCOL.md says.
 GH_TIMEOUT="${PR_QUEUE_GH_TIMEOUT:-20}"
+# A bound that is not a positive whole number is the default: 0 would disable GNU timeout, and a
+# word would make every bounded call fail, which reads as unreadable forever.
+[ "$GH_TIMEOUT" -gt 0 ] 2>/dev/null || GH_TIMEOUT=20
 bounded() {
   if command -v timeout >/dev/null 2>&1; then timeout "$GH_TIMEOUT" "$@"
   elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$GH_TIMEOUT" "$@"

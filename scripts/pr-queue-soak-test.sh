@@ -454,6 +454,7 @@ if want hook; then
   echo g >> src/x.py; git commit -qam sneak
   check "the holder adds src to its clearing branch" "$(p origin hf)" 1
   has   "  ...refused for the soak" "$(last)" "$S"
+  has   "  ...naming the blocking night" "$(last)" "Blocking night: 101-1 $NOW"
   GH_RUNS_JSON='[{"headSha":"HEAD","status":"completed","conclusion":"failure","workflowName":"CI"}]'; export GH_RUNS_JSON
   check "the same push while another red is on the head" "$(p origin hf)" 1
   has   "  ...still refused for the soak" "$(last)" "$S"
@@ -513,6 +514,38 @@ if want slow; then
     hasnt "  ...saying nothing of the soak" "$o" "nightly soak"
   else
     echo "note  no timeout(1) or gtimeout here: the queue's gh calls are unbounded, as PROTOCOL.md says"
+  fi
+fi
+
+if want fetches; then
+  echo "== fetches: one queue call fetches the queue's ref at most once"
+  fixture fetches
+  GB="$F/gitlog-bin"; mkdir -p "$GB"; REAL_GIT="$(command -v git)"
+  printf '#!/bin/sh\ncase " $* " in *" fetch "*refs/pr-queue/*) echo fetch >> "%s" ;; esac\nexec "%s" "$@"\n' "$F/fetches" "$REAL_GIT" > "$GB/git"
+  chmod +x "$GB/git"
+  night failure; newbranch fx; echo f >> src/x.py; git commit -qam fx
+  : > "$F/fetches"; o="$(PATH="$GB:$PATH" turnout SPEC-1)"
+  check "turn at a 4 on a non-clearing branch" "${o%% *}" 1
+  check "  ...fetches the queue's ref once, not again for the branch" "$(grep -c fetch "$F/fetches")" 1
+  : > "$F/fetches"; Qs ticket SPEC-2 >/dev/null; o="$(PATH="$GB:$PATH" Qs acquire SPEC-2)"; Qs release SPEC-2 >/dev/null
+  check "acquire at a 4 fetches the queue's ref once" "$(grep -c fetch "$F/fetches")" 1
+fi
+
+if want bound; then
+  echo "== bound: PR_QUEUE_GH_TIMEOUT that is not a positive whole number reads as 20"
+  fixture bound
+  TB="$F/timeout-bin"; mkdir -p "$TB"
+  printf '#!/bin/sh\necho "$1" >> "%s"\nshift\nexec "$@"\n' "$F/bounds" > "$TB/timeout"; chmod +x "$TB/timeout"
+  night failure
+  for v in 0 abc "" 7; do
+    : > "$F/bounds"; PATH="$TB:$PATH" PR_QUEUE_GH_TIMEOUT="$v" Qs soak-verdict >/dev/null 2>&1
+    want_b=20; [ "$v" = 7 ] && want_b=7
+    check "PR_QUEUE_GH_TIMEOUT='$v' bounds each call at $want_b" "$(sort -u "$F/bounds" | tr '\n' ' ')" "$want_b "
+  done
+  if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+    # Through the real timeout(1). GNU's refuses a word, so unvalidated every read would be 3;
+    # macOS's reads a word as 0, no bound, so here the bounds rows above are what discriminate.
+    check "PR_QUEUE_GH_TIMEOUT=abc still reads the night" "$(PR_QUEUE_GH_TIMEOUT=abc Qs soak-verdict >/dev/null 2>&1; echo $?)" 4
   fi
 fi
 
@@ -588,8 +621,11 @@ plant "turn on 0 says nothing of a quiet soak" queue.sh 's#green"; soak_note; re
 plant "the unreadable note dropped" queue.sh "s#^    3\*)        echo \"  note: the nightly soak's verdict could not be read\"; return 0 ;;#    3*) return 0 ;;#" note "status: an unreadable verdict says so"
 plant "the override reaching only main_green" queue.sh 's#^  \[ -x "\$Q/main-green" \] && { echo "0 off"; return 0; }#  :#' override "soak-verdict reads it as off" "the hook passes the push"
 plant "a --json field changed" queue.sh 's#--json databaseId,attempt,status#--json databaseId,attempts,status#' "calls verdict" "the soak's scheduled runs, any status" "a failed night blocks"
-plant "the hook not reading the verdict" pre-push 's#^  "\$Q/queue.sh" soak-verdict >/dev/null 2>&1#  false#' hook "the holder adds src to its clearing branch" "a trunk push with src while it blocks" "a push of a path with a space"
-plant "the hook reading main-state instead" pre-push 's#^  "\$Q/queue.sh" soak-verdict >/dev/null 2>&1#  "$Q/queue.sh" main-state >/dev/null 2>\&1#' hook "the same push while another red is on the head"
+plant "the hook not reading the verdict" pre-push 's#^  soakline="\$("\$Q/queue.sh" soak-verdict 2>/dev/null)"#  false#' hook "the holder adds src to its clearing branch" "a trunk push with src while it blocks" "a push of a path with a space"
+plant "the hook reading main-state instead" pre-push 's#queue.sh" soak-verdict 2>/dev/null)"#queue.sh" main-state 2>/dev/null)"#' hook "the same push while another red is on the head"
+plant "the fetch cache dropped" queue.sh 's#^  \[ "\$FETCHED_QUEUE_REF" = 1 \] && return 0$#  :#' fetches "  ...fetches the queue's ref once, not again for the branch" "acquire at a 4 fetches the queue's ref once"
+plant "the verdict read in a subshell again" queue.sh 's#^  soak_verdict > "\$tmp"; SOAK_RC=\$?$#  SOAK_LINE="$(soak_verdict)"; SOAK_RC=$?; echo "$SOAK_LINE" > "$tmp"#' fetches "  ...fetches the queue's ref once, not again for the branch"
+plant "the bound not validated" queue.sh 's#^\[ "\$GH_TIMEOUT" -gt 0 \] 2>/dev/null || GH_TIMEOUT=20$#:#' bound "PR_QUEUE_GH_TIMEOUT='0' bounds each call at 20" "PR_QUEUE_GH_TIMEOUT='abc' bounds each call at 20"
 plant "the hook reading stale refs for the soak" pre-push 's#case " \$stale " in \*" \$branch "\*) ;;#case " $stale " in *" none "*) ;;#' hook "  ...and not the soak's"
 plant "the hook skipping the trunk" pre-push 's#\*) pushed="\$pushed\$branch \$lsha#*) [ "$branch" = "$MAIN" ] || pushed="$pushed$branch $lsha#' hook "a trunk push with src while it blocks"
 plant "reaping not stopped by the verdict" queue.sh 's#^  main_green || return 0$#  main_green; [ $? -eq 1 ] \&\& return 0#' reap "a stale lock is kept while it blocks"
