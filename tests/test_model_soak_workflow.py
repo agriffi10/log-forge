@@ -322,6 +322,39 @@ def check_timeout(text: str) -> list[str]:
     return [] if _lines(text, r"    timeout-minutes: 30") else ["no `timeout-minutes: 30`"]
 
 
+QUEUE = (ROOT / "scripts" / "pr-queue" / "queue.sh").read_text(encoding="utf-8")
+
+
+def check_queue_names(text: str, queue: str = QUEUE, file_name: str = WORKFLOW.name) -> list[str]:
+    """(16) The workflow's ``name:`` and file name are the ones the PR queue reads it by.
+
+    ``scripts/pr-queue/queue.sh`` leaves runs named ``SOAK_WORKFLOW`` out of the head's reading
+    and lists the nights by ``SOAK_FILE``. Renaming ``name: Model soak`` alone would put the
+    soak's runs back into the head's reading, so a red dispatch would read ``IS RED`` with
+    nothing to say why; renaming the file makes the queue's list fail, which waits, loudly.
+
+    Args:
+      text: The workflow's text.
+      queue: ``queue.sh``'s text.
+      file_name: The workflow's file name.
+
+    Returns:
+      One finding per name that disagrees.
+
+    Raises:
+      None.
+    """
+    named = re.search(r"^name: (.+)$", text, re.MULTILINE)
+    soak_workflow = re.search(r'^SOAK_WORKFLOW="([^"]+)"$', queue, re.MULTILINE)
+    soak_file = re.search(r'^SOAK_FILE="([^"]+)"$', queue, re.MULTILINE)
+    findings = []
+    if named is None or soak_workflow is None or named[1] != soak_workflow[1]:
+        findings.append(f"the workflow's name {named and named[1]!r} is not SOAK_WORKFLOW")
+    if soak_file is None or soak_file[1] != file_name:
+        findings.append(f"the workflow's file {file_name!r} is not SOAK_FILE")
+    return findings
+
+
 CHECKS: dict[str, Callable[[str], list[str]]] = {
     "cron": check_cron,
     "dispatch": check_dispatch,
@@ -337,6 +370,7 @@ CHECKS: dict[str, Callable[[str], list[str]]] = {
     "path-filter": check_path_filter,
     "selection": check_selection,
     "timeout": check_timeout,
+    "queue-names": check_queue_names,
 }
 """The workflow checks over its text; check 14, the seeds rule, is held by its own tests."""
 
@@ -390,6 +424,7 @@ _KEY = "test_soak_the_close_count_under_concurrency or test_the_soak_is_wired or
             "6 soak items and []",
         ),
         ("timeout", "timeout-minutes: 30", "timeout-minutes: 60", "timeout-minutes"),
+        ("queue-names", "name: Model soak\n", "name: Model Soak\n", "is not SOAK_WORKFLOW"),
     ],
     ids=[
         "cron",
@@ -408,6 +443,7 @@ _KEY = "test_soak_the_close_count_under_concurrency or test_the_soak_is_wired or
         "filter-drops-soak-verdict",
         "selection-narrowed",
         "timeout",
+        "workflow-renamed",
     ],
 )
 def test_each_workflow_check_can_actually_fail(name: str, old: str, new: str, says: str) -> None:
@@ -421,6 +457,20 @@ def test_each_workflow_check_can_actually_fail(name: str, old: str, new: str, sa
     findings = CHECKS[name](TEXT.replace(old, new))
     assert findings, f"{name} is silent over the planted edit"
     assert any(says in finding for finding in findings), findings
+
+
+def test_the_queue_names_check_reads_the_queues_side_too() -> None:
+    """(16) A ``SOAK_FILE`` or ``SOAK_WORKFLOW`` changed in ``queue.sh`` alone is named too."""
+    assert QUEUE.count('SOAK_FILE="model-soak.yml"') == 1
+    renamed = QUEUE.replace('SOAK_FILE="model-soak.yml"', 'SOAK_FILE="soak.yml"')
+    assert check_queue_names(TEXT, renamed) == [
+        "the workflow's file 'model-soak.yml' is not SOAK_FILE"
+    ]
+    assert QUEUE.count('SOAK_WORKFLOW="Model soak"') == 1
+    renamed = QUEUE.replace('SOAK_WORKFLOW="Model soak"', 'SOAK_WORKFLOW="Soak"')
+    assert check_queue_names(TEXT, renamed) == [
+        "the workflow's name 'Model soak' is not SOAK_WORKFLOW"
+    ]
 
 
 def test_the_derived_set_follows_imports_through_the_modules_they_reach() -> None:
