@@ -244,24 +244,31 @@ reads as unmeasured: the next batch is then the count trigger's.
 
 **A declined exit batch restores the rate rule's target** (diff review frame 2, 2026-11-24). The
 guard is asked when an exit batch returns; the prediction is asked again before the next batch,
-after its items were taken. When the room at the fit lies in `[_exit_longest, _exit_longest + the
-take's time)`, the guard lowers the target, the next batch is declined anyway, and the whole
-declined backlog was cut at the lowered target: 980 events in 49 batches where `main` names 8, on
+after its items were taken. When the room at the fit is at least `_exit_longest` but less than
+`_exit_longest` plus the time from the fit to the next prediction, which can include the take, a
+flush marker's answer or a wait for the GIL, the guard lowers the target, the next batch is
+declined anyway, and the whole declined backlog was cut at the lowered target: 980 events in 49 batches where `main` names 8, on
 both twins. So when an exit batch is declined and a rate is recorded, `_emit_pending` sets the
 target to `min(cap, _exit_rate × flush_interval / 2)`, what `_set_target` gave the batch that
 recorded the rate, with no new attribute. The first declined batch was already taken at the
 lowered target, so the cost is at most one declined batch more than the rate rule's target alone
-cuts the backlog into, in a window narrower than one take: an accepted trade (980 events in 9
-batches). With no rate recorded, a decline leaves the target as it was, as SPEC-090 has it. Two
-cases differ from "the target the fit lowered", read from the code: an empty exit batch after a
-rate is recorded zeroes the target and a later decline restores the rate rule's, which cuts the
-declined backlog into fewer batches and delivers nothing differently; and a caller that changes
-`flush_interval` between exit batches gets the restore at the new interval.
+cuts the backlog into, and only when the room falls in that window, from the fit to the next
+prediction, whose size this spec does not measure: an accepted trade (980 events in 9 batches).
+With no rate recorded, a decline leaves the target as it was, as SPEC-090 has it. The restore can
+also set a target the bound did not lower, read from the code, and each such case changes only
+how a backlog already declined is cut: an empty exit batch after a rate is recorded zeroes the
+target and a later decline restores the rate rule's, which cuts the declined backlog into fewer
+batches; a `flush_interval` a caller changed since the rate was recorded, which the restore reads
+where `_set_target` read the old one; and a forked child's stale rate, which `_reinit_after_fork`
+describes. None delivers an event differently. The cut can differ after a takeover that replaces
+the deadline with `None` following a decline: the rest of the backlog is then delivered, cut at
+the restored target, as `main` cuts it (`[20, 128 × 7, 64]`, where without the restore it is
+`[20, 20, 128 × 7, 44]`).
 
 **The guard's failure is nearly silent.** Since the restore, the guard decides only the size of
 the first declined batch. Without it, or with it weakened to `room > 0`, no event is lost or
 delivered differently and no line appears or disappears; the count of declined batches in the
-existing line moves by one. The two mutants are killed by different criteria. Removing the guard
+existing line moves by at most one. The two mutants are killed by different criteria. Removing the guard
 fails `tests/test_event_ledger_defects.py::test_an_expired_shutdown_leaves_the_batch_in_flight`
 with `lost 960 event(s); 2 exit batch(es) declined unattempted` where it pins 1. The guard weakened
 to `room > 0` passes that test, because `room` is negative once the deadline has passed and the
@@ -294,6 +301,11 @@ events in 3 batches either way; the 0.6 s, 199-span criterion kills it.
       time, the deadline at 0.03125 and 1,000 spans queued, no later exit batch is handed to the
       sink, the declined line names 1,980 events in 2 batches, and the target reads 1000.0. A
       restore made without a recorded rate names 50; this is mutation-tested (invariant 2).
+- [ ] On FR-001's clock (the pre-stop call charged nothing) but at 2**-12 s an event, 4,096 events
+      a second, so the rate rule's 2,048 is above the 1,000-event cap, with the deadline at 0.045
+      and 5,000 spans queued, no later exit batch is handed to the sink, the declined line names
+      9,980 events in 10 batches, and the target reads 1000.0. A restore without the cap names 6;
+      this is mutation-tested (invariants 2 and 3).
 - [ ] On FR-001's clock (the pre-stop call charged nothing) with the deadline at 0.1953125, 500
       spans queued and no time between the fit and the prediction, the room equals the longest
       attempt: the exit batches handed are 20 and 20, the second returning at 0.15625, and the
@@ -778,7 +790,7 @@ design hands 100 to 110 and declines 20 to 30; at 0.5 s on 3.12.12, today hands 
     the repro names 9. FR-003's Description and criteria are rewritten for it: removing the guard
     now fails the ledger test with 2 declined batches, not 48, and gives 9 at the 0.09765625 s
     deadline; the weakened guard is no longer killed by the 0.6 s, 200-span criterion but by a
-    199-span one; the guard's failure moves the declined count by one batch, not dozens; and
+    199-span one; the guard's failure moves the declined count by at most one batch, not dozens; and
     criteria are added for the restore on both twins and for a decline with no rate recorded.
     FR-001's first criterion gains its declined line, 926 events in 8 batches.
   - Fixed: the guard's boundary, `room == _exit_longest`, had no test; FR-003 gains one, and the
@@ -789,3 +801,16 @@ design hands 100 to 110 and declines 20 to 30; at 0.5 s on 3.12.12, today hands 
   - Flagged, not built: an exit batch whose emit the clock cannot see records no rate, and the
     next batch goes out at the cap. Recorded in Out of Scope and in the §12 item as a remainder of
     the first shape, with a candidate closure and no closer named.
+- **Fix review, 2026-11-24.** A review aimed at the restore found it sound and closed its prose:
+  - FR-003 gains a criterion for the restore's cap (2**-12 s an event, deadline 0.045, 5,000
+    spans: 9,980 events in 10 declined batches, target 1000.0; 6 without the cap).
+  - "Moves by one" became "by at most one", since the 0.6 s, 200-span case gives 258 in 3 either
+    way.
+  - "A window narrower than one take" was unmeasured; the window is now stated as the time from
+    the fit to the next prediction, which can include a take, a marker's answer or a GIL wait,
+    with no size claimed.
+  - "Delivers nothing differently" became "delivers no event differently", with the cut a takeover
+    to a `None` deadline can see after a decline.
+  - The targets the restore can set that the bound did not lower now match `_emit_pending`'s
+    docstring at `c749b2bc`: an empty exit batch, a changed `flush_interval` and a forked child's
+    stale rate.

@@ -59,8 +59,8 @@ one-minute load average at 61 at the start and 27 at the end.
 At `d9f2f097`, before the build, the join expired at 0.45 to 0.65 s on 3.13.1 with a second exit
 batch of 222 to 248 events (the §12 item's before-and-after table).
 
-**Mutation runs** at `901b6690`, each mutant scoped to one method and restored from the committed
-bytes:
+**Mutation runs** at `901b6690` (M10 at `c749b2bc`), each mutant scoped to one method and
+restored from the committed bytes:
 
 | Mutant | Killed by, and the reason |
 |---|---|
@@ -73,18 +73,20 @@ bytes:
 | M7 restore removed | the restore test on both twins (980 in 49 against 9) |
 | M8 restore without the rate check | the no-rate decline test (1,980 in 50 against 2) |
 | M9 guard `>=` turned to `>` | the boundary test (`[20, 128]` against `[20, 20]`) |
+| M10 restore without the cap | the cap test (`[(9980, 6)] == [(9980, 10)]`) |
 
 On FR-004 AC3, M3 failed
 `test_a_tight_shutdown_completes_its_join_behind_a_sink_that_recovered_by_exit` on
 `stopped_reason`, `ShutdownTimeout`, with 228 events in flight; the return-time assertion passed
 under the mutant, so it alone could not tell the two apart.
 
-**From the second diff review.** A decline after the guard passed, in a window narrower than one
-take, cut the whole declined backlog at the lowered target (980 events in 49 batches against 8); a
+**From the second diff review.** A decline after the guard passed, when the room at the fit
+exceeded the guard's line by less than the time to the next prediction, cut the whole declined
+backlog at the lowered target (980 events in 49 batches against 8); a
 declined exit batch now restores the rate rule's target, and that case names 9, the accepted
 one-batch trade. The delivered-path test now asserts its declined line exactly (926 in 8), which
 is what lets M1 fail it. An exit batch whose emit the clock cannot see records no rate and is
-flagged as an open remainder in §12, not built.
+flagged as an open remainder in §12, not built. The fix review added the restore's cap test (M10).
 
 ## Verification
 
