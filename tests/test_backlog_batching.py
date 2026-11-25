@@ -436,6 +436,27 @@ def test_the_batching_fields_are_reset_in_the_forked_child(resume: bool) -> None
 
 
 @pytest.mark.parametrize("resume", [True, False])
+def test_the_exit_rate_is_reset_in_the_forked_child(resume: bool) -> None:
+    """SPEC-105 FR-001 AC4: the child's ``_exit_rate`` is 0.0 on both branches, before the split.
+
+    It describes a drain thread that does not exist in the child, as ``_exit_longest`` does.
+    """
+    worker = Worker(_Sink(), batch_size=10, flush_interval=60.0)
+    worker.stop(5.0)
+    assert not worker._thread.is_alive(), "the premise: the parent's drain thread has ended"
+    worker._exit_rate = 256.0
+
+    worker._reinit_after_fork(resume=resume)
+    try:
+        assert worker._exit_rate == 0.0
+    finally:
+        if resume:
+            worker.stop(2.0)
+        worker._thread.join(5.0)
+        assert not worker._thread.is_alive(), "no drain thread outlives the test"
+
+
+@pytest.mark.parametrize("resume", [True, False])
 def test_the_exit_fold_is_emptied_and_reopened_in_the_forked_child(resume: bool) -> None:
     """SPEC-103 FR-001: the child's worker keeps its one table, with no rows, open again."""
     worker = Worker(_Sink(), batch_size=10, flush_interval=60.0)

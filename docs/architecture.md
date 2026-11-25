@@ -1465,6 +1465,36 @@ an item leaves this list when a spec closes it, not because the arc names it.
     exit budgets of about 0.25 and 0.4 s, the join expired in every run; the first review of this
     item also saw it expire at 0.65 and complete at 0.8 (0.71 to 0.72 s, with 16 exit batches
     declined). At 30 s it completes in 8.19 to 8.24 s with 3,982 events handed.
+    → **This shape is closed by SPEC-105**: once an exit batch is delivered, its rate is recorded,
+    and after every emitted exit batch that did not straddle a sink change the next is held to what
+    that rate fits in the time left less `_JOIN_MARGIN`, when the prediction would let it start
+    (`Worker._fit_exit_target`; *The exit drain declines a retry, or a later batch, predicted to
+    end past the shutdown deadline*, `docs/decisions/sink-lifecycle/`). Measured with
+    `docs/audits/2026-11-14-probes/core-pipeline/spec103_recovered_slow_exit.py 2 2000 <t>`, the
+    same shape from SPEC-103's probe (the pre-stop batch released 0.2 s into the budget, then 2 ms
+    an event), two runs a cell, before on 3.13.1 and after on 3.12.12 and 3.13.1 (figures are
+    observed ranges; the after runs shared the machine with other sessions, load average 27 to 61):
+
+    | `shutdown` timeout | Before, at `d9f2f097` | After, at `e46c367c` |
+    |---|---|---|
+    | 0.45 s | join expired; second exit batch 222 to 236 events | completes in 0.34 to 0.35 s; second batch 36 to 44 |
+    | 0.5 s | join expired; 224 to 248 | completes in 0.38 to 0.39 s; 56 to 62 |
+    | 0.6 s | join expired; 224 to 232 | completes in 0.47 to 0.51 s; 100 to 120 |
+    | 0.65 s | join expired; 228 to 240 | completes in 0.50 to 0.53 s; 116 to 128 |
+    | 2.0 s | 1.69 to 1.72 s; 738 to 750 events handed | 1.67 to 1.71 s; 708 to 734 |
+    | 30 s | 8.23 s; 3,982 handed | 8.30 to 8.32 s; 3,982 |
+
+    **A remainder of this shape stays open: an exit batch whose emit the clock cannot see**
+    (found by SPEC-105's second diff review, 2026-11-24; read from the code at `901b6690`, not
+    measured). A delivered exit batch records its rate only when `elapsed` is above zero; one
+    whose `elapsed` reads zero or below records none, and `_set_target` reads that as the cap.
+    On a monotonic clock coarser than a fast small exit batch's emit, that batch reads zero
+    elapsed, records no rate, and the next batch goes out at the cap with no bound, which is
+    this shape again for a fast sink. How coarse the clock is depends on the platform; a reader
+    can see it with `time.get_clock_info('monotonic').resolution`. A candidate closure is to keep
+    the previous rate when `elapsed <= 0`, which closes it for every exit batch but the first,
+    which stays unmeasured. No closer is named.
+
   - **A sink that slows during the exit** (`<start> slowdown 2000 <t>`: ten events a request, each
     request 0.5 ms for the first two exit calls and 0.3 s after). Fast requests grow the batches
     to the 1,000-event cap, so the first slow one is 100 requests, about 30 s. With the target
@@ -1503,7 +1533,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
   3,982 at 2 s). It also keeps the zero target the dead-sink item above would read as the cap, and
   that item's cap closure is this item's first shape made worse: the first exit batch, never
   declined, becomes 1,000 events. What this item shows false, for the closing spec to qualify: the
-  `Worker` class docstring's "The exit drain fits the caller's budget" (`worker.py:787`), the
+  ~~`Worker` class docstring's~~ `Worker.__init__` docstring's (corrected by SPEC-105's build) "The
+  exit drain fits the caller's budget" (`worker.py:787`; every line number in this sentence is
+  at `6b9d50f6`, as the item's are), the
   `_JOIN_MARGIN` docstring (`:82-85`), `_set_target`'s "an emit stays shorter than the time
   trigger's interval" (`:2879-2881`), `_emit`'s "a retry fits the caller's budget or is not made"
   (`:3288`), the headline of `NATSSink`'s module docstring, "The exit drain fits the join"
@@ -1513,15 +1545,18 @@ an item leaves this list when a spec closes it, not because the arc names it.
   decision *A backlog drains in larger batches, and capacity is not a setting*, whose emit stays
   inside the interval, and the sink-lifecycle decision on the exit decline, whose trade names only
   a prediction that runs long. The README and the pending v1.2.1 notes are qualified in the same
-  change that files this item. **Closed by**, for the first shape, SPEC-105 (Draft, paused by
-  Andrew on 2026-11-17 until SPEC-103's rewrite settles), which chose the fit bound and is to be
-  revised against the folded SPEC-103;
-  the second and third shapes, and a sink slow from its very first exit call, have no closer yet:
-  a bound on the whole call, a per-call deadline handed to the sink, not a per-request timeout,
-  since each request here is well inside any. SPEC-105's text still names this item by the title
-  SPEC-103's growth branch gave it, "A sink that recovers by exit can be handed a second exit
-  batch whose attempt the exit budget did not predict" (SPEC-103's fold Draft did at `047cadce`;
-  its revision `5f6c9dea` uses this title).
+  change that files this item. SPEC-105 added a qualification at each of these sites, since
+  none carried one, naming what can still overrun (a sink that slows during the exit, a retry
+  after a call that failed at once, a first exit batch longer than the budget) and pointing
+  here, and narrowed the README's and the v1.2.1 notes' caveat to those, dropping "a batch the
+  exit has grown since". **Closed by**, for the first shape, SPEC-105 (landed: the fit bound,
+  marked closed above, except its remainder, and recorded under *Resolved*). The item stays open
+  for the first shape's remainder, the second and third shapes, and a sink slow from its very
+  first exit call, which have no closer yet; for the last three the candidate is a bound on the
+  whole call, a per-call deadline handed to the sink, not a per-request timeout,
+  since each request here is well inside any. ~~SPEC-105's text still names this item by the
+  title SPEC-103's growth branch gave it~~ — SPEC-105 was revised on 2026-11-24 and names this
+  item by this title.
 - ~~**A `NATSSink` whose abandoned-publish latch is armed refuses every round of the worker's at once, so a stall a little longer than one `publish_timeout` loses every batch the drain makes during it, and at the stop the whole backlog**~~ → **closed by SPEC-104**; struck and moved under *Resolved*.
 - **An owned core `NATSSink` whose abandoned publish leaves its buffer undrained refuses at once,
   through the PING latch, every caller that arrives after the abandoning round returned** (found
@@ -2096,6 +2131,24 @@ an item leaves this list when a spec closes it, not because the arc names it.
   of the 0.01 s window.
 
 ### Resolved
+
+- ~~**The exit drain sizes a batch from a rate it measured earlier…: a sink that recovers by exit**~~
+  (the first of that open item's three shapes, above; found by SPEC-103's spec review, 2026-11-17;
+  invariants 3 and 5). A sink whose last steady batch failed, so the size target read zero at the
+  stop, and which was healthy at exit, delivered a 20-event first exit batch quickly; the size
+  rule then grew the second to 220 to 250 events, about 0.5 s at 2 ms an event, which the exit
+  budget's prediction, allowing for the first batch's 0.04 s, let start; with the failing
+  steady batch returning about 0.2 s into the budget, which left the exit drain the timeout less
+  about 0.2 s, at a `shutdown()` budget of 0.45 to 0.65 s the join expired with the sink left
+  open.
+  → **closed by SPEC-105** (2026-11-24): a delivered exit batch records its rate in `_exit_rate`,
+  and after every emitted exit batch that did not straddle a sink change, delivered or failed,
+  `Worker._fit_exit_target` lowers the target to what that rate fits in the time left less
+  `_JOIN_MARGIN`, when the prediction would let the next batch start. Before and after are the
+  table under the open item's first shape: the join expired at 0.45 to 0.65 s at `d9f2f097` and
+  completes at all four at `e46c367c`, on 3.12.12 and 3.13.1, with the 2 s and 30 s drains as
+  they were. The item itself stays open for its second and third shapes, and for this shape's
+  remainder, an exit batch whose emit the clock cannot see.
 
 - ~~**`SNSSink` cannot write an SNS FIFO topic**~~ (SPEC-095, Out of Scope; invariant 7). `SNSSink`
   sends no `MessageGroupId`: each entry is an `Id` and a `Message` alone (`sinks/sns.py:495-501`

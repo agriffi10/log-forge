@@ -82,7 +82,13 @@ writes the ``_diag`` line, answers the flush markers and leaves :meth:`Worker._r
 this to its prediction of when a retry would end, and :meth:`Worker._emit_pending` to its
 prediction of when a later exit batch's first attempt would end (SPEC-090 FR-003), both through
 :meth:`Worker._retry_declined`, so an attempt permitted by the rule leaves the join time to
-return. It is that window and nothing more: it reserves no time for ``close()``,
+return — qualified (SPEC-105): when the attempt is no longer than the prediction assumed.
+:meth:`Worker._fit_exit_target` subtracts the margin too, holding a batch the prediction lets
+start to what the recorded exit rate fits by the deadline less it, so a batch the exit has grown
+no longer outruns it; a sink that slows during the exit, a retry after a call that failed at
+once, and a first exit batch longer than the budget still can (``architecture.md`` §12, "The
+exit drain sizes a batch from a rate it measured earlier…"). It is that window and nothing
+more: it reserves no time for ``close()``,
 which the lifecycle owner runs inline after the join whatever the budget, and it is a module
 constant rather than a parameter because a knob would let a caller recreate the overrun the
 budget exists to remove. ``_retry_declined`` reads it at each decision rather than binding it
@@ -795,7 +801,13 @@ class Worker:
         shutdown once-only flag, since ``shutdown`` may be called concurrently by ``atexit``
         and user code.
 
-        **The exit drain fits the caller's budget** (SPEC-062 FR-001). ``_exit_deadline`` is
+        **The exit drain fits the caller's budget** (SPEC-062 FR-001) — qualified (SPEC-105): as
+        far as each attempt is no longer than the exit budget predicts. Once an exit batch is
+        delivered, each later one is held to what its rate fits in the time left
+        (:meth:`_fit_exit_target`); a sink that slows during the exit, a retry after a call that
+        failed at once, and a first exit batch longer than the budget can still overrun it
+        (``architecture.md`` §12, "The exit drain sizes a batch from a rate it measured
+        earlier…"). ``_exit_deadline`` is
         the ``shutdown()`` caller's deadline as a ``time.monotonic()`` instant, ``None`` for an
         unbounded one, and it is written by :meth:`claim_stop` in the same decision that wins
         the once-only gate — so the caller whose timeout the join uses is always the caller
@@ -835,7 +847,10 @@ class Worker:
         so a measurement that straddled a swap is discarded without holding a reference to the
         sink it replaced, which keeps ``_FORK_SKIP`` unchanged. **The exit budget's state**
         (FR-003): ``_exit_batches`` counts the exit batches whose first attempt was made,
-        ``_exit_longest`` is the longest attempt any of them made, ``_exit_declining`` records
+        ``_exit_longest`` is the longest attempt any of them made, ``_exit_rate`` the rate in
+        events a second of the most recent delivered exit batch, ``0.0`` when none is recorded,
+        which :meth:`_fit_exit_target` holds the next batch to (SPEC-105 FR-001),
+        ``_exit_declining`` records
         that an exit batch declined a retry or that one was declined, and
         ``_exit_abandoned_seen`` that the first abandoned exit batch has written its own line,
         all drain thread only; ``_abandoned_tally`` and ``_declined_tally`` are the
@@ -937,6 +952,7 @@ class Worker:
         self._sink_generation = 0
         self._exit_batches = 0
         self._exit_longest = 0.0
+        self._exit_rate = 0.0
         self._exit_declining = False
         self._exit_abandoned_seen = False
         self._abandoned_tally = (0, 0)
@@ -991,7 +1007,20 @@ class Worker:
         drain thread starts with an empty batch, and ``_target`` to zero so the child's first
         batch under a backlog is the count trigger's, measured afresh against the child's sink.
         The exit fields and both tallies go to their unstarted values, so a child neither
-        declines against nor announces an exit the parent was making, and ``_exit_fold`` is
+        declines against nor announces an exit the parent was making; ``_exit_rate`` among them
+        goes to ``0.0`` before the resume split, beside ``_exit_longest``, so a child starts with
+        no rate of a parent's exit (SPEC-105 FR-001). Not quite never: a fork from inside an exit
+        batch's ``emit`` on the drain thread leaves the child a copy of that thread, which
+        returns from the forking ``emit`` after this reset. It writes ``_exit_longest`` from the
+        parent's batch, as it already could, and ``_exit_rate`` only when ``failed_batches``
+        reads the same after that emit as before it: the reset zeroed the child's count, so that
+        is only when the parent had counted no failed batch before the emit, and otherwise the
+        batch reads as failed and records no rate. Such a rate is read only while a deadline
+        stands: by :meth:`_fit_exit_target`, which only lowers a target, and by a declined
+        batch's restore in :meth:`_emit_pending`, which can raise one to the rate rule's from
+        that rate, but only once every later batch is declined, so it changes only how the
+        declined backlog is cut. The stale longest only declines sooner. Neither can make the
+        child overrun a budget. ``_exit_fold`` is
         emptied and reopened in place (SPEC-103), by the time ``_fork`` has already withdrawn the
         fold window the forking thread may have had open. ``_sink_generation`` is
         **not** reset: the child inherits it harmlessly, as it inherits ``sink``, and
@@ -1112,6 +1141,7 @@ class Worker:
         self._target_generation = self._sink_generation
         self._exit_batches = 0
         self._exit_longest = 0.0
+        self._exit_rate = 0.0
         self._exit_declining = False
         self._exit_abandoned_seen = False
         self._abandoned_tally = (0, 0)
@@ -2740,7 +2770,10 @@ class Worker:
         anything: it is no attempt, and declining it would count a failed batch of nothing.
 
         **An abandoned exit batch leaves the target as it was** (SPEC-090 FR-001 rule 4, diff
-        review, 2026-11-16), as a declined one does. On the steady drain a failure resets the
+        review, 2026-11-16), as a declined one does until a rate is recorded (a declined one then
+        restores the rate rule's target, below) — refined by SPEC-105 FR-002: it keeps the
+        target rather than resetting it, and then, once a rate is recorded, the bound below
+        lowers what it kept to the time now left. On the steady drain a failure resets the
         target so a failing sink is retried with small batches while it may recover; at exit
         nothing waits for it to recover, and resetting there cut the rest of a dead sink's
         backlog into ``batch_size`` submissions each. Every such batch costs the sink's own
@@ -2762,9 +2795,46 @@ class Worker:
         join records its own deadline (:meth:`claim_stop`), which can be ``None`` after a batch
         was declined, and the decline line would then claim a deadline there is not (diff
         review, 2026-11-16). A declined batch was not emitted and leaves the target as it was,
-        so the batches the rest of the backlog is cut into are the rule's. The size is summed
-        from the list rather than read from ``_pending_events``, so the measurement holds on any
-        path that appends without :meth:`_take`.
+        so the batches the rest of the backlog is cut into are the rule's — refined by SPEC-105:
+        once a rate is recorded it restores the rate rule's target instead, below. The size is
+        summed from the list rather than read from ``_pending_events``, so the measurement holds
+        on any path that appends without :meth:`_take`.
+
+        **After an exit batch the next is held to what fits the time left** (SPEC-105). The
+        prediction assumes the next attempt is no longer than the longest seen, and the rate
+        rule makes no such promise: after a short delivered exit batch it grew the next to many
+        times its length, which the prediction let start and which outran the deadline. So a
+        delivered exit batch records its rate, ``size / elapsed``, in ``_exit_rate`` (FR-001),
+        or ``0.0`` when ``elapsed`` is zero or below, a clock that cannot see the emit and whose
+        rate is unbounded, or when the emit straddled a sink change and measured a sink no
+        longer installed; a failed one leaves the rate as it was. Then, after ``_set_target``
+        for a delivered exit batch, and after a failed one whose emit did not straddle a sink
+        change (FR-002), :meth:`_fit_exit_target` lowers the target to what that rate fits in
+        the time left before the deadline less ``_JOIN_MARGIN``, when the prediction would let
+        the next batch start (FR-003). A failed exit batch that straddled a change keeps its
+        target as it was.
+
+        **A declined exit batch restores the rate rule's target the bound lowered** (diff
+        review, 2026-11-24). The guard is asked when an exit batch returns and the prediction
+        here, after the next batch's items were taken, so the guard can pass and the batch still
+        be declined; on the real clock any time between the two can do it. That batch was
+        already taken at the lowered target, but every later one is declined too, so the decline
+        sets the target back to ``min(cap, _exit_rate * flush_interval / 2)``, which is exactly
+        what :meth:`_set_target` gave the batch that recorded the rate, the same expression in
+        the same order, and the rest of the backlog is cut at the rate rule's target: at most one
+        declined batch more than that target alone would cut the same backlog into, where
+        without the restore it went out in ``batch_size``-submission batches. Measured on
+        SPEC-105's fake clock: 9 declined batches, against 8 at the rate rule's target and 49
+        without the restore. With no rate recorded the decline leaves the target as it was, as
+        SPEC-090 has it. The restore can also set a target the bound did not lower, and each such
+        case changes only how a backlog already declined is cut: one an empty exit batch zeroed
+        after the rate was recorded, which it cuts into fewer batches; a ``flush_interval`` a
+        caller changed since that rate was recorded, which the restore reads where
+        :meth:`_set_target` read the old one; and a forked child's stale rate, which
+        :meth:`_reinit_after_fork` describes. The bound acts only on an exit batch, so
+        :meth:`_drain` and :meth:`_final_drain` share every other rule here: the batch ahead of a
+        flush marker and the exit drain's last batch all reach it through this method, on the
+        1.x ``emit`` loop and the delivery engine alike.
 
         Args:
           pending: The accumulated event-lists, cleared in place.
@@ -2791,6 +2861,10 @@ class Worker:
             and (self._exit_declining or self._retry_declined(self._exit_longest))
         ):
             self._decline_exit_batch(size)
+            if self._exit_rate > 0:
+                self._target = min(
+                    float(_BACKLOG_BATCH_CAP), self._exit_rate * self.flush_interval / 2
+                )
             pending.clear()
             self._pending_events = 0
             return
@@ -2805,8 +2879,14 @@ class Worker:
         self._pending_events = 0
         failed = self.failed_batches != before
         if exit_batch and failed:
+            if generation == self._sink_generation:
+                self._fit_exit_target()
             return
         self._set_target(size, elapsed, failed=failed, generation=generation)
+        if exit_batch:
+            measured = elapsed > 0 and generation == self._sink_generation
+            self._exit_rate = size / elapsed if measured else 0.0
+            self._fit_exit_target()
 
     def _size_target(self) -> float:
         """The size target a batch reads now, in events (SPEC-090 FR-001 rule 4).
@@ -2898,14 +2978,23 @@ class Worker:
         Zero when the batch was counted in ``failed_batches``, when the sink generation moved
         while it was emitted, or when it held no events: the next batch is then the count
         trigger's. An exit batch counted in ``failed_batches`` never reaches here:
-        :meth:`_emit_pending` leaves the target as it was, as for a declined one. The cap when
+        :meth:`_emit_pending` leaves the target as it was, as for a declined one until a rate is
+        recorded; once one is, it lowers the kept target to the time left, and a declined one
+        restores this method's target from that rate (SPEC-105). The cap when
         ``elapsed`` is zero or negative: an emit the clock cannot see took less than its
         resolution, which is the limit of an unbounded rate, and the cap is
         what bounds that limit; keeping the previous target instead would let a frozen clock pin
         whatever it last measured, and dividing by zero on this thread would end it. Otherwise
         ``min(cap, events / elapsed * flush_interval / 2)``: half an interval of the sink's own
         rate, so an emit stays shorter than the time trigger's interval and a per-event sink
-        settles near half an interval's worth rather than growing its calls.
+        settles near half an interval's worth rather than growing its calls — qualified
+        (SPEC-105): while the sink keeps the rate it was measured at. On the exit drain this
+        target is then lowered, never raised, to what the most recent delivered exit batch's
+        rate fits in the time left (:meth:`_fit_exit_target`, called by :meth:`_emit_pending`,
+        also after a failed exit batch). A sink that slows during the exit, a retry after a
+        call that failed at once, and a first exit batch longer than the budget can still
+        overrun (``architecture.md`` §12, "The exit drain sizes a batch from a rate it measured
+        earlier…").
 
         Args:
           events: The events the batch held.
@@ -2927,6 +3016,70 @@ class Worker:
         else:
             self._target = min(cap, events / elapsed * self.flush_interval / 2)
         self._target_generation = generation
+
+    def _fit_exit_target(self) -> None:
+        """Lowers the size target to what the recorded exit rate fits in the time left (SPEC-105).
+
+        **The rule.** :meth:`_emit_pending` calls this after every emitted exit batch whose emit
+        did not straddle a sink change, delivered or failed. While the deadline is not ``None``
+        and ``_exit_rate`` holds a rate, ``room`` is ``deadline - now - _JOIN_MARGIN`` and the
+        target becomes at most ``_exit_rate * room``: at the rate of the most recent delivered
+        exit batch, the next batch's attempt then ends by the deadline less the margin. So a
+        batch the prediction in :meth:`_retry_declined` lets start fits the budget by its size,
+        rather than by that prediction's assumption that it is no longer than the longest
+        attempt seen, which the rate rule in :meth:`_set_target` does not keep: after a short
+        delivered exit batch it grew the next to many times its length, and a ``shutdown()``
+        whose budget it outran left the sink open (invariants 3 and 5). The bound only ever
+        lowers the target, so it never raises one a failed exit batch kept, and a target that
+        reads zero stays zero. It leaves ``_target_generation`` as it was, so a target stamped
+        with an older sink generation, which :meth:`_size_target` reads as zero, stays unread
+        however far it is lowered; that is why a ``retarget`` between exit batches, whose old
+        rate stands until the new sink delivers an exit batch, changes no batch. The deadline
+        is read without the lock, as :meth:`_retry_declined` reads it, and ``_JOIN_MARGIN`` is
+        read at each call, so a test can patch it.
+
+        **The guard is the one whose failure would be silent** (FR-003). The target is lowered
+        only when ``room`` is at least ``_exit_longest``, which is when the prediction, asked
+        now, would let the next exit batch start. Below that line the next batch is declined
+        unattempted whatever its size, so a smaller target buys nothing and would cut the
+        declined backlog into more batches: past the deadline ``room`` is negative, and a bound
+        applied there drove the target to zero or below, so the backlog went out in
+        ``batch_size``-submission batches and the declined line named dozens where it names
+        one. Above the line the bound is positive whenever ``_exit_longest`` is, so it never sets
+        the zero that :meth:`_set_target`'s rule reads as unmeasured. Without the guard, or with
+        it weakened to ``room > 0``, no event is lost or delivered differently; only the count of
+        declined batches in the existing line changes, which is why each mutant has a test.
+        The guard agrees with the prediction only at this moment: the prediction is asked again
+        before the next batch, after its items were taken, so a batch the guard admitted can
+        still be declined, already cut at the lowered target. :meth:`_emit_pending` then
+        restores the rate rule's target, so the batches behind it are cut as they would have
+        been, and since that restore the guard decides only the size of the first declined
+        batch.
+
+        **Its limits.** It trusts the recorded rate, so a sink that slows during the exit, a
+        retry predicted from a call that failed at once, and a first exit batch longer than the
+        budget can still overrun (``architecture.md`` §12, "The exit drain sizes a batch from a
+        rate it measured earlier…"). A batch is never fewer than ``batch_size`` submissions, so
+        when those carry more events than the bound allows, the batch is longer than it. In the
+        last ``_JOIN_MARGIN`` before the deadline it trims a batch that would have been started
+        and, by luck, delivered whole, and the prediction declines the tail, counted and
+        announced: the margin is the rule everywhere at exit (Andrew, 2026-11-17).
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        deadline = self._exit_deadline
+        if deadline is None or self._exit_rate <= 0:
+            return
+        room = deadline - time.monotonic() - _JOIN_MARGIN
+        if room >= self._exit_longest:
+            self._target = min(self._target, self._exit_rate * room)
 
     def _answer_marker(self, pending: list[list[dict[str, object]]], marker: _FlushMarker) -> None:
         """Emits the batch ahead of a flush marker, then answers it (SPEC-090 FR-002).
@@ -3236,6 +3389,17 @@ class Worker:
         read at each call, so a test can patch it to prove it is added; the deadline is read
         without the lock, as :meth:`_emit` documents.
 
+        The prediction assumes the next attempt is no longer than ``longest``. Before a later
+        exit batch, :meth:`_fit_exit_target` (SPEC-105) has already held that batch, by its
+        size, to what the most recent delivered exit batch's rate fits by the deadline less the
+        same margin, as far as its ``batch_size`` submissions allow, and it bounds only when
+        this rule, asked at that moment, would let the batch start: the two agree as of the
+        moment the bound is computed, when the previous exit batch returns. This rule is asked
+        again later, before the next batch and after its items were taken, so a batch the bound
+        has lowered can still be declined here, already cut at the lowered target. The decline
+        then restores the rate rule's target (:meth:`_emit_pending`), so every later declined
+        batch is cut at it, and the disagreement costs at most one declined batch.
+
         Args:
           longest: The longest attempt of the current batch so far, in seconds, or, before a
             later exit batch, the longest attempt any exit batch has made.
@@ -3343,12 +3507,18 @@ class Worker:
         attempt rather than the last or the mean because a sink whose attempts vary — 0.1 s,
         0.8 s, 0.3 s — can run the next for as long as it ever has, and a prediction from a
         shorter one lets the join expire with the sink left open, which is the outcome the
-        budget exists to prevent. The deadline is read without the lock, as :attr:`draining` is
-        read: it is written by :meth:`claim_stop` in the decision that wins the stop gate or
-        takes an owed join over (SPEC-068 FR-006), and a stale read costs at most one attempt, which
-        invariant 3's observable already allows. Measured at ``71e42dd``, before the rule, a 0.5 s
-        failing sink under ``shutdown(timeout=1.2)`` made 3 attempts, the join expired and
-        ``close()`` ran 0 times; with it, 2 attempts and one close.
+        budget exists to prevent. Qualified (SPEC-105): the retry fits only as far as it is no
+        longer than the prediction from this batch's longest attempt, so a retry after a call
+        that failed at once can still overrun, as can a sink that slows during the exit or a
+        first exit batch longer than the budget (``architecture.md`` §12, "The exit drain sizes
+        a batch from a rate it measured earlier…"); a later exit batch is held by its size to
+        the time left (:meth:`_fit_exit_target`). The deadline is read without the lock, as
+        :attr:`draining` is read: it is written by :meth:`claim_stop` in the decision that wins
+        the stop gate or takes an owed join over (SPEC-068 FR-006), and a stale read costs at
+        most one attempt, which invariant 3's observable already allows. Measured at
+        ``71e42dd``, before the rule, a 0.5 s failing sink under ``shutdown(timeout=1.2)`` made 3
+        attempts, the join expired and ``close()`` ran 0 times; with it, 2 attempts and one
+        close.
 
         A declined retry is counted once in ``failed_batches`` and announced once, with a reason
         distinct from the exhausted wording so a reader can tell "the sink stayed broken" from

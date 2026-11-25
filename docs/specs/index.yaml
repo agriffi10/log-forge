@@ -703,7 +703,7 @@ specs:
   - id: "SPEC-105"
     title: "Once an Exit Batch Is Delivered, Each Later One Fits the Remaining Shutdown Budget"
     description: "Records the rate of the exit drain's most recent delivered batch and, after every exit batch from then on, delivered or failed, holds the next batch to what that rate fits into the time left before the shutdown() deadline less the join margin, whenever the exit budget's prediction would let that batch start, so a sink healthy or flapping at exit is never handed a batch the prediction did not allow for, and a tight shutdown() completes its join and closes the sink, with no setting, line, tally or Health field added."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-062", "SPEC-090"]
     path: "docs/specs/SPEC-105-exit-batch-fits-the-remaining-budget.md"
 arcs:

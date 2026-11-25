@@ -316,7 +316,11 @@ is the generic hazard of forking while another thread holds a lock the caller's 
 (a `close()` during a backoff), `tests/test_sinks_nats_liveness.py` (every `NATSSink` wait, the
 backstop and the latch, SPEC-061), `tests/test_sinks_nats_matrix.py` (those waits and both latches
 as a mutation-gated corpus, including the next and the queued caller's latency), `tests/test_worker_exit_budget.py` (the exit drain's
-retries fit the `shutdown()` budget, SPEC-062), `tests/test_concurrent_configure.py` (a
+retries fit the `shutdown()` budget, SPEC-062 — qualified: as far as each attempt is no longer than
+predicted, so a retry after a call that failed at once, a sink that slows during the exit and a
+first exit batch longer than the budget can still overrun it, `architecture.md` §12, "The exit drain
+sizes a batch from a rate it measured earlier…"), `tests/test_exit_drain_batches.py` (a later exit
+batch held to what the last delivered exit batch's rate fits in the time left, SPEC-105), `tests/test_concurrent_configure.py` (a
 `configure(sink=…)` waiting on a concurrent one spends its own swap budget, idly), `tests/test_shutdown_mid_swap.py` (a `shutdown()` waiting on a sink change spends its own budget: one closer grace at most, never the drain's share, never on itself, and never on a no-worker swap's stop-signal setter) and `tests/test_delivery_paths.py` (the same cases
 through `deliver`, SPEC-072); the CPU half by `tests/test_sinks_pubsub.py`,
 `tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight),

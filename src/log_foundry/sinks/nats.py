@@ -44,13 +44,20 @@ drain thread against that deadline and ~~``_final_drain``'s single emit runs~~ `
 exit batches run on that thread, and an expired join leaves the sink **open** by SPEC-027 FR-004,
 so ``close()`` never drains the client's outbound buffer.
 
-**The exit drain fits the join, and the arithmetic is stated rather than assumed.**
-``Worker._emit`` retries a failing batch up to ``max_retries + 1`` times -- four at the default --
-and its inter-attempt wait returns immediately once the stop event is set, which it is for the whole
-of the exit drain. This deadline deliberately does not consult that event (a shutdown shortens a
-wait and never skips work), so on its own the sequence would cost ``(max_retries + 1) x
-publish_timeout``, 40 s against a 30 s join. Since SPEC-062 the worker declines a retry predicted to
-end after the ``shutdown()`` deadline, so the exit drain's worst case is bounded by the
+**The exit drain fits the join, and the arithmetic is stated rather than assumed.** Qualified
+(SPEC-105): the headline holds for this sink because one ``publish_timeout`` bounds a whole call,
+which the arithmetic below rests on. The worker's exit budget alone does not make it true of every
+sink: it predicts each attempt from the longest seen and, since SPEC-105, holds a later exit
+batch to what the last delivered one's rate fits in the time left, so a sink that slows during the
+exit, a retry after a call that failed at once, and a first exit batch longer than the budget can
+still overrun it (``architecture.md`` §12, "The exit drain sizes a batch from a rate it measured
+earlier…"). ``Worker._emit`` retries a failing batch up to ``max_retries + 1`` times -- four at
+the default -- and its inter-attempt wait returns immediately once the stop event is set, which it
+is for the whole of the exit drain. This deadline deliberately does not consult that event (a
+shutdown shortens a wait and never skips work), so on its own the sequence would cost
+``(max_retries + 1) x publish_timeout``, 40 s against a 30 s join. Since SPEC-062 the worker
+declines a retry predicted to end after the ``shutdown()`` deadline, so the exit drain's worst
+case is bounded by the
 ``shutdown()`` budget plus up to two ``publish_timeout``s -- the emit in flight when the budget
 runs out, and the first attempt of ~~a tail batch~~ the exit drain's first batch, which is never
 declined -- and at these defaults the third attempt is declined at 20 s and ``close()`` runs. Since

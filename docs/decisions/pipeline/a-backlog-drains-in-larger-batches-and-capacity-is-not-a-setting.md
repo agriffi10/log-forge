@@ -27,13 +27,21 @@ so the steady drain and the exit drain decide a batch boundary the same way, inv
   emit, or one a test froze); zero, which is the count trigger's batch, after a batch counted in
   `failed_batches`, after one that held no events, after one whose emit straddled a
   `retarget`, for a new worker and in a forked child. A batch the exit drain declines, or
-  abandons, leaves it as it was: at exit nothing waits for a failing sink to recover, and a reset
+  abandons, leaves it as it was, except that once an exit batch's rate is recorded a declined one
+  restores the rate rule's target, which the exit bound may have lowered (SPEC-105, below): at
+  exit nothing waits for a failing sink to recover, and a reset
   cut a dead sink's backlog into `batch_size` submissions, each paying the sink's own calls and
   lines. The trade is a sink that fails because a batch is too large: at exit it is now handed
   the target every time rather than ten spans after its first failure. It is no regression
   against the release, which handed it the whole backlog in one call: with a sink refusing
   batches over 500 events, the build delivered 20 of 4,020 events at exit, the build that reset
-  the target 80, and the tree before SPEC-090 none (the second diff review's probe).
+  the target 80, and the tree before SPEC-090 none (the second diff review's probe). **At exit
+  the target is then lowered, never raised** (SPEC-105): once an exit batch is delivered, after
+  every emitted exit batch that did not straddle a sink change it is held to what the most recent
+  delivered exit batch's rate fits in the time left before the `shutdown()` deadline less the join
+  margin, when the exit budget's prediction would let the next batch start (*The exit drain
+  declines a retry, or a later batch, predicted to end past the shutdown deadline*,
+  `docs/decisions/sink-lifecycle/`). With an ample budget it never binds.
 - **The cap is 1,000 events**, the private constant `_BACKLOG_BATCH_CAP`, a ceiling except for a
   batch of at most `batch_size` submissions, which the count trigger sent before this rule too.
 
@@ -79,7 +87,11 @@ every batch was 20);
 a per-event sink (SQS at ten entries a request, a JetStream `NATSSink` at one ack per event) settles
 near half an interval's worth, so an emit stays shorter than the time trigger's interval and a
 later event, a flush marker, a swap's fence or an exit's join waits behind it no longer than the
-interval already allowed. Prototyped at a whole interval, a sink costing 20 ms an event was handed
+interval already allowed — qualified: while the sink keeps the rate it was measured at. A sink that
+slows during the exit is handed a batch sized at its earlier rate and can still overrun the
+`shutdown()` budget, as can a retry after a call that failed at once and a first exit batch longer
+than the budget (`docs/architecture.md` §12, "The exit drain sizes a batch from a rate it measured
+earlier…"); a healthy sink's grown exit batch is held to the time left (SPEC-105, above). Prototyped at a whole interval, a sink costing 20 ms an event was handed
 a single span in 22 of 65 batches; prototyped as a fixed cap with no rate, a JetStream `NATSSink`
 behind a 20 ms ack lost 976 of 2,000 events to its own 10 s `publish_timeout`, where under the rule
 it loses none (SPEC-090 Evidence).
@@ -128,6 +140,16 @@ exit drain's budget for the batches this sends at exit is *The exit drain declin
 later batch, predicted to end past the shutdown deadline* (`docs/decisions/sink-lifecycle/`).
 
 ## History
+
+### 2026-11-24
+
+- **Refined** by SPEC-105: the size-target bullet names the exit bound, which lowers the target
+  after an exit batch to what the last delivered exit batch's rate fits in the time left, and
+  points at the sink-lifecycle decision that holds it; "so an emit stays shorter than the time
+  trigger's interval" is qualified for a sink whose rate changes during the exit. "A batch the
+  exit drain declines … leaves it as it was" now excepts a declined exit batch once a rate is
+  recorded, which restores the rate rule's target (SPEC-105's second diff review). The fence is
+  unchanged, since the bound only lowers a target and the restore sets only the rate rule's own target.
 
 ### 2026-11-17
 

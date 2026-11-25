@@ -33,6 +33,7 @@ from typing import Any
 
 import pytest
 
+import ledger_check
 import log_foundry
 from conftest import install_worker, retire_process
 from ledger_sinks import ledger
@@ -198,9 +199,24 @@ def _until(predicate: Any, seconds: float = 20.0) -> None:
     raise AssertionError(f"timed out waiting for {predicate}")
 
 
-def _at_exit(sink: Any, queued: int, *, batch_size: int = 10, max_retries: int = 3) -> Worker:
-    """Builds and installs a worker holding one pre-stop batch, with ``queued`` spans behind it."""
-    worker = Worker(sink, batch_size=batch_size, flush_interval=3_600.0, max_retries=max_retries)
+def _at_exit(
+    sink: Any,
+    queued: int,
+    *,
+    batch_size: int = 10,
+    max_retries: int = 3,
+    flush_interval: float = 3_600.0,
+) -> Worker:
+    """Builds and installs a worker holding one pre-stop batch, with ``queued`` spans behind it.
+
+    ``flush_interval`` is an hour unless a test says otherwise (the module docstring says why).
+    SPEC-105's tests pass 1.0 s, its fake clock's interval: their pre-stop call fails, so the
+    target at the stop is zero whatever the interval, or, where it is delivered, the test
+    charges it on that clock.
+    """
+    worker = Worker(
+        sink, batch_size=batch_size, flush_interval=flush_interval, max_retries=max_retries
+    )
     sink.first_waits_on = worker._stop
     install_worker(worker)
     for seq in range(batch_size):
@@ -982,7 +998,14 @@ def test_once_an_exit_batch_is_declined_every_later_one_is() -> None:
 def test_a_declined_exit_batch_leaves_the_target_as_it_was(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """FR-001 rule 4's last sentence: a batch declined unattempted sets no target."""
+    """FR-001 rule 4's last sentence: a batch declined unattempted sets no target.
+
+    It calls no ``_set_target``, which is what this counts. Refined by SPEC-105: once an exit
+    batch has recorded a rate, a declined one restores the rate rule's target from that rate,
+    which ``test_a_batch_declined_after_the_guard_passed_restores_the_rate_rules_target`` holds;
+    with no rate recorded it leaves the target as it was, as
+    ``test_a_declined_exit_batch_with_no_rate_recorded_leaves_the_target_as_it_was`` holds.
+    """
     _ten_span_batches(monkeypatch)
     measured: list[int] = []
     real = Worker._set_target
@@ -1599,3 +1622,640 @@ def test_a_sqs_sink_that_turns_slow_mid_exit_ends_before_the_deadline(
     assert ended[0] < deadline, f"the drain ended {ended[0] - deadline:+.2f}s past the deadline"
     assert worker.stopped_reason is None, "the join completed"
     assert closes_at_return == 1, "close() ran once"
+
+
+# ---------------------------------------------------------------------------- SPEC-105
+
+_COST = 0.00390625
+"""Seconds an exit call costs per event on SPEC-105 FR-001's clock: 256 events a second."""
+
+_FIT_MARGIN = 0.0390625
+"""``_JOIN_MARGIN`` as FR-001's clock patches it, exact in binary as every figure there is."""
+
+_FAIL_COST = 0.0625
+"""Seconds a failing exit call costs on FR-001's clock, whatever it was handed."""
+
+_DECLINED = re.compile(r"(\d+) exit batch\(es\) declined unattempted")
+
+
+class _FitRun:
+    """One exit driven on SPEC-105 FR-001's clock, and what it saw.
+
+    Attributes:
+      clock: The clock only the sinks move, starting at 0.0.
+      worker: The worker, once built.
+      sink: The sink the worker was built with.
+      calls: Sink calls made, across every sink the run charges.
+      rates: ``_exit_rate`` as each charged call began, the pre-stop call excepted.
+      snapshots: After each ``_emit_pending`` that called a sink, the worker's ``target``,
+        ``generation``, ``rate`` and ``size_target`` and the clock's ``now``; the first is the
+        pre-stop batch's, then one per exit batch handed to a sink, whichever sink it was.
+      first_charged: Set once the pre-stop call has been charged.
+      err: What the run wrote to stderr.
+    """
+
+    def __init__(self, clock: _SlowdownClock) -> None:
+        self.clock = clock
+        self.worker: Worker | None = None
+        self.sink: Any = None
+        self.calls = 0
+        self.rates: list[float] = []
+        self.snapshots: list[dict[str, float]] = []
+        self.first_charged = threading.Event()
+        self.err = ""
+
+
+class _ChargedEngineSink(_EngineSink):
+    """A ``deliver`` sink whose first call fails once the stop is claimed, after ``first_seconds``.
+
+    Every call first runs ``on_call`` with its number, as ``_ExitSink`` does, which is where a
+    test charges it; a later call then raises if ``fail_calls`` names it and accepts otherwise.
+
+    Attributes:
+      handed: The size of every batch handed to ``deliver``, in call order.
+      first_seconds: Seconds the first call idles once the stop is claimed, before it raises.
+      fail_calls: Call numbers, from 1, that raise ``ConnectionError``.
+      on_call: Called with each call's number before it answers, or ``None``.
+      closes: ``close()`` calls.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(seconds=0.0, accepts=True)
+        self.handed: list[int] = []
+        self.first_seconds = 0.0
+        self.fail_calls: set[int] = set()
+        self.on_call: Any = None
+        self.closes = 0
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Fails the first call once the stop is claimed; later calls are charged, then answer."""
+        self.calls += 1
+        call = self.calls
+        self.handed.append(len(batch))
+        if self.on_call is not None:
+            self.on_call(call)
+        if call == 1:
+            assert self.first_waits_on is not None
+            self.first_waits_on.wait(30.0)
+            if self.first_seconds:
+                threading.Event().wait(self.first_seconds)
+            raise ConnectionError("down")
+        if call in self.fail_calls:
+            raise ConnectionError("down")
+        self.accepted += len(batch)
+        return Verdict(outcomes=(Outcome.ACCEPTED,) * len(batch))
+
+    def close(self) -> None:
+        """Counts the close."""
+        self.closes += 1
+
+
+def _charging(
+    run: _FitRun,
+    sink: Any,
+    costs: dict[int, float],
+    *,
+    per_event: float = _COST,
+    main: bool = False,
+    hook: Any = None,
+) -> None:
+    """Charges each of ``sink``'s calls on the run's clock: ``costs`` by call number, else per event.
+
+    ``main`` marks the sink the worker was built with, whose first call is the pre-stop batch:
+    it is charged before that call waits for the stop, sets ``first_charged`` and records no
+    rate, since the worker may not be in ``run`` yet. ``hook(run, call)`` runs before the charge.
+    """
+
+    def on_call(call: int) -> None:
+        pre_stop = main and call == 1
+        if not pre_stop:
+            assert run.worker is not None
+            run.rates.append(run.worker._exit_rate)
+        if hook is not None:
+            hook(run, call)
+        run.clock.now += costs.get(call, per_event * sink.handed[call - 1])
+        run.calls += 1
+        if pre_stop:
+            run.first_charged.set()
+
+    sink.on_call = on_call
+
+
+def _reassign(worker: Worker, new_sink: Any) -> None:
+    """Changes the worker's sink as ``Worker.retarget``'s locked section does.
+
+    ``retarget`` itself declines once ``shutdown()`` has moved the retirement count, so it cannot
+    reassign during an exit drain; this does what its reassign does, under the same lock: the
+    sink, the generation bump and the sinks the drain may be inside.
+    """
+    with worker._lock:
+        worker.sink = new_sink
+        worker._sink_generation += 1
+        worker._held = [held for held in worker._held if held is not new_sink] + [new_sink]
+
+
+def _fit_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    *,
+    deadline: float | None,
+    spans: int,
+    fail: frozenset[int] = frozenset(),
+    free: frozenset[int] = frozenset(),
+    engine: bool = False,
+    pre_stop_cost: float | None = None,
+    hook: Any = None,
+    between: Any = None,
+    per_event: float = _COST,
+) -> _FitRun:
+    """Runs one exit on SPEC-105 FR-001's clock and returns what it saw.
+
+    **The clock.** ``time.monotonic`` and ``_lifecycle.monotonic`` read a clock only the sinks
+    move, from 0.0, as SPEC-103 FR-002's test patches them; ``_JOIN_MARGIN`` is 0.0390625 s, the
+    interval 1.0 s, ``max_retries`` 0 and ``batch_size`` 10 two-event spans. The pre-stop call
+    costs nothing and fails, so the target is zero at the stop, unless ``pre_stop_cost`` is
+    given, when it costs that, before the stop, and is delivered. Every later call costs
+    ``per_event`` an event, 0.00390625 s unless a test says otherwise, a call in ``fail`` costs
+    0.0625 s and raises, and one in ``free`` costs nothing; calls are numbered from 1, the
+    pre-stop call first.
+
+    **The deadline is the shipped path's.** ``retire_process(worker, deadline)`` runs once the
+    pre-stop call is charged, so ``claim_stop`` records the clock's reading plus ``deadline``:
+    exactly ``deadline`` while the pre-stop call is free, the instant the first exit batch then
+    begins at, which is FR-001's premise. **The join gets 30 real seconds more**, as SPEC-103
+    FR-002's test gives it: its own wait is the fake deadline less the fake now, in real
+    seconds, which a loaded runner could spend while the drain is still inside the fake budget.
+    No fake-clock figure moves, and every run asserts the drain ended and the join completed,
+    so the declined line is the drain's own, written once.
+
+    ``hook(run, call)`` runs at the start of each of the first sink's calls; ``between(run,
+    index)`` after each ``_emit_pending`` that called any sink, ``index`` counting the pre-stop
+    batch as 0. Either may change the worker's sink with :func:`_reassign`.
+    """
+    clock = _SlowdownClock()
+    monkeypatch.setattr(time, "monotonic", clock)
+    monkeypatch.setattr(_lifecycle, "monotonic", clock)
+    monkeypatch.setattr(worker_mod, "_JOIN_MARGIN", _FIT_MARGIN)
+    run = _FitRun(clock)
+    costs = {1: pre_stop_cost or 0.0} | dict.fromkeys(fail, _FAIL_COST)
+    costs |= dict.fromkeys(free, 0.0)
+    sink: Any = _ChargedEngineSink() if engine else _ExitSink()
+    if not engine:
+        sink.first_fails = pre_stop_cost is None
+    sink.fail_calls = set(fail)
+    _charging(run, sink, costs, per_event=per_event, main=True, hook=hook)
+    real = Worker._emit_pending
+
+    def snapshotting(self: Worker, pending: list[list[dict[str, object]]]) -> None:
+        calls = run.calls
+        real(self, pending)
+        if run.calls == calls:
+            return
+        run.snapshots.append(
+            {
+                "target": self._target,
+                "generation": float(self._target_generation),
+                "rate": self._exit_rate,
+                "size_target": self._size_target(),
+                "now": run.clock.now,
+            }
+        )
+        if between is not None:
+            between(run, len(run.snapshots) - 1)
+
+    monkeypatch.setattr(Worker, "_emit_pending", snapshotting)
+    worker = _at_exit(sink, spans, max_retries=0, flush_interval=1.0)
+    run.worker = worker
+    run.sink = sink
+    assert run.first_charged.wait(10), "the premise: the pre-stop call was charged"
+    real_join = worker._thread.join
+    monkeypatch.setattr(
+        worker._thread,
+        "join",
+        lambda timeout=None: real_join(None if timeout is None else timeout + 30.0),
+    )
+    retire_process(worker, deadline)
+    real_join(60.0)
+    run.err = capsys.readouterr().err
+    assert not worker._thread.is_alive(), "the drain ended"
+    assert worker.stopped_reason is None, "the join completed"
+    return run
+
+
+def _declined(err: str) -> list[tuple[int, int]]:
+    """Every declined line on stderr, as (events, batches)."""
+    found = [(n, _DECLINED.search(detail)) for n, _what, detail in _lost_lines(err)]
+    return [(n, int(match.group(1))) for n, match in found if match is not None]
+
+
+def test_after_a_delivered_exit_batch_the_next_fits_the_time_left(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-001 AC1 and FR-003 AC4 (invariant 3): the second exit batch fits the budget.
+
+    The first exit batch, 20 events, ends at 0.078125 and records 256 events a second; the rate
+    rule would make the next 128 events, ending at 0.578125, past the 0.328125 deadline. The
+    bound gives 256 × (0.328125 − 0.078125 − 0.0390625) = 54, which ends at 0.2890625: the time
+    left less the margin is then exactly 0.0, below the longest attempt, so the guard leaves the
+    rate rule's 128.0 standing rather than a bound of zero, and the rest is declined.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.328125, spans=500)
+    assert run.sink.handed[1:] == [20, 54], run.sink.handed
+    assert run.clock.now == 0.2890625
+    assert 0.328125 - run.clock.now - _FIT_MARGIN == 0.0
+    assert run.worker is not None
+    assert run.worker._target == 128.0, "the guard kept the rate rule's target, not zero"
+    assert _declined(run.err) == [(926, 8)], run.err
+
+
+def test_the_engine_twin_is_handed_the_same_fitted_batches(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-001 AC2 (invariant 6): a ``deliver`` sink is handed the same 20 and 54."""
+    run = _fit_exit(monkeypatch, capsys, deadline=0.328125, spans=500, engine=True)
+    assert run.sink.handed[1:] == [20, 54], run.sink.handed
+
+
+def test_an_exit_batch_the_clock_cannot_see_records_no_rate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-001 AC3 (invariant 3): a first exit batch that costs no time records no rate.
+
+    Its elapsed is zero, so ``_set_target`` gives the cap and no rate bounds the next batch,
+    which is the whole remaining backlog. Before any rate exists, "set to 0.0" and "left as it
+    was" read alike here; the straddle branch of the same rule is held by the test after this.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.328125, spans=500, free=frozenset({2}))
+    assert run.sink.handed[1:] == [20, 980], run.sink.handed
+    assert run.rates[1] == 0.0, "_exit_rate when the second exit batch reached the sink"
+
+
+def test_a_delivered_exit_batch_across_a_sink_change_records_no_rate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-001: a delivered exit batch whose emit straddled a sink change records 0.0.
+
+    It measured a sink no longer installed. The sink changes inside the first exit batch's call,
+    which then delivers; without the generation check the rate would read 256.0.
+    """
+
+    def hook(run: _FitRun, call: int) -> None:
+        if call == 2:
+            assert run.worker is not None
+            new = _ExitSink()
+            _charging(run, new, {})
+            _reassign(run.worker, new)
+
+    run = _fit_exit(monkeypatch, capsys, deadline=0.328125, spans=500, hook=hook)
+    assert run.sink.handed[1:] == [20], "the premise: the first exit batch went to the old sink"
+    assert run.snapshots[1]["rate"] == 0.0, run.snapshots[1]
+
+
+def test_a_flapping_sink_at_exit_is_held_to_the_time_left_after_each_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-002 AC1 and AC2 (invariants 3 and 5): each failure re-fits the kept target.
+
+    The first exit batch delivers at 256 events a second; the next three fail after 0.0625 s
+    each, and each failure lowers the kept target to what that rate fits in the time now left,
+    so the fifth, delivered, returns at 0.5390625, the deadline less the margin. Without the
+    bound on the failed path the batches are 20, 118, 118, 118 and 118, and the fifth ends at
+    0.7265625, past the 0.578125 deadline.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.578125, spans=500, fail=frozenset({3, 4, 5}))
+    assert run.sink.handed[1:] == [20, 118, 102, 86, 70], run.sink.handed
+    assert run.snapshots[5]["now"] == 0.5390625, run.snapshots
+
+
+def test_an_exit_batch_failing_across_a_sink_change_leaves_the_target_as_it_was(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-002 AC3 (invariant 6): no bound after a failed exit batch that straddled.
+
+    The second exit batch, 118 events under a 118.0 target, fails across a sink change at
+    0.140625, where the bound with the recorded 256 events a second would lower the target to
+    102.0. The target and its generation are left exactly as they were before it. This pins the
+    state, not an outcome: the stale-generation target reads 0.0 either way.
+    """
+    before: list[tuple[float, int]] = []
+
+    def hook(run: _FitRun, call: int) -> None:
+        if call == 3:
+            assert run.worker is not None
+            before.append((run.worker._target, run.worker._target_generation))
+            new = _ExitSink()
+            _charging(run, new, {})
+            _reassign(run.worker, new)
+
+    run = _fit_exit(
+        monkeypatch, capsys, deadline=0.578125, spans=500, fail=frozenset({3}), hook=hook
+    )
+    assert before == [(118.0, 0)], "the premise: the bound would lower this target to 102.0"
+    after = run.snapshots[2]
+    assert (after["target"], after["generation"]) == (118.0, 0.0), after
+
+
+def test_after_a_sink_change_between_exit_batches_the_new_sink_records_its_own_rate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-002 AC4 (invariant 6): the old rate lowers only a target already read as zero.
+
+    After the first exit batch (256 events a second) the sink changes to one costing 0.0078125 s
+    an event, whose first exit batch fails after 0.0625 s. The old rate then lowers the old
+    sink's 118.0 target to 102.0, which ``_size_target`` reads as zero, so the next batch is the
+    count trigger's; the new sink delivers it and records its own 128.0, not the old 256.0.
+    """
+    new = _ExitSink()
+    new.first_fails = True
+
+    def between(run: _FitRun, index: int) -> None:
+        if index == 1:
+            assert run.worker is not None
+            _charging(run, new, {1: _FAIL_COST}, per_event=0.0078125)
+            _reassign(run.worker, new)
+
+    run = _fit_exit(monkeypatch, capsys, deadline=0.578125, spans=500, between=between)
+    assert new.handed[:2] == [20, 20], new.handed
+    failed = run.snapshots[2]
+    assert failed["size_target"] == 0.0, failed
+    assert failed["rate"] == 256.0, "the premise: the old sink's rate stood through the failure"
+    assert (failed["target"], failed["generation"]) == (102.0, 0.0), failed
+    assert run.snapshots[3]["rate"] == 128.0, run.snapshots[3]
+
+
+def test_a_dead_sink_at_exit_records_no_rate_and_keeps_its_target(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SPEC-105 FR-002 AC5 (invariant 2): a dead sink with no exit batch delivered is unchanged.
+
+    The pre-stop batch is delivered, so the target is the cap, and every exit batch fails at
+    once. No exit batch is delivered, so no rate is recorded and the kept target stands: 4,000
+    events go in four batches at the cap, as ``main`` hands them. With a bound applied before
+    any rate was recorded, the target would be zero and the backlog would go ten spans a call.
+    """
+    sink = _ExitSink(fails=True)
+    rates: list[float] = []
+    holder: list[Worker] = []
+    sink.on_call = lambda call: rates.append(holder[0]._exit_rate) if call > 1 else None
+    worker = _at_exit(sink, 2_000, max_retries=0)
+    holder.append(worker)
+    retire_process(worker, 30.0)
+    worker._thread.join(5.0)
+    capsys.readouterr()
+    assert sink.handed[1:] == [1_000] * 4, sink.handed
+    assert rates == [0.0] * 4, rates
+    assert worker._exit_rate == 0.0
+
+
+def test_the_bound_is_not_applied_once_the_deadline_is_within_the_margin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003 AC2 (invariants 2 and 3): with no time left, the declined backlog stands.
+
+    After the first exit batch the time left less the margin is negative. The guard leaves the
+    rate rule's 128.0, so the declined backlog is 8 batches; a bound applied there would drive
+    the target below zero and cut it into 49.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.09765625, spans=500)
+    assert run.sink.handed[1:] == [20], run.sink.handed
+    assert run.worker is not None
+    assert run.worker._target == 128.0
+    assert _declined(run.err) == [(980, 8)], run.err
+
+
+def test_the_bound_is_not_applied_where_the_prediction_declines_the_next_batch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003 AC3 (invariants 2 and 3): the guard, not ``room > 0``, keeps 3 batches.
+
+    The second exit batch, 122 events, ends at 0.5546875; the time left less the margin is then
+    positive but below the longest attempt, so the next batch is declined whatever its size. A
+    guard weakened to ``room > 0`` would lower the target to about 1.6 and name 13 batches.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.6, spans=200)
+    assert run.sink.handed[1:] == [20, 122], run.sink.handed
+    assert _declined(run.err) == [(258, 3)], run.err
+
+
+@pytest.mark.parametrize("deadline", [64.0, None])
+def test_an_ample_deadline_hands_the_unbounded_batches(
+    deadline: float | None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SPEC-105 FR-005 AC1 (invariant 3): where the budget does not bind, nothing changes.
+
+    At 256 events a second and a 1.0 s interval the rate rule gives 128 events a batch. With a
+    64.0 deadline and with none, 2,000 spans go as 20, then 31 batches of 128, then the 12 left:
+    both runs meet one sequence, so the bound changed nothing an ample budget sends.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=deadline, spans=2_000)
+    assert run.sink.handed[1:] == [20] + [128] * 31 + [12], run.sink.handed
+
+
+def test_a_batch_ending_inside_the_last_margin_is_trimmed_and_its_tail_declined(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-005 AC2 (invariants 2 and 3): the band Andrew chose on 2026-11-17.
+
+    Without the bound the second exit batch is 128 events ending at 0.578125, inside the last
+    margin before 0.6, and nothing is declined. With it the batch is 122 events and the 6 left
+    are declined, counted and announced.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.6, spans=74)
+    assert run.sink.handed[1:] == [20, 122], run.sink.handed
+    assert _declined(run.err) == [(6, 1)], run.err
+
+
+_TAKE = 2.0**-20
+"""Seconds that pass between a fit and the next prediction: the take of the next batch's items."""
+
+
+def _take_after(index: int) -> Any:
+    """A ``between`` hook that moves the clock on by ``_TAKE`` after exit batch ``index``."""
+
+    def between(run: _FitRun, i: int) -> None:
+        if i == index:
+            run.clock.now += _TAKE
+
+    return between
+
+
+@pytest.mark.parametrize("engine", [False, True], ids=["1x", "engine"])
+def test_a_batch_declined_after_the_guard_passed_restores_the_rate_rules_target(
+    engine: bool, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003, diff review frame 2 (invariants 2 and 6): the guard and the prediction differ.
+
+    The guard is asked when an exit batch returns and the prediction when the next one is
+    emitted, after its items were taken. With a 0.1953125 deadline the room after the first exit
+    batch equals its 0.078125 attempt exactly, so the guard passes and lowers the target to 20;
+    ``_TAKE`` later the prediction declines the next batch. That batch was already taken at the
+    lowered target, so it is 20 events, and the decline then restores the rate rule's 128.0, so
+    the rest is cut as ``main`` cuts it: 9 declined batches where ``main`` names 8, and 49
+    without the restore.
+    """
+    run = _fit_exit(
+        monkeypatch, capsys, deadline=0.1953125, spans=500, engine=engine, between=_take_after(1)
+    )
+    assert run.sink.handed[1:] == [20], run.sink.handed
+    assert _declined(run.err) == [(980, 9)], run.err
+    assert run.worker is not None
+    assert run.worker._target == 128.0
+
+
+def test_the_guard_admits_a_batch_whose_room_equals_the_longest_attempt(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003, diff review frame 2 (invariant 3): the guard's boundary is ``>=``.
+
+    The same 0.1953125 deadline with no time between the fit and the prediction: the room
+    after the first exit batch equals its attempt, so the bound gives 20 and the prediction
+    starts a batch of 20, which returns at 0.15625. A guard of ``room > longest`` would leave
+    the rate rule's 128, which the prediction also starts, and which ends at 0.578125.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.1953125, spans=500)
+    assert run.sink.handed[1:] == [20, 20], run.sink.handed
+    assert run.snapshots[2]["now"] == 0.15625, run.snapshots
+    assert _declined(run.err) == [(960, 8)], run.err
+
+
+def test_the_first_declined_batch_is_cut_at_the_rate_rules_target(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-003, diff review frame 2 (invariants 2 and 3): the guard's refusal is visible.
+
+    The second exit batch, 122 events, ends at 0.5546875 under a 0.6 deadline; the room left is
+    then positive but below the longest attempt, so the guard leaves the rate rule's 128 and the
+    256 events left are declined in 2 batches. A guard weakened to ``room > 0``, or none, would
+    lower the target to about 1.6, so the first declined batch would be ten spans and the
+    decline's restore would cut the 236 behind it in 2 more: 3 batches.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.6, spans=199)
+    assert run.sink.handed[1:] == [20, 122], run.sink.handed
+    assert _declined(run.err) == [(256, 2)], run.err
+
+
+def test_a_declined_exit_batch_with_no_rate_recorded_leaves_the_target_as_it_was(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-090 FR-001 rule 4 under SPEC-105: a decline restores nothing when no rate exists.
+
+    The first exit batch costs no time, so it records no rate and ``_set_target`` gives the cap.
+    Under a 0.03125 deadline, inside the margin, every later batch is declined, and the 1,980
+    events left go at the cap in 2 batches. A restore made without a rate would set the target
+    to zero after the first, and cut the 980 behind it into 49 more.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.03125, spans=1_000, free=frozenset({2}))
+    assert run.sink.handed[1:] == [20], run.sink.handed
+    assert _declined(run.err) == [(1_980, 2)], run.err
+    assert run.worker is not None
+    assert run.worker._target == 1_000.0
+
+
+def test_a_declined_exit_batch_restores_the_rate_rules_target_no_higher_than_the_cap(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105, diff review (invariants 2 and 3): the restore is the rate rule's, cap included.
+
+    A sink at 2**-12 s an event delivers 4,096 events a second, so half an interval of its rate
+    is 2,048 events, above the 1,000-event cap. Under a 0.045 deadline every batch after the
+    first exit batch is declined, and the restore sets the cap, as ``_set_target`` did, so the
+    9,980 events left are declined in 10 batches; a restore without the cap would cut all but
+    the first at 2,048, in 6.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.045, spans=5_000, per_event=2.0**-12)
+    assert run.sink.handed[1:] == [20], run.sink.handed
+    assert _declined(run.err) == [(9_980, 10)], run.err
+    assert run.worker is not None
+    assert run.worker._target == 1_000.0
+
+
+def test_a_pre_stop_batch_delivered_while_the_stop_is_claimed_records_no_rate(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-105 FR-005 AC4 (invariant 6): a batch begun before the stop is not an exit batch.
+
+    The pre-stop call costs 0.078125 and the stop is claimed during it, with a deadline of
+    0.328125, under which the bound would lower its 128.0 to 54. It is delivered after the
+    claim, but its first attempt began before it, so the rate rule alone sets its target.
+    """
+    run = _fit_exit(monkeypatch, capsys, deadline=0.25, spans=500, pre_stop_cost=0.078125)
+    assert run.snapshots[0]["target"] == 128.0, run.snapshots[0]
+    assert run.snapshots[0]["rate"] == 0.0, run.snapshots[0]
+    assert run.sink.handed[1] == 128, run.sink.handed
+
+
+_RECOVERED_COST = 0.002
+"""Seconds a sink that recovered by exit costs an event, on the real clock (SPEC-105 FR-004)."""
+
+_TIGHT_BUDGET = 0.45
+"""The ``shutdown()`` budget at which ``main`` expires its join behind that sink."""
+
+
+def _recovered_sink(sink: Any) -> Any:
+    """Makes ``sink`` FR-004's: a pre-stop call that idles 0.2 s and fails, then 2 ms an event."""
+    sink.first_seconds = 0.2
+    if isinstance(sink, _ExitSink):
+        sink.first_fails = True
+
+    def on_call(call: int) -> None:
+        if call > 1:
+            threading.Event().wait(_RECOVERED_COST * sink.handed[call - 1])
+
+    sink.on_call = on_call
+    return sink
+
+
+def test_a_tight_shutdown_completes_its_join_behind_a_sink_that_recovered_by_exit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SPEC-105 FR-004 AC1 and AC2 (invariants 2, 3 and 5): the join completes, the sink closes.
+
+    2,000 two-event spans queued behind a pre-stop call that idles 0.2 s once the stop is
+    claimed and fails, so the target is zero and the exit drain has about 0.25 s. The first
+    exit batch, 20 events, costs about 0.04 s; the rate rule would make the next about 250
+    events, 0.5 s, and on ``main`` the join expired. The bound sizes it to end by the deadline
+    less the margin, and the rest is declined.
+
+    **What makes this robust on a loaded runner.** The join waits on the real clock, and the
+    bound reads that same clock after each batch, so a late wake from the idle or a slow first
+    batch only shrinks or declines what follows; the rate is measured on the loaded machine in
+    the batch just before. What no bound absorbs is one call running more than ``_JOIN_MARGIN``
+    past its own measured rate, which is invariant 3's designed margin. No batch size is
+    asserted. ``_SLACK`` covers only the return after the join: the inline ``close()`` and the
+    caller being scheduled. An expired join also returns within the budget, so
+    ``stopped_reason`` and the close count are what tell this tree from one without the bound.
+    """
+    sink = _recovered_sink(_ExitSink())
+    worker = _at_exit(sink, 2_000, max_retries=0, flush_interval=1.0)
+    started = time.monotonic()
+    retire_process(worker, _TIGHT_BUDGET)
+    elapsed = time.monotonic() - started
+    closes_at_return = sink.closes
+    worker._thread.join(5.0)
+    err = capsys.readouterr().err
+    assert elapsed < _TIGHT_BUDGET + _SLACK, f"shutdown returned at {elapsed:.2f}s"
+    assert worker.stopped_reason is None, err
+    assert "shutdown timed out" not in err, err
+    assert closes_at_return == 1
+    abandoned = [n for n, _what, detail in _lost_lines(err) if "batch abandoned" in detail]
+    assert abandoned == [20], err
+    declined = sum(n for n, _batches in _declined(err))
+    assert sink.events() + 20 + declined == 4_020, err
+    assert ledger_check.worker_problems(worker) == []
+
+
+def test_the_engine_twin_completes_its_join_at_a_tight_budget(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """SPEC-105 FR-004 AC4 (invariant 6): the same shape through ``deliver``, ``max_retries=0``."""
+    sink = _recovered_sink(_ChargedEngineSink())
+    worker = _at_exit(sink, 2_000, max_retries=0, flush_interval=1.0)
+    retire_process(worker, _TIGHT_BUDGET)
+    closes_at_return = sink.closes
+    worker._thread.join(5.0)
+    err = capsys.readouterr().err
+    assert worker.stopped_reason is None, err
+    assert closes_at_return == 1
+    assert ledger_check.worker_problems(worker) == []
