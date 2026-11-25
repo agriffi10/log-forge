@@ -46,11 +46,14 @@ list project-specific; seed it the first time a trap bites and never again.
   Analysis": the SARIF exported, then "Uploading results" stalled and the step failed with no error
   line, so no analysis for that commit appears under `code-scanning/analyses`. `gh run rerun`
   refused that run ("cannot be retried"; its event is `dynamic`), and the weekly scheduled re-scan
-  does not help, because `queue.sh` reads a sha as red while any run on it failed. The job log is
+  does not help, because `queue.sh` reads a sha as red while any run on it other than the nightly
+  `Model soak`'s failed. The job log is
   what decides: one ending at "Uploading results" is an upload stall that any new commit clears,
   while an extraction or query failure is an ordinary red needing a real fix. A missing
   `/language:<lang>` row for the failed job's language only confirms nothing was uploaded, which
   is true of both. Either way it is an `IS RED`, handled as `scripts/pr-queue/PROTOCOL.md` says.
+  A failed scheduled night of the soak is the one red that is not an `IS RED` (SPEC-099): `turn`
+  answers `WAIT` naming the night, and only that night's filing on `main` clears it.
 - **`gh pr merge <n> --squash` refuses on this repo; `--admin` is the normal path, not a trap
   door.** The `main` ruleset squash-merges only and sets `require_last_push_approval`, which asks for
   an approval from someone who did not push — unobtainable for a PR authored and pushed by the only

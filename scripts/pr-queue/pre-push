@@ -1,6 +1,6 @@
 #!/bin/bash
-# pre-push — makes the PR queue real rather than advisory. Two refusals, for the two ways a
-# push goes wrong under a shared checkout:
+# pre-push — makes the PR queue real rather than advisory. Three refusals, the first two for the
+# two ways a push goes wrong under a shared checkout:
 #
 #   LOCK       a participating branch pushed by a session that does not hold the lock.
 #   FRESHNESS  a push whose commits do not contain the remote's current main. The docs told
@@ -8,6 +8,13 @@
 #              branch rebased BEFORE a queue wait — during which peers merge, by design —
 #              pushed a stale base with `turn`, this hook and CI all reporting green. Prose was
 #              the only guard, and three review frames each found another place it had leaked.
+#   SOAK       while a scheduled night of the nightly soak in its 30-run window has failed and
+#              is not filed (`queue.sh soak-verdict` exits 4, SPEC-099), a push whose commits since the remote's
+#              main change anything but tests/soak_known.py and docs/architecture.md. It holds
+#              whatever else is red, and fails OPEN only when the verdict cannot be read — `gh`
+#              missing or failing, or a queue it cannot run — as this hook did before it existed.
+#              A stale ref is not read for it: it is refused for its base, and the rebase is its
+#              answer.
 #
 # WHAT PARTICIPATES, and why it is not a list of prefixes. `enforce-branches` holds an ERE, and
 # the installer defaults it to every branch. An allowlist of branch prefixes was the first design
@@ -101,7 +108,9 @@ fi
 # against the same remote state. `git ls-remote` rather than a fetch, for the reason queue.sh
 # gives at its own remote checks: it reads the remote's head without touching local refs, which
 # several worktrees pushing at once would race on through FETCH_HEAD. It also means this hook
-# never moves a ref. (In a partial clone the `cat-file` below can lazily fetch the commit object
+# never moves a branch or a remote-tracking ref: the one ref it can move, through `queue.sh
+# soak-verdict` reading a failed night's filing, is refs/pr-queue/main, which no session works on
+# (that fetch carries `--refmap=` so it leaves refs/remotes/origin/* alone). (In a partial clone the `cat-file` below can lazily fetch the commit object
 # itself — a round trip, but still no ref moved, which is the race the comment is about.)
 #
 # Exit status and emptiness mean DIFFERENT things and are kept apart: non-zero is "the check
@@ -138,7 +147,7 @@ fi
 # Every decision below keys on the REMOTE ref, which is the one that decides what appears on the
 # remote. `git push origin mine:main` is a push to the trunk however it is spelled locally, and
 # `git push origin main:refs/heads/topic` is a topic branch however it is spelled locally.
-refused=""; stale=""; unreadable=""; unfetched=""; notrunk=""; deltrunk=""; badpat=0
+pushed=""; refused=""; stale=""; unreadable=""; unfetched=""; notrunk=""; deltrunk=""; badpat=0
 while read -r lref lsha rref _rsha; do
   [ -n "$rref" ] || continue
   case "$rref" in refs/heads/*) branch="${rref#refs/heads/}" ;; *) continue ;; esac
@@ -185,9 +194,43 @@ while read -r lref lsha rref _rsha; do
     stale="$stale $branch"; unfetched="$unfetched $branch"; continue
   fi
   git merge-base --is-ancestor "$main_sha" "$lsha" 2>/dev/null || stale="$stale $branch"
+  case " $stale " in *" $branch "*) ;; *) pushed="$pushed$branch $lsha
+" ;; esac
 done
 
-[ -n "$refused$stale$unreadable$notrunk$deltrunk" ] || [ "$badpat" -eq 1 ] || exit 0
+# SOAK. Asked once per push, only when a ref reached the base check and passed it. Anything but 4
+# from queue.sh — 0, 3 for a verdict it could not read, 2 for a queue it could not run — leaves
+# the push to the checks above, as before this check existed.
+soakbad=""; soaknight=""
+if [ -n "$pushed" ] && [ -x "$Q/queue.sh" ]; then
+  soakline="$("$Q/queue.sh" soak-verdict 2>/dev/null)"
+  if [ $? -eq 4 ]; then
+    soaknight="$(printf '%s' "$soakline" | cut -d' ' -f2,3)"
+    while read -r pb psha; do
+      [ -n "$pb" ] || continue
+      "$Q/queue.sh" clearing-range "$main_sha" "$psha" >/dev/null 2>&1 || soakbad="$soakbad $pb"
+    done <<PUSHED
+$pushed
+PUSHED
+  fi
+fi
+
+[ -n "$refused$stale$unreadable$notrunk$deltrunk$soakbad" ] || [ "$badpat" -eq 1 ] || exit 0
+
+if [ -n "$soakbad" ]; then
+  cat >&2 <<MSG
+
+  PUSH REFUSED — the nightly soak's verdict blocks, and only a branch that files that night may land.
+
+  Refused ref(s):$soakbad
+
+  Blocking night: $soaknight — a scheduled night of the model soak in its 30-run window that
+  failed and is not filed. A branch that files it changes tests/soak_known.py and
+  docs/architecture.md and nothing else, and is written only once Andrew has answered the night's
+  escalation. Protocol: $Q/PROTOCOL.md
+
+MSG
+fi
 
 if [ -n "$deltrunk" ]; then
   cat >&2 <<MSG

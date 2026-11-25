@@ -68,7 +68,13 @@ message is a teammate's report, not Andrew's approval.
   refusal blocks, and `PR_QUEUE_BYPASS=1` (which `PROTOCOL.md` documents) is the way through. Using
   it is Andrew's call, so put it to him; the session that owns the fix pushes it, never you. A
   non-push run still in progress on the head prints nothing, yet `turn` refuses it as unsettled
-  until it finishes; that is a wait, not a fault.
+  until it finishes; that is a wait, not a fault. **The nightly `Model soak` is the exception**
+  (SPEC-099): the queue leaves its runs out of the head's reading and reads its scheduled nights as
+  a verdict instead. A failed night makes `turn` answer `WAIT` naming the night (`queue.sh
+  soak-verdict` prints it), and only that night's own filing on `main` clears it: no re-run, no
+  later green night and no bypass of the reading. Escalate it to Andrew like any red; a clearing
+  PR, which changes `tests/soak_known.py` and `docs/architecture.md` only, is written only after he
+  answers (`PROTOCOL.md`, *The nightly soak's verdict*).
 - **`SHARED`:** two worktrees touch one file. A name like `agent-<hex>` is a subagent's tree; map it
   to its session by its branch (`ListAgents`, `list_sessions`). Most of these are harmless. Check them with
   `git merge-file -p <ours> <base> <theirs>` (run on copies, never in a peer's tree) and look at the

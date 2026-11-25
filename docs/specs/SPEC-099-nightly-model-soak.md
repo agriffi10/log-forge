@@ -3,8 +3,8 @@ type: Spec
 id: SPEC-099
 title: "A Nightly Soak of the Model Test: Known Findings Named by Their Open Item, New Ones Block the Queue Until Filed"
 description: "Runs SPEC-086's soak of the model test's close count every night on main, reads a second close that a log entering after the first take owes as owed, names each red item whose shape an open item of architecture.md §12 already records as known by that item until the item closes or its nightly ceiling is passed, and turns the run red for anything else; a scheduled night that fails stops the PR queue until a pull request files that night, so that what the soak finds is seen and answered rather than learned to be ignored."
-spec_status: Draft
-depends_on: [SPEC-085, SPEC-086]
+spec_status: Completed
+depends_on: [SPEC-085, SPEC-086, SPEC-097]
 arc: audit-2026-11-14
 arc_order: 15
 ---
@@ -15,18 +15,27 @@ SPEC-086 built a soak of the model test: under four callers, it judges every sin
 close nobody owed and for a write after the last close. It runs only when someone sets
 `LOG_FOUNDRY_MODEL_SOAK=1`, and no workflow sets it. On 2026-11-14 Andrew took a nightly soak of
 the model test (`docs/architecture.md` §12, *CI cannot see a hang, a platform difference or an
-untested line*). This spec is that soak. Run as it stands, it would be red nearly every night, and
-not for anything new. Over 12,000 soak items on `main` it was red on 9, and every one is
-accounted for. Four are a swap arming a sink that a `shutdown()` already closed, an open item that
-SPEC-097 closes. Three are an orphan log writing after its sink's close, an open item no spec owns
-yet. Two are a gating oracle that went stale when SPEC-090 changed a stderr line. The soak's rule
-also misreads a second close the library owes. A job that is red every night for known reasons
-teaches people to ignore it. So this spec fixes the misreading. It names each red item whose shape
-an open item records, by that item, while the item is open and the shape stays under a nightly
-ceiling. It keeps the run red for anything else, and guards the job against rotting unseen. On
-2026-11-17 Andrew decided that a red night blocks merging. So a scheduled night that fails stops
-the PR queue as a durable fact, and the way out is a pull request that does nothing but file that
-night. The library does not change.
+untested line*). This spec is that soak. Run as it stands on `main` (`d9f2f097`), it would be red
+nearly every night, and not for anything new. Over 12,000 soak items on macOS it was red on 6, on
+seven sinks, and every finding was a write after the sink's last close on a caller's thread. By
+its signature and thread that is an orphan log writing after its sink's close, an open item no
+spec owns yet; whether each one meets that item's predicate cannot be read from today's record,
+which drops what came after the last close (FR-001 adds it). At that rate a night's 15,000 items
+would hold about seven or eight on macOS, and on a Linux stand-in about one in two nights; on the
+real `ubuntu-latest` runner, measured once this spec's pull request ran, it is about 1.8% of
+items, some 270 a night (FR-002 sets the ceiling from that). The
+soak's rule also misreads a second close the library owes. When this spec was written at
+`eda19f32` the soak was red for two more reasons, and both have since closed. SPEC-097 closed a
+swap arming a sink that a `shutdown()` already closed, so a record of that shape is now either a
+regression of SPEC-097 or the open item SPEC-097 left for a `fenced` retarget, and stays red
+either way. #393 closed a gating oracle that had gone stale when SPEC-090 changed a stderr line,
+which was this spec's start condition. A job that is red every
+night for known reasons teaches people to ignore it. So this spec fixes the misreading. It names
+each red item whose shape an open item records, by that item, while the item is open and the
+shape stays under a nightly ceiling. It keeps the run red for anything else, and guards the job
+against rotting unseen. On 2026-11-17 Andrew decided that a red night blocks merging. So a
+scheduled night that fails stops the PR queue as a durable fact, and the way out is a pull request
+that does nothing but file that night. The library does not change.
 
 ## Scope
 
@@ -35,18 +44,17 @@ night. The library does not change.
 - The soak's repeat rule reads a write whose log entered after the first close's take as owing the
   second close. The soak records which library function armed or took a sink, and prints what came
   after the last close (FR-001).
-- A table of known soak shapes, each naming an open item of §12, and their nightly ceilings in a
-  file of their own. A red soak
-  item whose every finding has a known shape is reported as known. A row whose item has left
-  `### Open` fails the default suite (FR-002).
+- A table of known soak shapes, each naming an open item of §12, one row at authoring, and their
+  nightly ceilings in a file of their own. A red soak item whose every finding has a known shape is
+  reported as known. A row whose item has left `### Open` fails the default suite (FR-002).
 - `.github/workflows/model-soak.yml`: the soak every night on `main`, on request, and on a pull
   request that changes it (FR-003).
 - The run's report, its floor and its ceilings, and a default-suite test that holds the workflow to
   what the soak needs (FR-004).
 - The record: SPEC-086's decision rewritten in place, §12's items, invariant 5's *Guarded* line and
   the model file's docstring (FR-005).
-- **The PR queue reads the newest scheduled night's verdict**, and lets through only a branch that
-  files that night, in
+- **The PR queue reads the scheduled nights' verdicts**: while a scheduled night in the 30-run
+  window failed and is not filed, it lets through only a branch that files that night, in
   `scripts/pr-queue/queue.sh`, `scripts/pr-queue/pre-push` and `scripts/pr-queue/PROTOCOL.md`
   (FR-006). These are installed copies: the queue in use runs from the directory `install.sh`
   writes under `$HOME`, so the change reaches sessions only when `install.sh` is run again after the
@@ -56,22 +64,22 @@ night. The library does not change.
 
 - **Any change under `src/`.** The library is unchanged. The soak reads it through the four names
   SPEC-086 wraps.
-- **Fixing what the soak finds.** Shape A, *A sink a swap installs is closed twice with nothing
-  written between when a concurrent `shutdown()` took it before the swap decided*, is closed by
-  SPEC-097. *An orphan log that passed its owed check before a `shutdown()` took its sink writes
-  after the close, and the sink is owed nothing* has no spec: SPEC-097 left it open, and §12 names
-  what would close it. Both stay known here until their items close.
-- **The stale lost-line oracle, and its start condition.** The gating model's `_WORKER_LOST`
-  pattern reads neither of the two lines the exit drain writes since SPEC-090: `lost <n> event(s);
-  <k> more exit batch(es) abandoned` (`worker.py:2667`) and `lost <n> event(s); <k> exit batch(es)
-  declined unattempted; ...` (`worker.py:2668-2673`). The first is measured failing a gating
-  assertion (*Evidence*). It is filed by this spec's own change as the §12 item *The model test's
-  lost-line oracle does not read the two lines the exit drain has written since SPEC-090, so a run
-  whose exit drain abandons more than one batch fails a gating assertion*, and it is a fix of its
-  own. FR-002 never excuses a gating assertion, so this spec does not make it a known shape.
-  **This spec's build starts only once that item is closed on `main`.** Until then the nightly run
-  would be red on it every night, and under Andrew's blocking decision it would stop the queue
-  every morning.
+- **Fixing what the soak finds.** *An orphan log that passed its owed check before a `shutdown()`
+  took its sink writes after the close, and the sink is owed nothing* has no spec: SPEC-097 left it
+  open, and §12 names what would close it. It stays known here until its item closes.
+- **A known `repeat` row at authoring, and at any time a row that explains Shape A's record,
+  including one for *A `fenced` retarget whose stop's wait ran out re-arms the sink the stop
+  closed, so it is closed a second time at the same write count*.** That item is open, but its
+  record cannot be told from a regression of the swap item SPEC-097 closed (FR-002 gives the
+  measurement). A night that meets either is red and is filed as FR-006 says, with no row.
+- **The lost-line oracle.** When this spec was written, the gating model's `_WORKER_LOST` read
+  neither of the two lines the exit drain has written since SPEC-090, and that failed a gating
+  assertion about once in 2,000 runs (*Evidence*, at `eda19f32`). This spec's own change filed it
+  as a §12 item and made its closure this spec's start condition, because the nightly run would
+  otherwise have stopped the queue every morning. #393 (`4b7e4b86`) closed it: `_WORKER_LOST` is
+  now built by `_worker_lost_shapes()` (`test_invariants_model.py:2290`, assigned at `:2341`), and
+  the item is under *Resolved*. The start condition is met. FR-002 never excuses a gating
+  assertion, so a gating failure in a soak item stays red.
 - **The sequential half, and the gating items at wide seeds.** The nightly run collects the soak
   items and the soak's wiring tests, and nothing else. Every soak item makes every gating assertion
   of the concurrent half too, because it runs `_interleaving` as the gating item does. The
@@ -97,22 +105,27 @@ night. The library does not change.
 
 ## Functional Requirements
 
-Line numbers are at `eda19f32`. *Evidence* holds every measurement, and a rate carries its run
-count.
+Line numbers are at `d9f2f097`. *Evidence* holds every measurement with the commit it was made
+at, and a rate carries its run count.
 
 ### FR-001: A write whose log entered after the first take owes the second close, and the record says who armed and took
 
 #### Description:
 
-`check_unowed_repeat` (`model_oracles.py:825`) excuses two closes at one write count only when a
+`check_unowed_repeat` (`model_oracles.py:847`) excuses two closes at one write count only when a
 writer's arm lies between the two closes' takes. Invariant 5 owes a sink a second close when it is
 written after its first close was taken (SPEC-045). A writer's arm is how the soak reads that, but
 it is not the only way. When something else re-armed the sink after the first take, the log finds
 the sink already owed. It takes the fast path, arms nothing, and writes. The second close is owed
 all the same, and the soak flags it. That is Shape B in the hand-over that traced the soak's
-repeats. The fix is to record the log itself. The soak's wrapper on `api._note_orphan_emit` adds a
+repeats, met unforced at `eda19f32` (*Evidence*). It can still happen at `d9f2f097`: SPEC-097 kept
+the arm a sink change makes on a `fenced` or `unfenced` retarget (§12, its resolved swap item), so
+something other than the log can still re-arm a sink after a take. The soak met no `repeat` at all
+in 12,000 items there. The fix is to record the log itself. The soak's wrapper on
+`api._note_orphan_emit` (defined in `_lifecycle`, called through `api`'s binding) adds a
 `Note(thread)` for the sink at its entry, before the owed check. Every orphan write passes through
-that call on its own thread first (`api.py:196-201`).
+that call on its own thread first (`api.py:209-215`: `_note_orphan_emit(sink)`, then
+`_engine.run_delivery(...)` or `sink.emit(...)`).
 
 **The rule.** Two closes at one count are owed when, strictly between the first close's take and
 the second's, there is a writer's arm, or a `Note` on a thread followed later by a `Write` on that
@@ -121,24 +134,36 @@ second. Nothing else between the takes owes the second close: not a `Note` alone
 whose thread has no `Note` before it in the stretch, and not a `Note` on one thread with a `Write`
 on another.
 
+**The rule fails closed.** A write on the worker's drain thread between the takes, after a sink
+change's arm, carries no `Note`, because only the orphan path makes one. So such a write never
+reads as owed: the pair stays a `repeat`, red, and is never masked as an owed close. A worker
+write that really did owe the second close would be reported, not hidden, which is the side to
+err on (the code round's second review).
+
 **Not any write.** The hand-over suggested excusing any `Write` between the takes. That hides a
-Shape A record. When the writer passed its owed check *before* the first take and wrote after it,
-the write is the race of the orphan-log item. Then only the swap's arm makes the second close,
-which is Shape A. §12 records that boundary at `deliver-seed600`. The authoring prototype met it
-unforced twice, at `deliver-seed348` and `http-seed576`, and the any-write rule reads both as
-owed (*Evidence*).
+record whose second close only a sink change's arm made. When the writer passed its owed check
+*before* the first take and wrote after it, the write is the race of the orphan-log item, and
+nothing it did owes the second close. At `eda19f32` that record was Shape A, a sink change arming
+a sink that a `shutdown()` had already taken and closed, and §12 recorded the boundary at
+`deliver-seed600` in that swap item, which SPEC-097 has since closed. The authoring prototype
+met it unforced twice, at `deliver-seed348` and `http-seed576`, and the any-write rule reads both as
+owed (*Evidence*, at `eda19f32`). Met now, it is a regression of SPEC-097 or the open `fenced`
+item, and either must be red.
 
 **Who armed and took.** The soak's wrappers on `_CloseRegistry.arm` and `.take` record the name of
 the library function that called each, as `Arm.by` and `Take.by`. The name is read from the
-caller's frame. FR-002's shapes need those names. Today's arms are made by `_arm_and_hand`,
-`rearm_if_released`, `_get_worker` and `_swap_sink`, and by the fork paths (`_clear_after_fork`,
+caller's frame. No known shape reads them since the swap row went (FR-002). They stay for the
+record: a red night is filed by someone reading it, and the labels are what tell a `_close_owed`
+take from a sink change's, which is #339's shape, and a log's arm from a worker build's. At
+`d9f2f097` the arms are made by `_note_orphan_emit`, `rearm_if_released`, `_get_worker` and
+`_swap_sink` (two sites), and by the fork paths (`_clear_after_fork`,
 `_adopt_factory_after_fork`), which no soak form reaches. The takes are made by `_close_owed` and
-`_swap_sink`.
+`_swap_sink` (three sites).
 
-**What came after.** `_sink_record` (`test_invariants_model.py:1060`) prints the arms, writes and
+**What came after.** `_sink_record` (`test_invariants_model.py:1121`) prints the arms, writes and
 takes before each close, and drops everything after the last one. A late write is exactly what
 comes after it. The record gains a last line, `after the last close: ...`. Each mark carries its
-label: `arm(writer:_arm_and_hand)`, `take(_close_owed)`, `note(<thread>)`.
+label: `arm(writer:_note_orphan_emit)`, `take(_close_owed)`, `note(<thread>)`.
 
 #### Acceptance Criteria:
 
@@ -164,12 +189,15 @@ label: `arm(writer:_arm_and_hand)`, `take(_close_owed)`, `note(<thread>)`.
       | M3, a `Note` and a `Write` on different threads owe | (b) |
       | M4, a `Note` alone owes | (a), (b) and (c) |
       | M5, a `Write` before its `Note` owes | (c) |
-- [ ] `lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`'s `forced` choreography, recorded with
-      the soak's event types, is flagged `repeat@<count>` by this rule in 7 of 7 runs.
+- ~~p11's `forced` choreography is flagged `repeat` in 7 of 7 runs~~: struck 2026-11-24, since
+  SPEC-097 closed it and p11 no longer closes its sink twice (*Revision history*).
 - [ ] Every `Arm` and `Take` the soak records carries the calling function's name.
       `test_the_soak_is_wired` and `test_the_soak_records_the_worker_path` assert the names their
-      deterministic steps make: `_arm_and_hand` for the coda's orphan log, preceded by its `Note`,
-      and `_get_worker` for the build (invariant 6).
+      deterministic steps make: `_note_orphan_emit` for the coda's orphan log, preceded by its
+      `Note`, and `_get_worker` for the build (invariant 6).
+- [ ] `_sink_record` over the forced `fenced` record (FR-002) prints `note(MainThread)`,
+      `arm(writer:_note_orphan_emit)`, `take(_close_owed)` and `arm(change:_swap_sink)`, and a
+      mutant that drops the `by` label from the rendering reddens it.
 - [ ] A red soak item's record ends with what was recorded after the sink's last close, or
       `nothing`.
 
@@ -184,20 +212,57 @@ label: `arm(writer:_arm_and_hand)`, `take(_close_owed)`, `note(<thread>)`.
 - the signature kind it explains;
 - a predicate over one sink's events and close record.
 
-Its nightly ceiling is held apart, in `tests/soak_ceilings.py` (below). Two rows exist at
+Its nightly ceiling is held apart, in `tests/soak_ceilings.py` (below). One row exists at
 authoring:
 
 | Name | Kind | The predicate | Ceiling | §12 item |
 |---|---|---|---|---|
-| `swap-arms-a-sink-a-shutdown-took` | `repeat` | for every pair of closes the rule reports on the sink, the first close's take is `_close_owed`'s, at least one non-writer arm lies between the two takes, and every non-writer arm there is `_swap_sink`'s | 20 | *A sink a swap installs is closed twice with nothing written between when a concurrent `shutdown()` took it before the swap decided* |
-| `orphan-write-after-close` | `late-write` | every write after the last close returned is on a thread not named `log-foundry-*`, whose last `Note` for the sink came before the sink's last take, and nothing armed the sink after that take | 25 | *An orphan log that passed its owed check before a `shutdown()` took its sink writes after the close, and the sink is owed nothing* |
+| `orphan-write-after-close` | `late-write` | every write after the last close returned is on a thread not named `log-foundry-*`, whose last `Note` for the sink came before the sink's last take, and nothing armed the sink after that take | 21 | *An orphan log that passed its owed check before a `shutdown()` took its sink writes after the close, and the sink is owed nothing* |
+
+**No `repeat` row.** At `eda19f32` a second row, `swap-arms-a-sink-a-shutdown-took`, named the swap
+item *A sink a swap installs is closed twice with nothing written between when a concurrent
+`shutdown()` took it before the swap decided*. SPEC-097 closed that item, so by the rule below the
+row cannot exist, and a Shape A record is now a regression of SPEC-097 and red. The open item
+nearest it, *A `fenced` retarget whose stop's wait ran out re-arms the sink the stop closed, so it
+is closed a second time at the same write count*, gets no row either, for two measured reasons:
+- **It cannot be told from that regression.** Recorded with the soak's event types, the
+  choreography that
+  `test_a_retarget_answering_fenced_keeps_its_arm_and_closes_the_sink_once_after_its_write`
+  forces reads `note arm(writer:_note_orphan_emit) write take(_close_owed) | close@1
+  arm(change:_swap_sink) take(_close_owed) | close@1` in 7 of 7 runs at `d9f2f097`. That is Shape
+  A's record exactly, and the dropped row's predicate matched it 7 of 7. A row for it would read a
+  regression of a closed item as known, which this table must never do.
+- **It was not met unforced.** It needs a sink change that has already retargeted to stay
+  undecided until a `shutdown()`'s wait for it runs out, up to `DEFAULT_CLOSER_GRACE`, 2 s. The
+  soak met no `repeat` in 12,000 items at `d9f2f097`.
+
+If a night meets it, the night is red, Andrew hears, and FR-006's clearing pull request files it
+under its open item. With no row, the swap predicate, its corpus, its ceiling and its mutant go
+too.
+
+**No row may ever explain Shape A's record**, not only at authoring. Shape A's record is a pair of
+closes at one count whose first take is `_close_owed`'s, with one or more `_swap_sink` arms and no
+other arm between the two takes, and no `Note` followed by its `Write` there. A clearing pull
+request that adds a `repeat` row for the `fenced` item would pass the open-item test, since that
+item is open, and would read every later Shape A night as known. So
+`test_no_known_row_explains_shape_a` runs `explain_run` against the live `KNOWN` over two fixed
+records, the Shape A corpus record of FR-001 and the forced `fenced` record above, and fails
+unless it returns `[]` for each. FR-006 files such a night under its item with no row.
+
+**What the clearing file holds.** `tests/soak_known.py` is a clearing file (FR-006), so it holds
+only data a clearing pull request must write: the `KNOWN` rows, each with its predicate, and
+`FILED_NIGHTS`. The code that matches a run against `KNOWN`, `explain_run`, `reason` and any helper
+they use, lives in `tests/soak_verdict.py`, which is not a clearing file, so a clearing pull request
+cannot widen what reads as known through that machinery. The exposure that remains is stated: a
+clearing pull request still writes a new row's predicate, bounded by `UNMEASURED_CEILING`, by
+`test_no_known_row_explains_shape_a` and by Andrew's answer to the night's escalation.
 
 **The late-write predicate rests on one fact about the library.** A write on a caller's thread can
 be read as that thread's last `Note` only while every caller-thread write follows its own entry to
 `_note_orphan_emit`. That holds today. Outside `sinks/`, the library hands a sink a batch in two
 functions only:
-- the orphan path's `_log` (`api.py:196-201`), which calls `_note_orphan_emit` first;
-- the worker's `_emit` (`worker.py:3030`, `:3076`), which writes on `log-foundry-worker`.
+- the orphan path's `_log` (`api.py:209-215`), which calls `_note_orphan_emit` first;
+- the worker's `_emit` (`worker.py:3424`, `:3476`), which writes on `log-foundry-worker`.
 
 So the case of a second log on the same thread that writes without its own `Note` cannot happen
 today. A roster derived from the AST holds the set of call sites to those four. A fifth site fails
@@ -208,7 +273,9 @@ matched against the table. If every one has a shape, the item records the shapes
 JUnit property `soak_known` and ends in `pytest.xfail`. The reason's first line is `known soak
 finding: <name> (§12: <item>)` for each shape, and the record follows. Anything else fails:
 - a signature with no shape;
-- `untaken@<count>`;
+- `untaken@<count>`: `tests/soak_verdict.py`, which is not a clearing file, honours rows of the
+  kinds `repeat` and `late-write` only, so a row a clearing pull request plants for any other
+  kind explains nothing;
 - any gating assertion `_interleaving` makes;
 - a run in which one sink's finding is known and another's is not.
 
@@ -216,7 +283,9 @@ The expected failure is not strict, because the soak measures a rate.
 
 **The ceiling.** A known shape that turns much more frequent may be a new defect behind an old
 name. So each row has a nightly ceiling. When one night's known items of a shape exceed it, the
-report makes the run red and names the row and the count (FR-004).
+report makes the run red and names the row and the count (FR-004). The count is of items, not
+sinks: one item that shows a shape on two sinks, as `deliver-seed898` did at `d9f2f097`, counts
+once.
 
 The ceilings live in `tests/soak_ceilings.py`, not in either clearing file (FR-006). So a clearing
 pull request cannot raise one:
@@ -228,16 +297,46 @@ pull request cannot raise one:
 A default-suite test fails:
 - when a `CEILINGS` key names no row, so renaming a row cannot shed its measured ceiling;
 - when an entry's line lacks a comment giving its measurement, the commit it was measured at, and
-  "x2 under, x3 over". Each ceiling is set from the
-most of its shape measured or expected in one night, so that a rate that doubles stays under it
-and one that triples passes it:
-- the swap row's most is 8. Two full windows on the Linux stand-in held 5 and 8, and its rate over
-  18,000 items there was 6.7 a night. Doubled that is 16, under 20, and tripled 24, over it;
-- the late-write row's most is 10 a night, from 24 in 36,000 items on macOS. Doubled that is 20,
-  under 25, and tripled 30, over it.
+  "x2 under, x3 over".
 
-The comment beside each number gives this and the commit it was measured at, and the test above
-holds it there.
+Each ceiling is set from its shape's rate in one night of 15,000 items, so that a rate that
+doubles stays under it and one that triples passes it. **The late-write ceiling is 800, derived
+from the real runner** the scheduled nights run on (Andrew's decision of 2026-11-25). This spec's
+pull request ran its own `Model soak` job on `ubuntu-latest` at seeds 0 to 99, 300 soak items an
+attempt (run 45561346799, attempts 1 to 3, at `12d4472a`), and met the orphan late write in 6, 3
+and 7 of 300 items: 300, 150 and 350 a night, 267 over the three. The most measured rate, 350,
+doubled is 700, under 800, and tripled is 1,050, over it. The rule holds for the 6 and 7 samples;
+for the 3 sample tripled (450) and for the three together tripled (800, at the ceiling and not
+over it) it does not, so a tripling of the lowest measured rate would not by itself break the
+ceiling. The ceiling was 21, derived from macOS rates, until that run showed every real night
+would pass it many times over and stop the queue.
+
+The other rates the spec records are far below 800, and **the ceiling is loose for them**: macOS
+measured 10 a night at `eda19f32` (24 in 36,000 items, loads up to 15), 7.5 at `d9f2f097` (6 in
+12,000, load about 10) and, on the build's tree (`beaf9403`), 21.7 over three runs at loads 19 to
+34 and about 40 at load 34; the Docker stand-in measured none in 18,000 items at `eda19f32` and 1
+in 30,000 at `d9f2f097`, about 0.5 a night. The stand-in under-measured this shape by about two
+orders of magnitude, and its rate is no longer what the ceiling rests on. The first scheduled
+nights, which FR-003 already owes, confirm the ceiling at the full window. The comment beside the
+number gives the measurement and its commit, and the test above holds it there.
+
+**Tests about the machinery never read the live table.** Every clearing pull request edits
+`tests/soak_known.py` and §12, and a clearing branch cannot touch `tests/`, so a test that judged
+the verdict, the report or the checks against the live `KNOWN`, `FILED_NIGHTS` or §12 would fail
+the very filing the queue waits for. Those tests use fixed fixture tables and texts. Only the
+tests whose job is the live content read it: the live row's predicate corpus, which looks its row
+up by name at test time, `test_no_known_row_explains_shape_a`, the open-item check, the
+ceilings-name-a-row check and the filing-format check over the live file, which accepts a
+populated `FILED_NIGHTS`. `tests/test_soak_future_edits.py` holds this in the default suite: it
+copies the tracked tree, applies two clearing edits in turn (each one `FILED_NIGHTS` entry, one new
+`### Open` item and one new `KNOWN` row with a worker-thread predicate) and, separately, the orphan
+item's closing edit (struck and moved under `### Resolved`, its row and ceiling removed), and runs
+SPEC-099's test modules against each copy in a subprocess, itself included behind a recursion
+guard so a copy that already carries filings runs the future-edit test too. The filing copy passes
+whole; the closing copy fails exactly the live row's corpus and the closing test, whose job is the
+live item, by name. Every edit locates its target through the AST, so it applies to a tree that
+already carries filings and rows, and asserts it changed something: a test matching the clearing
+file's literal text would fail on the first real filing, which a clearing branch cannot repair.
 
 **A row's life.** A known item stays visible: it is counted and listed in every run's summary
 (FR-004). It drops out only when its item closes. A default-suite test reads §12 with SPEC-085's
@@ -252,26 +351,20 @@ a soak, the red night is how the owner hears.
 
 - [ ] A soak item whose every finding matches a row ends `xfailed`, with the `soak_known` property
       and a reason naming each shape and its §12 item. An item with any unmatched signature, any
-      `untaken`, or any gating assertion failure ends `failed` (invariant 5).
-- [ ] The swap predicate's corpus asserts a match for:
-      - Shape A;
-      - Shape A whose second take is a swap's;
-      - three closes at one count with two swap arms.
-
-      It asserts no match for:
-      - no arm between the takes;
-      - an arm by an unknown caller only;
-      - a swap arm beside an arm by an unknown caller (`swap-arm-plus-unknown-arm-caller`);
-      - #339's shape, whose first take is `_swap_sink`'s.
+      `untaken`, or any gating assertion failure ends `failed`, and so does a run with one known
+      and one unknown sink (invariant 5).
+- [ ] `test_no_known_row_explains_shape_a` passes against the live `KNOWN`: `explain_run` returns
+      `[]` for the Shape A corpus record and for the forced `fenced` record, so either ends
+      `failed` whatever rows a clearing pull request adds. Planting
+      `Known("fenced-rearm", <the fenced item's lead>, "repeat")` with the dropped swap predicate
+      reddens it, and the same row passes `test_every_known_shape_names_an_open_item`, which is
+      why this test exists (invariant 5).
 - [ ] The late-write predicate's corpus asserts a match for the orphan late write. It asserts no
       match for:
       - a late write on `log-foundry-worker` (invariant 6: a worker-path late write is never read
         as the orphan path's);
       - a `Note` after the last take;
       - an arm after the last take.
-- [ ] Planting the swap predicate as first drafted, "any `_swap_sink` arm between the takes",
-      reddens `swap-arm-plus-unknown-arm-caller`. A run with one known and one unknown sink is not
-      known.
 - [ ] `test_every_place_the_library_hands_a_sink_a_batch_is_known` derives, from the AST of every
       module directly under `src/log_foundry/`, the calls to `run_delivery`, `emit`, `deliver` and
       `emit_via_deliver`. It asserts they are exactly the four sites above. A planted
@@ -298,8 +391,14 @@ a soak, the red night is how the owner hears.
     - the workflow;
     - `.github/actions/install-poetry/**`;
     - `scripts/model-soak-report.py`;
-    - `tests/soak_known.py`, `tests/model_oracles.py`, `tests/test_invariants_model.py` and
-      `tests/conftest.py`;
+    - `tests/soak_known.py`, `tests/soak_verdict.py` and `tests/soak_ceilings.py`;
+    - every module under `tests/` that `tests/test_invariants_model.py` and `tests/conftest.py`
+      import, directly or through each other, the two included. At `d9f2f097`, before this spec's
+      own imports, that is thirteen: `_reentry`, `conftest`, `ledger_check`, `model_oracles`,
+      `model_pins`, `model_sinks`, `shadow_check`, `sink_rigs`, `test_fork_lifecycle`,
+      `test_invariants_model`, `test_public_surface`, `test_sink_concurrency` and
+      `test_sinks_http`. The workflow lists them by path, and FR-004's guard derives the set and
+      holds the list to it, so an import added later cannot leave the filter short unseen;
     - `pyproject.toml` and `poetry.lock`.
 
     This trigger makes the soak gate a pull request that changes it, which partly reverses
@@ -340,14 +439,17 @@ a soak, the red night is how the owner hears.
   The normalised output means a dispatch input carrying a newline, such as `"1,\n2"`, which
   `parse_seeds` accepts, cannot write a second line into `$GITHUB_OUTPUT`.
 - **Budget.** `WINDOW` is 5,000 seeds, 15,000 soak items, and `WINDOWS` is 30, so the nights cover
-  seeds 0 to 149,999 every 30 runs. On the 4-CPU Linux stand-in, a soak item cost 18.7 ms of wall
-  clock at the default `-n 12`, linearly from 3,000 to 15,000 items. A window of 15,008 items
-  took 281.6 s and 280.5 s in two runs (*Evidence*). At `-n 4` the same items took three times as
-  long, so the step stays a bare `pytest` and inherits `addopts`. `timeout-minutes: 30`.
+  seeds 0 to 149,999 every 30 runs. On the 4-CPU Linux stand-in at `eda19f32`, a soak item cost
+  18.7 ms of wall clock at the default `-n 12`, linearly from 3,000 to 15,000 items, and a window
+  of 15,008 items took 281.6 s and 280.5 s in two runs. At `d9f2f097` the soak items of a window,
+  15,000, took 307.6 s over seeds 0 to 4999 and 284.3 s over 5000 to 9999, at most 20.5 ms an item
+  (*Evidence*). At `-n 4` the same items took three times as long at `eda19f32`, so the step stays
+  a bare `pytest` and inherits `addopts`. `timeout-minutes: 30`.
 - **The dispatch bound.** `MAX_SEEDS` is 10,000. Here is why, beside the number. The job has 1,800
   s. 180 s is allowed for the install, and 600 s for one hung item's guard and its dump, which leaves
-  1,020 s for the soak. 10,000 seeds is 561 s at the stand-in's 56 ms a seed, and 842 s at half
-  again that. A dispatch never reaches the queue (FR-006). The bound keeps it inside the job's own
+  1,020 s for the soak. 10,000 seeds is 561 s at the stand-in's 56 ms a seed at `eda19f32`, and
+  842 s at half again that. At `d9f2f097` its 61.5 ms a seed makes 615 s, and half again 923 s,
+  both under 1,020 s. A dispatch never reaches the queue (FR-006). The bound keeps it inside the job's own
   timeout, so that it ends with its report rather than being killed with none.
 - **The run.** The test step is:
 
@@ -406,8 +508,11 @@ a soak, the red night is how the owner hears.
         --branch main` lists a completed run, and its summary reads `15000 of 15000`.
       - A `workflow_dispatch` run on `main` with no input is made the day of the merge, and its
         summary is recorded too.
-      - Both are recorded in the delivery doc, with the pytest step's duration, which is at most
-        10 minutes.
+      - Both are recorded, with the pytest step's duration, which is at most 10 minutes. The
+        build's delivery doc is written before the push, so it names them as owed. After the
+        merge the orchestrator makes the dispatch and records it, and the first scheduled night
+        once it has run, in a docs-only follow-up pull request cut from fresh `main`, never
+        stacked on the build's.
 
       A missing scheduled run is a finding for the owner, not a pass.
 - [ ] This FR serves no invariant: it decides when the soak runs and where its verdict goes. What
@@ -425,12 +530,14 @@ than through a pipe, because a pipe would hide its exit status under the runner'
 - the soak items run, against `3 × |seeds|` asked for;
 - the clean, known and new counts;
 - the wiring items passed, of eight;
-- each known shape with its count, its ceiling and its §12 item;
+- each known shape with its count of items, never of sinks, its ceiling and its §12 item;
 - each new item with its first line and the command that re-runs it.
 
 A known item's full record is in the XML and the log.
 
-**The floor and the ceilings.** The report exits 1, and says why, in each of these cases:
+**The floor and the ceilings.** A new finding does not make the report exit 1: the report lists it
+with its re-run command and exits 0, and pytest's own non-zero exit is what makes that run red
+(FR-003). The report exits 1, and says why, in each of these cases:
 - the soak items run are not exactly `3 × |seeds|`;
 - a soak item was skipped;
 - a soak item is an expected failure without both the `soak_known` property and a reason starting
@@ -459,7 +566,16 @@ YAML parser is a dependency. It asserts:
 - `permissions: contents: read` and nothing that writes;
 - `persist-credentials: false`;
 - every `uses:` pinned to a 40-character SHA with a `# vX.Y.Z` comment, or local;
-- Python `"3.12"`.
+- Python `"3.12"`;
+- `timeout-minutes: 30`;
+- that the workflow's `name:` and its file name equal `SOAK_WORKFLOW` and `SOAK_FILE` as
+  `scripts/pr-queue/queue.sh` sets them, read from it as text. Renaming `name: Model soak` alone
+  would otherwise put the soak's runs back into the head's reading, and a red dispatch on the head
+  would read `IS RED` with nothing to say why;
+- that the `pull_request` path filter names, as a literal path, every module of FR-003's derived
+  set. The set is read from the AST: every `import` and `from ... import` with no leading dot,
+  anywhere in `tests/test_invariants_model.py` and `tests/conftest.py`, whose top-level name is a
+  module directly under `tests/`, followed through the modules it reaches.
 
 It collects the workflow's own `-k` in a subprocess, under `LOG_FOUNDRY_MODEL_SOAK=1` and
 `LOG_FOUNDRY_MODEL_SEEDS=0-1`, and asserts FR-003's selection. It also asserts FR-003's seeds rule
@@ -468,10 +584,10 @@ mutation-tested.
 
 #### Acceptance Criteria:
 
-- [ ] The report's fixture corpus asserts the exit status and the reason for each of twelve rows:
+- [ ] The report's fixture corpus asserts the exit status and the reason for each of fourteen rows:
       - clean;
       - known;
-      - new, with its re-run command;
+      - new, with its re-run command, exiting 0;
       - one soak item short;
       - all skipped by a skip mark;
       - an `xfail` with neither the property nor the known text;
@@ -480,7 +596,9 @@ mutation-tested.
       - a wiring item absent;
       - wiring items failed;
       - one known item over a ceiling;
-      - exactly at a ceiling.
+      - exactly at a ceiling;
+      - one known item naming one shape on two sinks, counted once;
+      - a known item whose property names no row, exit 1.
 - [ ] One mutant per check is planted, and each is reddened by a named row or test:
       - the count floor;
       - the skipped-or-unexplained floor;
@@ -489,11 +607,16 @@ mutation-tested.
       - the wiring set present;
       - the wiring set passed;
       - the ceiling;
+      - the known count taken per item, not per sink;
       - the window from the run number;
       - the dispatch bound, read before the set is built;
       - the normalised output;
-      - each of the thirteen workflow assertions, including the selection narrowed to
-        `test_soak_the_close_count_under_concurrency`.
+      - each of the sixteen workflow assertions, including the selection narrowed to
+        `test_soak_the_close_count_under_concurrency`, and the derived set read from the two
+        roots' direct imports only.
+- [ ] The path-filter check passes against the workflow, and fails, naming the path, when the
+      filter drops `tests/model_sinks.py`, which `test_invariants_model.py` imports directly, and
+      when it drops `tests/sink_rigs.py`, which neither root imports directly.
 - [ ] Every other test still passes with the soak switch unset, and the default collection holds
       no soak item.
 - [ ] This FR serves no invariant: it guards a job and its report.
@@ -526,6 +649,7 @@ says:
 Its *Do NOT build* lists:
 - a soak rule that excuses any write between the takes;
 - a known row without an open item;
+- a known row that explains Shape A's record;
 - a ceiling in a clearing file;
 - a gating assertion excused as known;
 - a window drawn from the clock;
@@ -533,7 +657,8 @@ Its *Do NOT build* lists:
   dispatch's or a pull request's run block it.
 
 The other sites that state the old behaviour are rewritten in place:
-- the model file's docstring (`test_invariants_model.py:83-93`, `:1230-1235`);
+- the model file's docstring (`test_invariants_model.py:83-93`), and the soak item's
+  (`:1296-1301`);
 - invariant 5's *Guarded* line, which says "its soak, run only on request and gating nothing";
 - §12's *The one generative test cannot find the lifecycle defects it is cited as guarding*, which
   says the soak is "run on request" and "gates nothing".
@@ -550,9 +675,17 @@ SPEC-086 and its delivery doc are frozen records and are not edited.
 - [ ] Each of these phrases is read with every file's text joined across its line breaks and its
       whitespace collapsed: "no workflow sets", "set by no workflow", "run only on request",
       "soak run on request", "run on request", "gating nothing", "gates nothing". The files read
-      are `docs/invariants.md`, `docs/architecture.md`, every file under `docs/decisions/`, and
-      every file under `tests/`. None contains any of the phrases except where it is struck
-      through and marked with SPEC-099.
+      are the tracked text files `git ls-files` lists as `docs/invariants.md`,
+      `docs/architecture.md`, under `docs/decisions/` and under `tests/`, so nothing untracked
+      such as `tests/__pycache__/*.pyc` is read, except `tests/test_model_soak_workflow.py`, which
+      holds the phrase list. A phrase passes only inside a `~~...~~` span of a paragraph that also
+      contains `SPEC-099`, a paragraph being a run of non-blank lines joined as above; anywhere
+      else it fails, naming the file. The three generic phrases, "run on request", "gating
+      nothing" and "gates nothing", are read only in a paragraph that mentions the soak, so a
+      later, unrelated use of one is not refused; a corpus row holds that too. A corpus asserts that a bare phrase fails, a struck one in a
+      paragraph naming `SPEC-099` passes, and a struck one whose paragraph does not name it fails
+      though another paragraph of the same text does. A mutant that widens the scope from the
+      paragraph to the whole file reddens that third row.
 - [ ] §12's CI item names SPEC-099 for the soak and PR #370 for the hang, and stays under
       `### Open`.
 - [ ] This FR serves no invariant: it is the record.
@@ -578,9 +711,22 @@ request's run never affects the queue: a red dispatch is someone's experiment, a
 typo or timeout is harmless. Runs of `Model soak` on `main`'s head are left out of the head's
 reading entirely.
 
-**Which run is read.** `queue.sh`'s `soak_verdict` lists the newest 30 scheduled runs, whatever
-their status, on any sha, newest first. It reads the first run that has a verdict. So a merge made
-while the night ran cannot step past the night.
+**Which nights are read.** `queue.sh`'s `soak_verdict` lists the newest 30 scheduled runs,
+whatever their status, on any sha, newest first, and reads every one: the first failing night
+whose failing attempt is not filed blocks, whatever came after it. A later green night clears
+nothing, since only a night's own filing does (Andrew's rule; the code round's second review found
+the first-verdict reading cleared an older red night under a newer green one). On any sha, so a
+merge made while the night ran cannot step past it. The printed time of a non-blocking answer is
+the newest night with any verdict, which is what `turn`'s note ages. **The residue:** a red night
+older than 30 scheduled runs falls out of the window unfiled, and nothing reads it after that; the
+nightly escalation is what keeps a night from ageing that far.
+
+**What a poll costs.** One `gh run list` for the head, one for the nights, and one for the open
+pull requests: three calls for an ordinary `turn`. A one-attempt run's listed conclusion is that
+attempt's own, so it needs no API call; only a re-run night is read attempt by attempt through the
+API, and the trunk is fetched into `refs/pr-queue/main` at most once per call of the queue, only
+when a failing night is read: the verdict runs in the queue's own shell, not a subshell, so the
+fetch it makes is the one `clearing_branch` reuses.
 
 **Re-runs.** `gh run list` reports only a run's latest attempt: measured on run 43801629163, it
 read `attempt=2 conclusion=success`. `gh api .../actions/runs/<id>/attempts/<n>` reports each
@@ -589,6 +735,13 @@ reads every attempt through the API, and **a run blocks if any attempt concluded
 `timed_out`**. A re-run cannot turn a red night green. A re-run still in progress leaves the run
 `in_progress`, so the run is listed whatever its status and its finished attempts are still read.
 If the API cannot show an attempt, the verdict is unreadable.
+
+Every multi-field line the queue reads from `gh` renders a missing value as `-`, and every `gh`
+call and fetch the verdict makes runs under `timeout` (or `gtimeout`) for 20 s where either
+exists, `PR_QUEUE_GH_TIMEOUT` overriding it (anything but a positive whole number, `0` included,
+reads as 20, since `0` disables GNU `timeout` and a word fails every call); an expiry is unreadable, so the hook fails open
+rather than hang a push. With neither installed the calls are unbounded, which `PROTOCOL.md`
+says.
 
 **Which conclusions block.**
 - `failure` and `timed_out` block. A timeout may be a hang the guard could not catch.
@@ -614,9 +767,16 @@ not measured.
 **What clears it.** A night is cleared only by its own filing. `tests/soak_known.py` holds
 `FILED_NIGHTS`, one entry per line in the form `    "<run id>-<attempt>": "<§12 lead>",`. A
 night that blocks names its last failing attempt. `soak_verdict` then:
-1. fetches `main` into `origin/main` with `--no-write-fetch-head`, because several worktrees
-   hitting `FETCH_HEAD` at once would race;
-2. reads `tests/soak_known.py` there;
+1. fetches `main` into a private ref, `refs/pr-queue/main`, with `git fetch --no-write-fetch-head
+   --refmap= origin +refs/heads/main:refs/pr-queue/main`. `--no-write-fetch-head` is there because
+   several worktrees hitting `FETCH_HEAD` at once would race. `--refmap=` is there because without
+   it git also updates `refs/remotes/origin/main` from the same fetch, its opportunistic
+   remote-tracking update (measured with git 2.54.0: the explicit refspec alone moved
+   `origin/main`, and with `--refmap=` it stayed put). It must never move `origin/main`: the hook
+   reaches this step, `pre-push` states that the hook never moves a ref, and moving `origin/main`
+   under a session in the middle of a rebase is a known hazard here. Every fetch the queue makes
+   for the soak is this one;
+2. reads `tests/soak_known.py` at `refs/pr-queue/main`;
 3. clears the night only if that attempt's own entry is present.
 
 Nothing else clears a night. A commit touching `tests/soak_known.py` for another night does not
@@ -629,18 +789,30 @@ its id and that it will fail. It still answers that night.
 
 **The clearing branch.** A clearing branch changes `tests/soak_known.py` and
 `docs/architecture.md` and nothing else, leaving each a regular file (mode 100644). `queue.sh
-clearing-range <from> <to>` decides it from `git diff --raw -z --no-abbrev --no-renames
---no-ext-diff --no-relative --no-color --no-textconv`:
+clearing-range <from> <to>` decides it from the plumbing `git diff-tree -r -z --no-abbrev
+--no-renames --ignore-submodules=none`:
 - names are read NUL-delimited and compared whole;
 - a rename reads as a deletion and an addition;
-- no `diff.*` or `color.*` setting can change what is read;
+- no `diff.*` or `color.*` setting can change what is read: the porcelain `git diff --raw` hid
+  an added gitlink under `diff.ignoreSubmodules all` (the code round's review, reproduced), so
+  the plumbing is read, with submodules never ignored;
 - an empty range, or one whose changes revert each other, is not clearing.
+
+`turn`, `acquire` and the hook decide a branch with `clearing_range` from its merge base with
+`refs/pr-queue/main`, made by the same private fetch, never with `origin/main`. A session's
+`origin/main` can be stale, and a stale base counts a peer's merged commits as the branch's own,
+so a valid clearing branch would read `WAIT`.
 
 `tests/soak_ceilings.py` is not a clearing file. So a clearing pull request cannot raise a ceiling
 (FR-002).
 
 While the verdict blocks:
 - `turn` answers `READY` to a clearing branch, and `WAIT` to any other branch, naming the night;
+- an open non-draft pull request (a bot's, or one pushed before the night went red) holds even a
+  clearing branch's `turn` at `WAIT`, and nothing may merge on a 4, so that `WAIT` names the
+  remedy: the session filing the night, once Andrew has answered, converts every open non-draft
+  pull request to a draft (`gh pr ready --undo <n>`) before its turn, and marks them ready again
+  once the filing has merged;
 - `acquire` refuses to stamp the lock onto any other branch, even for the lock's holder, whose
   `turn` answers before it reads the trunk.
 
@@ -660,7 +832,9 @@ unsettled, 3 unreadable. When those are clear, it answers:
 - 3 when the verdict cannot be read;
 - else 0.
 
-`queue.sh main-state` and `queue.sh soak-verdict` print and exit with their answers. If the
+`queue.sh main-state` and `queue.sh soak-verdict` print and exit with their answers.
+`soak-verdict` prints `0 none` when no scheduled night has a verdict, and otherwise
+`<state> <run id>-<attempt> <time>`, with `filed` after it when that attempt is filed. If the
 workflow file is renamed or removed from `main`, `gh run list --workflow model-soak.yml` fails
 (measured: HTTP 404 and exit 1 for a workflow not on the default branch). The queue then answers 3
 and waits, which is loud rather than silent, and `test_model_soak_workflow.py` fails in CI on the
@@ -672,7 +846,10 @@ answered that escalation.** This is his rule of 2026-11-17. The pull request:
 - adds the night's `FILED_NIGHTS` entry;
 - files the finding under its §12 item, a new item under `### Open` when it is new;
 - adds a `KNOWN` row when the finding is a soak signature of a new shape, which takes
-  `UNMEASURED_CEILING`.
+  `UNMEASURED_CEILING`, except a `repeat` whose record is Shape A's (FR-002). That one is filed
+  under its item, the `fenced` item or a new item for a regression of SPEC-097, with its
+  `FILED_NIGHTS` entry and no row, and `test_no_known_row_explains_shape_a` refuses a row that
+  would explain it.
 
 A finding no row can explain, such as a gating failure, is filed the same way. The next night is
 red again until its fix lands, and that fix is an ordinary pull request made while the queue is
@@ -694,10 +871,22 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
   takes effect only when `install.sh` is run again after the merge. Until then a red scheduled run
   on the head reads `IS RED` and escalates as today, which still blocks.
 
+**Three other descriptions of the queue go stale with this change.**
+`docs/process/operational-traps.md` (its CodeQL upload-stall trap),
+`.claude/skills/supervise/SKILL.md` (its `ALERT main` entry) and
+`docs/templates/multi-agent-briefing.md` ("If `turn` reports the trunk `IS RED`, stop and
+escalate") describe the queue stopping the line on `IS RED` alone. Each gains the soak's `WAIT`
+and how a night clears. And `docs/process/session-rhythm.md` names `pr-queue-test.sh` as the gate
+for a change to the queue; it gains `pr-queue-soak-test.sh` in a few words, since it is in the
+always-loaded set and its budget is nearly spent. `CLAUDE.md`'s *Common Commands* is not changed:
+it lists neither queue test today, and the always-loaded budget is better kept.
+
 #### Acceptance Criteria:
 
-- [ ] `scripts/pr-queue-soak-test.sh` runs with a stub `gh` (run lists and per-attempt API answers
-      from the environment), a bare remote and no network. Each case asserts its state or exit,
+- [ ] `scripts/pr-queue-soak-test.sh` runs with a stub `gh`, a bare remote and no network. The
+      stub holds canned JSON in the shape GitHub returns for the run list and for each attempt,
+      and applies the caller's own `--jq` to it with `jq`, so a broken filter fails a case rather
+      than reading a canned answer. Each case asserts its state or exit,
       and a line of what the queue said, including the cases that must stay silent. The cases:
       - a failed, a timed-out, a passed night;
       - a green re-run of a red attempt;
@@ -714,10 +903,21 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
       - filings of the blocking attempt, of an earlier attempt and of another run;
       - a filing in a comment, at the wrong indent, and on a local branch only;
       - an unreadable origin, and a peer's filing not yet fetched;
-      - `turn` for 22 branch shapes, among them renames onto and off a clearing file, a deletion,
+      - a filing read, and a clearing branch decided, after a peer has advanced `main` so that
+        the local `origin/main` is stale first, with `origin/main` and every other
+        `refs/remotes/` ref asserted unchanged afterwards;
+      - a valid clearing branch read `READY` while the local `origin/main` is stale;
+      - `turn` for 23 branch shapes, among them renames onto and off a clearing file, a deletion,
         a mode change, a symlink, a gitlink, paths with a space, both names in one path, a top-level `soak_known.py`, a newline or a glob
         character,
-        `tests/soak_ceilings.py`, a merge bringing in `src/`, and hostile `diff.*` settings;
+        `tests/soak_ceilings.py`, a merge bringing in `src/`, hostile `diff.*` settings, and a
+        gitlink added under `diff.ignoreSubmodules all`;
+      - an in-progress and a queued `Model soak` run on the head whose conclusion `gh run list`
+        renders as `""`, read as neither red nor unsettled. The stub renders a missing conclusion
+        as the real client does (`""` from `gh run list --json`, measured with gh 2.93.0; `null`
+        from the API) and refuses the other shape, and the queue renders every field of a line it
+        reads from `gh` with a `-` token for a missing value, so an empty field cannot shift the
+        fields after it;
       - `acquire` by a holder onto each kind of branch;
       - `turn`'s note for a verdict 48 hours old and for none, and its silence otherwise;
       - the hook on a clearing push, an added `src` commit, another red, `gh` failing or absent
@@ -729,6 +929,13 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
       reddened: a green attempt clearing a red one, and the hook refusing when the verdict cannot
       be read.
 - [ ] `sh scripts/pr-queue-test.sh` and `sh scripts/pr-queue/install-test.sh` still pass.
+- [ ] `docs/process/operational-traps.md` (its CodeQL upload-stall trap, which says the stall is
+      handled as an `IS RED`), `.claude/skills/supervise/SKILL.md` (its `ALERT main` entry, which
+      says the queue stops the line on `IS RED`) and `docs/templates/multi-agent-briefing.md` (its
+      lock paragraph) each also say that a failed scheduled night
+      of the soak answers `WAIT` naming the night, and that only that night's filing on `main`
+      clears it. `docs/process/session-rhythm.md` names `pr-queue-soak-test.sh` beside
+      `pr-queue-test.sh`, and `sh scripts/docs-lint.sh` stays green.
 - [ ] `PROTOCOL.md` states:
       - which runs count;
       - the attempt rule;
@@ -737,9 +944,16 @@ clear. A re-run cannot clear a night, and there is no acknowledgement command.
       - the clearing branch;
       - that a clearing pull request is written only after Andrew has answered;
       - the three consequences above.
+- [ ] Before the push, `soak_verdict`'s exact `gh` command lines, with `SOAK_WORKFLOW=Integration`
+      and `SOAK_FILE=integration.yml`, are run against this repository's scheduled `Integration`
+      runs, and their output is recorded in the pull request body: a real workflow's runs read
+      through the real `--json` fields and `--jq`.
 - [ ] **Owed after the merge:** `install.sh` is run once, and `queue.sh soak-verdict` from the
-      installed directory exits 0, 3 or 4 against the real repository. The delivery doc records
-      both.
+      installed directory prints `0 none` if no scheduled night has run yet, and otherwise
+      `<state> <run id>-<attempt> <time>` naming the newest scheduled `Model soak` run with a
+      verdict, as `gh run list --workflow model-soak.yml --event schedule` shows it. The build's delivery doc
+      names both as owed; the orchestrator runs them after the merge and records them in FR-003's
+      docs-only follow-up pull request.
 - [ ] This FR serves no invariant: it is the repository's process, not the library's behaviour.
 
 ---
@@ -774,9 +988,12 @@ class Known:
     name: str
     item: str                # the bold lead of a bullet under ### Open in architecture.md §12
     kind: str                # "repeat" | "late-write"
+    predicate: Callable[[Sequence[SinkEvent], Closes], bool] = field(compare=False)
 
 KNOWN: tuple[Known, ...]
 FILED_NIGHTS: dict[str, str] # "<run id>-<attempt>" -> the §12 lead it was filed under, one a line
+
+# tests/soak_verdict.py: new; not a clearing file; imports model_oracles and soak_known.
 def explain_run(sinks: Sequence[tuple[Sequence[SinkEvent], Closes]]) -> list[Known]: ...
 #   [] when nothing was found or any finding has no known shape
 def reason(known: Sequence[Known]) -> str: ...
@@ -788,7 +1005,8 @@ def ceiling_of(name: str) -> int: ...
 ```
 
 ```python
-# scripts/model-soak-report.py: new; imports tests/model_oracles.py and tests/soak_known.py.
+# scripts/model-soak-report.py: new; imports tests/model_oracles.py, tests/soak_known.py and
+#   tests/soak_verdict.py.
 WINDOW = 5000
 WINDOWS = 30
 MAX_SEEDS = 10_000
@@ -804,10 +1022,10 @@ def report(xml: pathlib.Path, seeds: str) -> tuple[str, int]: ...   # (Markdown,
 SOAK_WORKFLOW="Model soak"; SOAK_FILE="model-soak.yml"; SOAK_LOOKBACK=30; SOAK_QUIET_HOURS=48
 main_green       # 0 green · 1 RED · 2 building · 3 could not run · 4 the soak's verdict blocks
 head_green       # main_green's old reading of the head, with Model soak's runs left out
-soak_verdict     # 0 · 4 · 3, printing "<state> <run id>[-<attempt>] <time> [filed]"
-filed ID-N       # 0 when origin/main's tests/soak_known.py files that attempt
+soak_verdict     # 0 · 4 · 3 over the whole window, printing "4 <run id>-<attempt> <time>" for the newest unfiled failing night, else "0 <run id>-<attempt> <time> [filed]" for the newest night with a verdict, or "0 none"
+filed ID-N       # 0 when tests/soak_known.py at refs/pr-queue/main, fetched first with --refmap=, files that attempt
 clearing_range A B   # 0 when A..B changes only the two clearing files, each left mode 100644
-clearing_branch  # clearing_range from the branch's base on origin/main
+clearing_branch  # clearing_range from the branch's merge base with refs/pr-queue/main (fetched, --refmap=)
 soak_note        # turn's line for a verdict over 48 hours old, or none
 queue.sh main-state | soak-verdict | clearing-range A B
 ```
@@ -837,28 +1055,36 @@ scripts/pr-queue/queue.sh               # changed (FR-006): the soak's verdict, 
 scripts/pr-queue/pre-push               # changed (FR-006): the push check while the verdict blocks
 scripts/pr-queue/PROTOCOL.md            # changed (FR-006)
 scripts/pr-queue-soak-test.sh           # new (FR-006)
+.claude/skills/supervise/SKILL.md       # changed (FR-006): the soak's WAIT and how it clears
 tests/
 ├── model_oracles.py                    # changed: Note, Arm.by, Take.by, owed_between, FORMS_SOAKED
-├── soak_known.py                       # new (FR-002, FR-006): the shapes and FILED_NIGHTS
+├── soak_known.py                       # new (FR-002, FR-006): the KNOWN rows and FILED_NIGHTS; a clearing file
+├── soak_verdict.py                     # new (FR-002): explain_run and reason; not a clearing file
 ├── soak_ceilings.py                    # new (FR-002): the ceilings, outside the clearing files
 ├── test_invariants_model.py            # changed: labels, Note, the record's tail, the known verdict
 ├── test_model_oracles.py               # changed: the rule's corpus rows
 ├── test_soak_known.py                  # new: the shapes' corpora, the write-site roster
 └── test_model_soak_workflow.py         # new: the open-item check, the workflow guard, the report
 docs/
-├── architecture.md                     # changed by this spec's own change: the lost-line item;
-│                                       #   by the build: §12's CI item and model item (FR-005)
+├── architecture.md                     # changed by the build: §12's CI item and model item (FR-005)
 ├── invariants.md                       # changed: invariant 5's Guarded line (FR-005)
+├── process/operational-traps.md        # changed (FR-006): the soak's WAIT and how it clears
+├── process/session-rhythm.md           # changed (FR-006): pr-queue-soak-test.sh beside pr-queue-test.sh
+├── templates/multi-agent-briefing.md   # changed (FR-006): the soak's WAIT and how it clears
 ├── decisions/working-rules/the-model-gates-its-close-count-only-where-one-caller-makes-it-exact-and-soaks-it-under-concurrency-on-request.md   # rewritten in place, name kept
-├── audits/2026-11-14-probes/lifecycle/spec099_rule_corpus.py   # this spec's own change
-├── audits/2026-11-14-probes/lifecycle/spec099_prototype.patch  # this spec's own change
+├── audits/2026-11-14-probes/lifecycle/spec099_rule_corpus.py   # on main since #391; not changed
+├── audits/2026-11-14-probes/lifecycle/spec099_prototype.patch  # on main since #391, against eda19f32;
+│                                                               #   it does not apply to d9f2f097
 └── spec-delivery/SPEC-099-nightly-model-soak.md                # new, at completion
 ```
 
 ## Implementation Phases
 
-**Start condition:** §12's item *The model test's lost-line oracle does not read the two lines the
-exit drain has written since SPEC-090...* is closed on `main`.
+**Start condition:** met. §12's item *The model test's lost-line oracle does not read the two lines
+the exit drain has written since SPEC-090...* was closed by #393 (`4b7e4b86`), and the specs before
+this one in the lifecycle lane (`docs/specs/ARCS.md`), SPEC-097, SPEC-098 and SPEC-101, have
+landed. `spec099_prototype.patch` was made against `eda19f32` and does not apply to `main`; the
+build writes its change against `main` and uses the patch only as a reference.
 
 One pull request. Everything it adds is inert until it merges: the schedule fires only from
 `main`, the pull-request trigger runs the job against the branch, and the queue change runs only
@@ -890,15 +1116,99 @@ and `install-test.sh`, and `install.sh` is run once after the merge (FR-006).
 
 ## Evidence
 
-Measured 2026-11-16 and 2026-11-17 at `eda19f32`, which is `main`. The macOS figures are Python
+Two commits are measured here. **`d9f2f097`** (`main` on 2026-11-24) is what the spec must be true
+of, and the first subsection holds everything measured there. **`eda19f32`** (`main` on 2026-11-16
+and 2026-11-17, when the spec was written) is history; FR-001's Shape B and boundary records, one
+of FR-002's two late-write rates, the `-n 4` cost and every prototype result rest on it, and none
+of that was re-run at `d9f2f097`.
+
+### At `d9f2f097`, measured 2026-11-24
+
+The macOS figures are Python 3.13 on 10 cores at `-n 12`, loads of about 8 to 10. The Linux
+figures are the spec reviewer's.
+
+**How red the soak is on `main`.** `LOG_FOUNDRY_MODEL_SOAK=1 LOG_FOUNDRY_MODEL_SEEDS=0-999 poetry
+run pytest tests/test_invariants_model.py -k soak_the_close`, four runs of 3,000 items, 65.9 to
+68.1 s each:
+
+| Run | Red | Findings |
+|---|---|---|
+| 1 | 1 | `late-write@1` at `http-seed922` |
+| 2 | 4 | `late-write@3` at `deliver-seed202` and `deliver-seed556`; `late-write@5` at `http-seed972`; `late-write@5` and `late-write@0` on two sinks at `deliver-seed898` |
+| 3 | 0 | |
+| 4 | 1 | `late-write@1` at `http-seed604` |
+
+That is 6 red items in 12,000, on seven sinks, every finding `late-write` and every write on a
+`Thread-N (runner)` thread: the orphan late write by its signature and thread. No `repeat`, no
+`untaken`, and no gating failure. SPEC-086's record drops what came after the last close, so whether
+each meets FR-002's late-write predicate cannot be read from these runs; FR-001's record tail is
+what makes that readable, and Phase 1's soak reads it.
+
+**On the real runner, measured 2026-11-25.** This spec's pull request ran its own `Model soak`
+job on `ubuntu-latest` (run 45561346799, branch head `12d4472a`, seeds 0 to 99, 300 soak items
+an attempt, three attempts, all green):
+
+| Attempt | Known (orphan late write) | New | Wiring | pytest step |
+|---|---|---|---|---|
+| 1 | 6 of 300 | 0 | 8 of 8 | 12.0 s |
+| 2 | 3 of 300 | 0 | 8 of 8 | 14.0 s |
+| 3 | 7 of 300 | 0 | 8 of 8 | 18.4 s |
+
+About 1.8% of items: roughly 270 a night of 15,000, and 350 at the most measured rate, where the
+stand-in below measured about 0.5. The Docker stand-in under-measured this shape by about two
+orders of magnitude, so it is no longer what the late-write ceiling rests on (FR-002). These small
+runs cost about 33 to 55 ms an item with the job's startup included, above the stand-in's 18.7 ms,
+so the first night's pytest step duration re-checks `WINDOW` and `MAX_SEEDS` (FR-003, owed).
+
+**On the Linux stand-in.** Docker `python:3.12-slim`, `--cpus=4 --memory=16g`, the pinned
+`pytest` 9.2.0, `pytest-xdist` 3.8.0, `pytest-asyncio` 1.4.1.post1 and `opentelemetry-proto`
+1.45.2, over `git archive d9f2f097`, at `-n 12`, with `-k
+test_soak_the_close_count_under_concurrency`:
+
+| Seeds | Items | Red | Wall |
+|---|---|---|---|
+| 0 to 4999 | 15,000 | 1: `late-write@8` at `deliver-seed4276`, written on a runner thread | 307.6 s |
+| 5000 to 9999 | 15,000 | 0 | 284.3 s |
+
+No `repeat`, no `untaken` and no gating failure in 30,000 items: about 0.5 orphan late writes a
+night there, against 7.5 on macOS.
+
+**The swap item is closed.**
+`PYTHONPATH=src python docs/audits/2026-11-14-probes/lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py all 7`
+reports `forced: 0 of 7 runs closed S twice at one write count`, S's closes entering at `[1]` in
+all 7, and both controls 0 of 7.
+
+**The `fenced` item's record.** A pytest plugin wrapped `_CloseRegistry.arm` and `.take` (the
+caller read from the frame), `api._note_orphan_emit` (a `note` at entry, and a writer's arm while
+inside it) and the test's `Sink.emit` and `.close`, and ran
+`tests/test_shutdown_mid_swap.py::test_a_retarget_answering_fenced_keeps_its_arm_and_closes_the_sink_once_after_its_write`
+7 times. Sink B's record was the same each time:
+`note(MainThread) arm(writer:_note_orphan_emit) write(MainThread) take(_close_owed) | close@1
+arm(change:_swap_sink) take(_close_owed) | close@1`. SPEC-086's rule and FR-001's rule each report
+`repeat@1`, and the dropped swap row's predicate matched, 7 of 7.
+
+**Call sites.** An AST sweep of every module directly under `src/log_foundry/` finds the arms
+listed in FR-001 (`_lifecycle.py`: `_clear_after_fork`, `_get_worker`, `_note_orphan_emit`,
+`_adopt_factory_after_fork`, `rearm_if_released`, and `_swap_sink` twice) and its takes
+(`_close_owed` once, `_swap_sink` three times). `_arm_and_hand` is gone, removed by SPEC-098. The
+calls to `run_delivery`, `emit`, `deliver` and `emit_via_deliver` are exactly four: `api._log` at
+`api.py:211` and `:215`, and `worker._emit` at `worker.py:3424` and `:3476`.
+
+**The prototype patch.** `git apply --check spec099_prototype.patch` fails at
+`tests/test_invariants_model.py`.
+
+### At `eda19f32`, measured 2026-11-16 and 2026-11-17
+
+`eda19f32` was then `main`. The macOS figures are Python
 3.13.1 on a 10-core Mac at `-n 12`, at the loads given. The Linux figures are Docker
 `python:3.12-slim` with `--cpus=4 --memory=16g` on that Mac, standing in for `ubuntu-latest`,
 which has 4 CPUs and 16 GB for a public repository, with the pinned `pytest`, `pytest-xdist`,
 `pytest-asyncio` and `opentelemetry-proto`. *Prototype* rows ran `spec099_prototype.patch` applied
 to `git archive eda19f32`. The first prototype is the patch at `914d2154`. The revised one is the
-patch this revision commits.
+patch the 2026-11-17 revision committed. Where a row below names the swap row, it is the row this
+revision drops, and where it names the lost-line oracle, it is the item #393 closed.
 
-**How red the soak is on `main`.** `LOG_FOUNDRY_MODEL_SOAK=1 LOG_FOUNDRY_MODEL_SEEDS=0-999 pytest
+**How red the soak was.** `LOG_FOUNDRY_MODEL_SOAK=1 LOG_FOUNDRY_MODEL_SEEDS=0-999 pytest
 tests/test_invariants_model.py -k soak_the_close`, four runs of 3,000 items, 65 to 67 s each at
 loads of 4 to 15:
 
@@ -915,7 +1225,7 @@ That is 9 red in 12,000. Read by their records:
 - three are the orphan late write;
 - two are the lost-line oracle.
 
-**The lost-line oracle.** The gating items alone, `LOG_FOUNDRY_MODEL_SEEDS=0-999 -k
+**The lost-line oracle** (closed by #393 since). The gating items alone, `LOG_FOUNDRY_MODEL_SEEDS=0-999 -k
 accounting_identity`, were red on 1 of 2 runs, at `http-seed78`. A copy of the model file whose
 failure printed the whole of stderr was run four times over the `deliver` and `http` forms (8,000
 items) and was red twice, at `deliver-seed790` and `deliver-seed450`. In both, the worker had two
@@ -1061,7 +1371,9 @@ said. Twenty-six mutants were planted, one per check, and each is reddened:
 | the newest night only, with no fallback | each "... falls back to a failed one" |
 | a filing of any attempt clears | "filing an earlier attempt does not clear" |
 | the filing's format not held | the comment, the wrong indent, the local branch |
-| `origin/main` not fetched | "filing the blocking attempt clears", and the unreadable origin |
+| `refs/pr-queue/main` not fetched | "filing the blocking attempt clears", and the unreadable origin |
+| `--refmap=` dropped from the fetch | "`origin/main` unchanged after the read", run with `origin/main` stale first |
+| the clearing base read from `origin/main` | "a valid clearing branch reads `READY` while `origin/main` is stale" |
 | an unreadable verdict read as clear by `main-state` | "...and main-state reads it as 3, not clear" |
 | the mode not held | the deletion, the executable, the symlink, the gitlink |
 | the path not held | every non-clearing branch shape |
@@ -1127,6 +1439,111 @@ nothing.
 
 ## Revision history
 
+- **2026-11-25, the late-write ceiling re-derived from the real runner** on Andrew's decision. The
+  pull request's own `Model soak` job on `ubuntu-latest` met the orphan late write in 6, 3 and 7
+  of 300 items, about 1.8%, where the Docker stand-in had measured about 1 in 30,000: a ceiling of
+  21 would have turned every night red and stopped the queue. By FR-002's rule the most measured
+  rate, 350 a night, sets it at 800 (700 under, 1,050 over); FR-002 says which rates it is loose
+  for. The Overview's Linux rate, a real-runner Evidence subsection and the owed re-check of
+  `WINDOW` and `MAX_SEEDS` against the real runner's per-item cost follow.
+- **2026-11-25, corrected in the third code round** after the execution-frame review: the
+  future-edit check's edits matched the clearing file's literal text and would have failed on the
+  first real filing; they now locate the dict and the tuple through the AST, the clearing scenario
+  files twice and runs the check itself on the filed copy. The queue's verdict runs in its own
+  shell so one call fetches at most once; `PR_QUEUE_GH_TIMEOUT` is validated; the prose that said
+  the newest night decides now says a failed night in the window that is not filed does.
+- **2026-11-25, corrected in the second code round** after the second diff review. The verdict
+  scans the whole window and blocks on the newest unfiled failing night, since reading only the
+  first night with a verdict let a newer green night clear an older red one; the window's residue
+  and a poll's cost are stated. Tests about the machinery use fixture tables, and a default-suite
+  test applies a clearing edit and the orphan item's closing edit to a copy of the tree. `turn`'s
+  `WAIT` behind an open pull request names the remedy while the verdict blocks. Only `repeat` and
+  `late-write` rows are honoured. The verdict's `gh` calls are bounded by `timeout`. The generic
+  phrases of FR-005 are read only in paragraphs about the soak. FR-001 states that a worker write
+  between the takes reads as unowed, failing closed.
+- **2026-11-24, corrected in the code round** after the first diff review: `gh run list --json`
+  renders a run with no conclusion as `""`, which collapsed under the queue's space-separated
+  `read` and made an in-progress `Model soak` run on the head read as building; the queue now
+  renders every field with a `-` token for a missing value, and the stub matches the real client's
+  rendering and refuses the other. `clearing_range` reads the plumbing `diff-tree`, since
+  `diff.ignoreSubmodules all` hid an added gitlink from `git diff --raw`. The report corpus gains a
+  row for a known item naming no row (fourteen rows), and `turn` a twenty-third branch shape.
+- **2026-11-24, completed.** The build landed on this branch at `da095631`. Two corrections make
+  the spec true of what shipped: FR-002's ceiling derivation no longer claims "x2 under" holds for
+  every rate measured, since the build's own macOS runs measured 21.7 a night at loads 19 to 34;
+  it now says the macOS rate is load-dependent, that 21 is derived from the moderate-load figures
+  and applies to Linux nights, where it is loose, and that the first real-runner nights re-derive
+  it. FR-004 now says plainly that a new finding leaves the report at exit 0 and pytest's exit makes
+  the run red.
+- **2026-11-24, corrected after the plan review**, on the orchestrator's rulings:
+  - every soak fetch of the queue carries `--refmap=`, since without it the private fetch also
+    moved `origin/main` (git 2.54.0, measured); the unmoved case now runs with `origin/main` stale
+    first, and a mutant drops `--refmap=`;
+  - `clearing_branch` takes its base against `refs/pr-queue/main`, since a stale `origin/main`
+    made a valid clearing branch read `WAIT`;
+  - FR-005's phrase check reads tracked text files only, and its third corpus row puts `SPEC-099`
+    in another paragraph of the same text, with a mutant widening the scope to the whole file;
+  - `soak-verdict`'s printed form is pinned (`0 none` before any night), its `gh` lines are run
+    against `integration.yml` before the push, and the stub `gh` applies the caller's `--jq`;
+  - `docs/templates/multi-agent-briefing.md` joins the stale queue descriptions, and
+    `session-rhythm.md` gains `pr-queue-soak-test.sh` (`CLAUDE.md` unchanged);
+  - `explain_run` and `reason` move to the non-clearing `tests/soak_verdict.py`, with the residual
+    exposure stated;
+  - known items are counted per item, not per sink, with a report row for it.
+- **2026-11-24, corrected after the implementation plan**, on the orchestrator's rulings, with the
+  spec In Progress:
+  - FR-006's `filed` step fetches `main` into the private ref `refs/pr-queue/main`, not
+    `origin/main`, so the hook never moves a ref; the Data Model, the mutant row and a new case
+    say so. The stale-branch base check still reads `origin/main`.
+  - FR-005's phrase check skips only `tests/test_model_soak_workflow.py`, which holds the list, and
+    defines "struck and marked" as a `~~...~~` span in a paragraph that names `SPEC-099`, held by
+    a three-row corpus.
+  - The Data Model's `Known` gains its `predicate`, with `field(compare=False)`.
+  - FR-004's workflow guard gains `timeout-minutes: 30` and the workflow's `name:` and file name
+    matching `queue.sh`'s `SOAK_WORKFLOW` and `SOAK_FILE`, making sixteen workflow assertions.
+  - FR-006 names `docs/process/operational-traps.md` and `.claude/skills/supervise/SKILL.md` as
+    changed, with a criterion that each says the soak's `WAIT` and how it clears.
+  - FR-003's and FR-006's after-merge results are named as owed in the delivery doc and recorded
+    by the orchestrator in a docs-only follow-up pull request from fresh `main`.
+- **2026-11-24, re-validated against `d9f2f097`**, after SPEC-087 to SPEC-101 landed. Re-checked
+  and still true: the workflow names and crons, `ci.yml`'s concurrency group and pins, the
+  install-poetry action, the four wrapped names, the 14-item selection at seeds 0 to 1 and 15
+  under `-k soak`, `open_item_leads`, `parse_seeds`, the decision file's name, invariant 5's and
+  §12's "on request ... gating nothing" wording, §12's CI item, `queue.sh`'s `main_green` states
+  and its line 199, and the orphan late-write item, still open with no spec. What changed:
+  - **The swap row is dropped, and no `repeat` row replaces it.** SPEC-097 closed its item, and
+    p11 now closes its sink twice in 0 of 7 runs. The open `fenced` item was weighed as its
+    replacement and declined: its forced record is Shape A's exactly (7 of 7 at `d9f2f097`), so a
+    row for it would read a regression of SPEC-097 as known (FR-002). With it go the swap
+    predicate, its corpus, its ceiling of 20 and its derivation, the "as first drafted" mutant,
+    and FR-001's p11 criterion, struck in place. `Arm.by` and `Take.by` stay, for the record a red
+    night is filed from (FR-001). Shape A's record is now red.
+  - **The start condition is met.** #393 (`4b7e4b86`) closed the lost-line item. The Overview, the
+    Out of Scope bullet and the start condition say so; `worker.py:2667` and `:2668-2673` survive
+    only in the `eda19f32` Evidence.
+  - **`_arm_and_hand` is gone** (SPEC-098). FR-001's caller list and its wiring criterion name
+    `_note_orphan_emit` for the orphan log's arm.
+  - **The Overview's counts** are the 6 red in 12,000 measured at `d9f2f097`, every one a
+    `late-write` on a caller's thread. ~~The late-write ceiling stays 25~~: struck by the review
+    below, which set it to 21.
+  - **Line anchors** move to `d9f2f097`, and the Evidence says which commit each measurement is
+    from. The prototype patch is said not to apply to `main`, measured.
+  - **`tests/soak_ceilings.py` joins FR-003's path filter**: it decides the report's verdict, and
+    the 2026-11-17 revision that created it did not add it there.
+  - `depends_on` gains SPEC-097, which the known table and the lifecycle lane rest on.
+
+  The fresh-context spec review of `e6491b6b` found two MAJOR and three MINOR issues, all fixed
+  here. **MAJOR:** a clearing pull request could still add a `repeat` row explaining Shape A's
+  record, since the `fenced` item is open; FR-006 now files such a night with no row,
+  `test_no_known_row_explains_shape_a` holds the live table to it, FR-005's *Do NOT build* names
+  it, and FR-002's first criterion no longer claims every `repeat` is red. **MAJOR:** a ceiling of
+  25 broke FR-002's own "x3 over" for the `d9f2f097` rate; it is 21, true of both rates, and the
+  reviewer's Linux stand-in run at `d9f2f097` (1 in 30,000, about 0.5 a night) is recorded, with
+  the ceiling said to be loose there and FR-003's budget updated from its window timings.
+  **MINOR:** a criterion now holds the labels to the printed record; the Overview no longer calls
+  every Shape A record a regression nor reads the six findings as the orphan item's predicate; and
+  FR-003's path filter now covers every `tests/` module the soak imports, derived and held by
+  FR-004's guard rather than listed by hand.
 - **2026-11-17, revised after the spec review**, which found seven MAJOR issues. Andrew's calls,
   recorded as his:
   - **"A red night BLOCKS merging."** This was the opposite of the recommendation in the first
@@ -1158,7 +1575,8 @@ nothing.
   made while the night ran, a cancelled night or a dispatch cleared or dodged the block. FR-006 is
   restructured rather than patched case by case:
   - only scheduled runs carry a verdict;
-  - the newest night with a verdict is read on any sha;
+  - ~~the newest night with a verdict is read on any sha~~ every night in the 30-run window is read
+    on any sha, and the newest failed one not filed blocks (corrected in the second code round);
   - every attempt is read through the API;
   - `failure` and `timed_out` block;
   - only the night's own `FILED_NIGHTS` entry on `main` clears it.

@@ -83,10 +83,14 @@ sequential seed replays exactly. Every failure ends with the command that re-run
 **The soak** (FR-003). ``LOG_FOUNDRY_MODEL_SOAK=1`` adds one item per passive form and seed that
 runs the concurrent test as the gating item does, with the library's own record of what it armed
 and took read through four wrapped private names, and judges every sink by two rules: an
-unowed repeat close (two closes at one count with no writer's arm between their takes) and a write
-after the last close returned. A red soak item is a finding, not a regression, and it gates
-nothing: no workflow sets the switch. ``test_the_soak_is_wired`` runs the soak's body for one seed
-in every session and asserts its wiring, never its verdict.
+unowed repeat close (two closes at one count with nothing between their takes that owes the
+second, which is a writer's arm or a log that entered after the first take and wrote before the
+second) and a write after the last close returned. ``.github/workflows/model-soak.yml`` runs the
+soak every night on ``main``, when dispatched, and on a pull request that changes it (SPEC-099). A
+red soak item whose every finding has a shape ``tests/soak_known.py`` records under an open item
+of §12 ends as an expected failure naming that item; anything else fails, and a failed scheduled
+night stops the PR queue until a pull request files it. ``test_the_soak_is_wired`` runs the soak's
+body for one seed in every session and asserts its wiring, never its verdict.
 
 ```
 LOG_FOUNDRY_MODEL_SEEDS=0-999 poetry run pytest tests/test_invariants_model.py
@@ -117,6 +121,8 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
+import soak_known
+import soak_verdict
 from conftest import install_worker, retire_process, run_concurrently
 from log_foundry import _diag, _lifecycle
 from log_foundry._lifecycle import State
@@ -127,6 +133,7 @@ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 from log_foundry.worker import Worker
 from model_oracles import (
     EPSILON,
+    FORMS_SOAKED,
     GATE_MARGIN,
     Arm,
     BoundExceeded,
@@ -135,6 +142,7 @@ from model_oracles import (
     CloseBroken,
     Closes,
     LedgerBroken,
+    Note,
     SinkEvent,
     Stalled,
     Take,
@@ -151,13 +159,14 @@ from model_oracles import (
 )
 from model_oracles import Ledger as OracleLedger
 from model_sinks import span_ends_queued
+from soak_known import Known
 from test_fork_lifecycle import CHILD_TIMEOUT, run_in_child
 from test_sinks_http import FakeResponse
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
-FORMS = ("emit", "deliver", "http")
+FORMS = FORMS_SOAKED
 DEFAULT_SEEDS = range(16)
 """The concurrent half's gating seeds; only this range gates (SPEC-086 FR-002)."""
 
@@ -209,6 +218,8 @@ class _SoakRecord:
       judged_repeat: The sinks the unowed-repeat rule was evaluated over.
       judged_late: The sinks the late-write rule was evaluated over.
       report: The failure text of a red run, empty for a clean one.
+      judged: Each sink's events and close record exactly as the rules judged them, one read per
+        sink, so the known-shape verdict explains the same snapshot (SPEC-099).
     """
 
     def __init__(self) -> None:
@@ -229,6 +240,7 @@ class _SoakRecord:
         self.judged_repeat = 0
         self.judged_late = 0
         self.report = ""
+        self.judged: list[tuple[list[SinkEvent], Closes]] = []
         self._events: dict[int, list[SinkEvent]] = {}
         self._sinks: dict[int, object] = {}
         self._lock = threading.Lock()
@@ -1039,7 +1051,10 @@ def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
 
     A name that no longer exists fails the item instead of silencing it: a rename would
     otherwise leave the soak reading no arms or takes, and every repeat close would look unowed,
-    or none would be recorded at all.
+    or none would be recorded at all. SPEC-099 FR-001: each arm and take records the name of the
+    library function that called it, read from the caller's frame, and the orphan path records a
+    ``Note`` for its sink at entry, before its owed check, so a log that finds the sink already
+    owed and arms nothing is still seen entering.
     """
     for owner, name, label in _WRAPPED:
         if name not in vars(owner):
@@ -1050,14 +1065,16 @@ def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
     real_build = _lifecycle._get_worker
 
     def arm(registry: Any, sink: Any) -> None:
-        soak.add(sink, Arm(by_writer=soak.by_writer(sink)))
+        by = sys._getframe(1).f_code.co_name
+        soak.add(sink, Arm(by_writer=soak.by_writer(sink), by=by))
         real_arm(registry, sink)
 
     def take(registry: Any, sink: Any, rule: Any) -> Any:
-        soak.add(sink, Take())
+        soak.add(sink, Take(by=sys._getframe(1).f_code.co_name))
         return real_take(registry, sink, rule)
 
     def note(sink: Any) -> None:
+        soak.add(sink, Note(threading.current_thread().name))
         soak.entering(sink)
         try:
             real_note(sink)
@@ -1082,12 +1099,16 @@ def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
 def _judge_soak(soak: _SoakRecord, ledger: Ledger, err: str) -> str:
     """Judges every sink the run handed the library by the soak's two rules (SPEC-086 FR-003).
 
-    No run and no sink is exempt. Returns the failure text, empty when every sink is clean.
+    No run and no sink is exempt. Returns the failure text, empty when every sink is clean, and
+    leaves each sink's events and close record, read once, in ``soak.judged`` (SPEC-099), so the
+    known-shape verdict explains exactly what was judged.
     """
     found: list[str] = []
+    soak.judged = []
     for index, sink in enumerate(ledger.sinks):
         events = soak.events_of(sink)
         closes = sink.record.closes()
+        soak.judged.append((events, closes))
         keys: list[str] = []
         soak.judged_repeat += 1
         try:
@@ -1119,7 +1140,12 @@ def _judge_soak(soak: _SoakRecord, ledger: Ledger, err: str) -> str:
 
 
 def _sink_record(index: int, keys: list[str], events: list[SinkEvent], closes: Closes) -> str:
-    """One failing sink's record: each close's counts and thread, the gaps, and what lay between."""
+    """One failing sink's record: each close's counts and thread, the gaps, and what lay between.
+
+    SPEC-099 FR-001: each mark carries its label, ``arm(writer:_note_orphan_emit)``,
+    ``take(_close_owed)`` or ``note(<thread>)``, and the record ends with what was recorded after
+    the last close, or ``nothing``: a late write is exactly what comes after it.
+    """
     lines = [f"sink {index}: {' '.join(keys)}; writes={closes.writes}"]
     marks: list[str] = []
     seen = 0
@@ -1137,11 +1163,14 @@ def _sink_record(index: int, keys: list[str], events: list[SinkEvent], closes: C
             seen += 1
             marks = []
         elif isinstance(event, Arm):
-            marks.append("arm(writer)" if event.by_writer else "arm(change)")
+            marks.append(f"arm({'writer' if event.by_writer else 'change'}:{event.by})")
         elif isinstance(event, Take):
-            marks.append("take")
+            marks.append(f"take({event.by})")
         elif isinstance(event, Write):
             marks.append(f"write({event.thread})")
+        elif isinstance(event, Note):
+            marks.append(f"note({event.thread})")
+    lines.append(f"  after the last close: {' '.join(marks) or 'nothing'}")
     return "\n".join(lines)
 
 
@@ -1282,6 +1311,92 @@ def test_the_accounting_identity_holds_under_every_interleaving(
     record_property(GATE_MARGIN, f"{worst:.6f}")
 
 
+SOAK_KNOWN = "soak_known"
+"""The JUnit property a known soak item records its shapes' names under (SPEC-099 FR-002)."""
+
+
+def _soak_item(
+    seed: int,
+    form: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    request: pytest.FixtureRequest,
+    record_property: Callable[[str, object], None],
+    run: Callable[..., object] | None = None,
+    known: Sequence[Known] | None = None,
+) -> None:
+    """The soak item's body, defined whatever the switch says so the default suite can drive it.
+
+    SPEC-099 FR-002. ``run`` is :func:`_interleaving` unless a test stands in for it. It runs
+    inside :func:`_rerun_on_failure`, so any gating assertion it makes propagates as it is, with
+    its re-run note, and nothing below ever sees it: a gating failure is never excused as known.
+    Only after it returns is the soak's own verdict read, by :func:`_soak_verdict`, outside the
+    context manager, which would otherwise catch the expected failure as a ``pytest.fail``
+    exception and attach a re-run note to it.
+
+    Args:
+      seed: The item's seed.
+      form: The passive form.
+      monkeypatch: The item's monkeypatch.
+      capfd: The item's captured output.
+      request: The item's request, for its id.
+      record_property: The item's property recorder.
+      run: What runs the interleaving; :func:`_interleaving` when ``None``.
+      known: The known table to read a red run against; the live ``KNOWN`` when ``None``.
+
+    Returns:
+      None.
+
+    Raises:
+      AssertionError: For a gating failure, or a soak finding with no known shape.
+    """
+    record_property("model_tree", log_foundry.__file__)
+    soak = _SoakRecord()
+    interleave = _interleaving if run is None else run
+    with _rerun_on_failure(request, seed, concurrent=True, soak=True):
+        interleave(seed, form, monkeypatch, capfd, soak)
+    _soak_verdict(soak, request, seed, record_property, known)
+
+
+def _soak_verdict(
+    soak: _SoakRecord,
+    request: pytest.FixtureRequest,
+    seed: int,
+    record_property: Callable[[str, object], None],
+    known: Sequence[Known] | None = None,
+) -> None:
+    """Ends a soak item: clean, an expected failure of known shapes, or a failure (FR-002).
+
+    The verdict explains ``soak.judged``, the snapshot the rules judged, and never re-reads the
+    record. When every finding of every failing sink has a known shape, the item records the
+    shapes' names, each once since ``explain_run`` names a shape once, as :data:`SOAK_KNOWN` and ends in a non-strict expected failure
+    whose reason starts ``known soak finding:``; the soak measures a rate, so the item is not
+    strict. Anything else fails with the record and the command that re-runs the item alone.
+
+    Args:
+      soak: The run's record.
+      request: The item's request, for its id.
+      seed: The item's seed.
+      record_property: The item's property recorder.
+      known: The known table to read against; the live ``KNOWN`` when ``None``. The tests of this
+        machinery pass a fixed table, so a clearing pull request's new row changes none of them.
+
+    Returns:
+      None.
+
+    Raises:
+      AssertionError: For a finding with no known shape, or a run mixing known and unknown.
+    """
+    if not soak.report:
+        return
+    shapes = soak_verdict.explain_run(soak.judged, soak_known.KNOWN if known is None else known)
+    if shapes:
+        record_property(SOAK_KNOWN, ",".join(shape.name for shape in shapes))
+        pytest.xfail(f"{soak_verdict.reason(shapes)}\n{soak.report}")
+    rerun = rerun_command(request.node.nodeid, seed, soak=True)
+    raise AssertionError(f"{soak.report}\nRe-run it alone: {rerun}")
+
+
 if SOAK:
 
     @pytest.mark.parametrize(("form", "seed"), _concurrent_params(SEEDS))
@@ -1293,19 +1408,18 @@ if SOAK:
         request: pytest.FixtureRequest,
         record_property: Callable[[str, object], None],
     ) -> None:
-        """SPEC-086 FR-003: the close count under four callers, collected only on request.
+        """SPEC-086 FR-003 and SPEC-099: the close count under four callers, every night.
 
         The concurrent half exactly as the gating item runs it, with the library's arms and
         takes recorded, and every sink it was handed judged after the final shutdown for an
-        unowed repeat close and a write after its last close returned. A red item is a finding,
-        not a regression in the change under test, and gates nothing; it records no margin.
+        unowed repeat close and a write after its last close returned. Collected under
+        ``LOG_FOUNDRY_MODEL_SOAK=1``, which ``.github/workflows/model-soak.yml`` sets every night
+        on ``main``, when dispatched, and on a pull request that changes the soak. A red item
+        whose every finding has a known shape is an expected failure naming its open item of
+        §12; any other red item fails, and a failed scheduled night stops the PR queue until it
+        is filed. It records no margin.
         """
-        record_property("model_tree", log_foundry.__file__)
-        soak = _SoakRecord()
-        with _rerun_on_failure(request, seed, concurrent=True, soak=True):
-            _interleaving(seed, form, monkeypatch, capfd, soak)
-            if soak.report:
-                raise AssertionError(soak.report)
+        _soak_item(seed, form, monkeypatch, capfd, request, record_property)
 
 
 WIRING_SEED = 2
@@ -1412,7 +1526,7 @@ def test_the_soak_is_wired(
     assert soak.installed == [label for _, _, label in _WRAPPED]
     events = soak.all_events()
     kinds = collections.Counter(type(event).__name__ for event in events)
-    assert {kinds[name] > 0 for name in ("Arm", "Take", "Write", "Close")} == {True}, kinds
+    assert {kinds[name] > 0 for name in ("Arm", "Take", "Write", "Close", "Note")} == {True}, kinds
     assert soak.orphan_entries > 0, "the orphan path's wrapper was never entered"
     assert soak.judged_repeat == soak.judged_late == len(ledger.sinks), (
         soak.judged_repeat,
@@ -1431,7 +1545,8 @@ def test_the_soak_is_wired(
     log_foundry.configure(service="model", sink=fresh)
     log_foundry.info("coda")
     assert soak.events_of(fresh) == [
-        Arm(by_writer=True),
+        Note(threading.current_thread().name),
+        Arm(by_writer=True, by="_note_orphan_emit"),
         Write(threading.current_thread().name),
     ], soak.events_of(fresh)
 
@@ -1453,7 +1568,7 @@ def test_the_soak_records_the_worker_path(monkeypatch: pytest.MonkeyPatch) -> No
     assert soak.builds > 0, "the traced call never entered the worker build's wrapper"
     assert log_foundry.flush(timeout=FLUSH_TIMEOUT), "the flush did not settle"
     events = soak.events_of(sink)
-    assert events[:1] == [Arm(by_writer=True)], f"the worker build's arm: {events}"
+    assert events[:1] == [Arm(by_writer=True, by="_get_worker")], f"the build's arm: {events}"
     assert Write("log-foundry-worker") in events, f"no write on the drain thread: {events}"
     log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
     assert isinstance(soak.events_of(sink)[-1], Close), soak.events_of(sink)
@@ -1536,6 +1651,186 @@ def test_a_name_the_soak_cannot_wrap_fails_it(
     monkeypatch.delattr(owner, name)
     with pytest.raises(pytest.fail.Exception, match=re.escape(label)):
         _install(monkeypatch, _SoakRecord())
+
+
+_LATE = "Thread-2 (runner)"
+_KNOWN_SINK: tuple[list[SinkEvent], Closes] = (
+    [
+        Note("Thread-1 (runner)"),
+        Arm(by_writer=True, by="_note_orphan_emit"),
+        Write("Thread-1 (runner)"),
+        Note(_LATE),
+        Take(by="_close_owed"),
+        Close(1, "MainThread", 0.0),
+        Write(_LATE),
+    ],
+    Closes(2, (1,), (1,)),
+)
+"""One sink whose only finding is §12's orphan late write: its log entered before the last take."""
+
+_NEW_SINK: tuple[list[SinkEvent], Closes] = (
+    [
+        Arm(by_writer=True, by="_get_worker"),
+        Write("log-foundry-worker"),
+        Take(by="_close_owed"),
+        Close(1, "MainThread", 0.0),
+        Write("log-foundry-worker"),
+    ],
+    Closes(2, (1,), (1,)),
+)
+"""One sink whose late write is on the drain thread: never the orphan path's, so it is new."""
+
+_UNTAKEN_SINK: tuple[list[SinkEvent], Closes] = (
+    [Write(_LATE), Close(1, "MainThread", 0.0)],
+    Closes(1, (1,), (1,)),
+)
+"""One sink closed with no take: a wiring failure, which no known shape explains."""
+
+_GATING = "invariant 2 (spans): stand-in gating failure"
+
+
+def _fixture_late_write(events: Sequence[SinkEvent], closes: Closes) -> bool:
+    """The fixture row's predicate: the sink's last write is late and on ``_LATE``'s thread.
+
+    Args:
+      events: One sink's events.
+      closes: Its close record.
+
+    Returns:
+      Whether it has that shape.
+
+    Raises:
+      None.
+    """
+    writes = [event for event in events if isinstance(event, Write)]
+    late = bool(closes.at_return) and closes.writes > closes.at_return[-1]
+    return late and bool(writes) and writes[-1].thread == _LATE
+
+
+_FIXTURE_KNOWN = (Known("fixture-late-write", "A fixture lead", "late-write", _fixture_late_write),)
+"""A fixed known table: these tests are about the verdict, not the live ``KNOWN`` a filing edits."""
+
+
+def _stand_in(judged: list[tuple[list[SinkEvent], Closes]], *, raises: bool) -> Any:
+    """Returns a stand-in for :func:`_interleaving` that leaves a judged soak record behind.
+
+    Args:
+      judged: The snapshot it leaves in ``soak.judged``.
+      raises: Whether it then fails a gating assertion, as ``_interleaving`` does.
+
+    Returns:
+      The stand-in.
+
+    Raises:
+      None.
+    """
+
+    def run(_seed: int, _form: str, _mp: object, _capfd: object, soak: _SoakRecord) -> None:
+        soak.judged = judged
+        soak.report = "soak emit seed=7: invariant 5 broke on 1 of 1 sinks (a stand-in)"
+        if raises:
+            raise AssertionError(_GATING)
+
+    return run
+
+
+def _ending(call: Callable[[], object]) -> tuple[str, BaseException | None]:
+    """Returns how a soak item's body ended: ``"xfail"``, ``"fail"`` or ``"clean"``, and with what.
+
+    An expected failure raised inside a test body marks that test itself as expected to fail,
+    silently, so a verdict test that let one escape would read an excused failure as nothing at
+    all. Every ending is caught here and returned, and the test asserts the one it wants.
+
+    Args:
+      call: The body to run.
+
+    Returns:
+      The ending's name and its exception, ``None`` for a clean one.
+
+    Raises:
+      None.
+    """
+    try:
+        call()
+    except pytest.xfail.Exception as exc:
+        return "xfail", exc
+    except AssertionError as exc:
+        return "fail", exc
+    return "clean", None
+
+
+@pytest.mark.parametrize("raises", [True, False], ids=["gating-failure", "no-gating-failure"])
+def test_a_gating_failure_in_a_soak_item_is_never_excused(
+    raises: bool, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-099 FR-002: a gating failure fails the soak item even when its findings are known.
+
+    The stand-in leaves a record the known shapes explain. With no gating failure the item ends
+    as an expected failure, which shows the record really is known; with one, the gating
+    ``AssertionError`` escapes as it was raised, and the soak's verdict is never read.
+    """
+    request: Any = _Request()
+    recorded: list[tuple[str, object]] = []
+
+    def record(name: str, value: object) -> None:
+        recorded.append((name, value))
+
+    run = _stand_in([_KNOWN_SINK], raises=raises)
+    ending, raised = _ending(
+        lambda: _soak_item(7, "emit", monkeypatch, capfd, request, record, run, _FIXTURE_KNOWN)
+    )
+    if raises:
+        assert ending == "fail", f"a gating failure ended {ending}: {raised}"
+        assert str(raised) == _GATING, raised
+        assert (SOAK_KNOWN, "fixture-late-write") not in recorded, recorded
+    else:
+        assert ending == "xfail", f"a known record ended {ending}: {raised}"
+        assert str(raised).startswith(soak_verdict.KNOWN_PREFIX), raised
+        assert (SOAK_KNOWN, "fixture-late-write") in recorded, recorded
+
+
+@pytest.mark.parametrize(
+    ("judged", "ends", "says"),
+    [
+        ([_KNOWN_SINK], "xfail", "known soak finding: fixture-late-write (§12: A fixture lead)"),
+        ([_KNOWN_SINK, _KNOWN_SINK], "xfail", "known soak finding: fixture-late-write ("),
+        ([_NEW_SINK], "fail", "Re-run it alone: LOG_FOUNDRY_MODEL_SOAK=1"),
+        ([_KNOWN_SINK, _NEW_SINK], "fail", "Re-run it alone: LOG_FOUNDRY_MODEL_SOAK=1"),
+        ([_UNTAKEN_SINK], "fail", "Re-run it alone: LOG_FOUNDRY_MODEL_SOAK=1"),
+        ([], "clean", ""),
+    ],
+    ids=["known", "known-on-two-sinks", "new", "known-beside-new", "untaken", "clean"],
+)
+def test_a_known_soak_item_is_an_expected_failure_and_anything_else_fails(
+    judged: list[tuple[list[SinkEvent], Closes]], ends: str, says: str
+) -> None:
+    """SPEC-099 FR-002: only a run whose every finding is known ends as an expected failure.
+
+    The verdict reads ``soak.judged``, the snapshot the rules judged: the live record here holds
+    nothing at all, so a verdict that re-read it would find nothing to explain. A shape found on
+    two sinks is named once, in the property and in the reason.
+    """
+    soak = _SoakRecord()
+    soak.judged = judged
+    soak.report = "soak deliver seed=7: invariant 5 broke (a stand-in)" if judged else ""
+    request: Any = _Request()
+    recorded: list[tuple[str, object]] = []
+
+    def record(name: str, value: object) -> None:
+        recorded.append((name, value))
+
+    ending, raised = _ending(lambda: _soak_verdict(soak, request, 7, record, _FIXTURE_KNOWN))
+    assert ending == ends, f"ended {ending}, wanted {ends}: {raised}"
+    if ends == "clean":
+        assert recorded == []
+    elif ends == "xfail":
+        text = str(raised)
+        assert text.startswith(says), text
+        assert text.split("\n", 1)[0].count("fixture-late-write") == 1, text
+        assert recorded == [(SOAK_KNOWN, "fixture-late-write")], recorded
+    else:
+        assert says in str(raised), raised
+        assert recorded == [], recorded
 
 
 # -- the sequential driver (SPEC-077 FR-004) ----------------------------------------------------

@@ -30,6 +30,18 @@ WORK="${TMPDIR:-/tmp}/pr-queue-install-test.$$"
 # trap when a signal kills it. `scripts/signal-test.sh` (template repo only) holds every script to this.
 trap 'rm -rf "$WORK"' EXIT
 trap 'exit 1' HUP INT PIPE TERM
+
+# HERMETIC (SPEC-099). The hook asks queue.sh for the nightly soak's verdict, which runs `gh`, and
+# a real, signed-in `gh` with a GH_REPO in the environment would read the real repository. So no
+# variable that points `gh`, the queue or git anywhere is inherited, the user's git config is not
+# read, and a stub `gh` that always fails comes first on PATH: every case sees an unreadable
+# verdict, which the hook leaves to its other checks, exactly as before the soak check existed.
+unset GH_REPO GH_TOKEN GH_HOST GH_ENTERPRISE_TOKEN GITHUB_TOKEN PR_QUEUE_REPO PR_QUEUE_BYPASS PR_QUEUE_DIR
+GIT_CONFIG_GLOBAL=/dev/null; GIT_CONFIG_NOSYSTEM=1; export GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM
+mkdir -p "$WORK/.stub-bin"
+printf '#!/bin/sh\necho "stub gh: no GitHub in this corpus" >&2\nexit 1\n' > "$WORK/.stub-bin/gh"
+chmod +x "$WORK/.stub-bin/gh"
+PATH="$WORK/.stub-bin:$PATH"; export PATH
 pass=0; fail=0
 
 sh -n "$SRC/install.sh" || { echo "FAIL  install.sh does not parse"; exit 1; }

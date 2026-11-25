@@ -76,7 +76,9 @@ keyed on the head sha, merge, confirm `main` went green — not just the push. T
 lock because the wait is exactly when peers merge, and `pre-push` refuses a push whose commits do not
 contain the remote's current `main` whether or not you hold the lock. One ticket per PR: if your spec needs several,
 release between them so the others interleave. If `turn` reports the trunk `IS RED`, stop and
-escalate; a red `main` is fixed before anything else merges. The one exception is a red your own
+escalate; a red `main` is fixed before anything else merges. If it reports that the nightly soak's
+verdict blocks, escalate that night, naming it: a failed scheduled night answers `WAIT` until that
+night's own filing is on `main`, and a clearing PR is written only after Andrew has answered. The one exception is a red your own
 merge caused: you fix it, through the red-trunk path in `scripts/pr-queue/PROTOCOL.md`.
 
 **Escalate, don't improvise — and ask, don't list.** [Name who to escalate to and how: in an arc

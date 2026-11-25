@@ -492,8 +492,11 @@ the close before it, after every step, and that no sink is written after its las
 after every `shutdown()` and exit drain (SPEC-086), its sequential half installing a caller's
 wrapper of either kind, one that leaves its member alone and one that closes it, over a recorder
 the library wrote to, with the repeat rule telling the wrapper's close from the library's
-(SPEC-101); its soak, run only on request and gating
-nothing, judges the same count under four callers by the library's own arms and takes;
+(SPEC-101); its soak judges the same count under four callers by the library's own arms and
+takes and the orphan path's entries, every night on `main` through `.github/workflows/model-soak.yml`
+and on a pull request that changes it, reads a red item of a shape an open item of
+`docs/architecture.md` §12 records as known, and stops the PR queue on a failed scheduled night
+until that night is filed (SPEC-099; `tests/test_soak_known.py`, `tests/test_model_soak_workflow.py`);
 `tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
 lock, its connection released once, and a forked child releases nothing (SPEC-061);
 `tests/test_closed_guard.py`, `tests/test_sink_post_close.py` and `tests/test_sinks_kafka.py` that

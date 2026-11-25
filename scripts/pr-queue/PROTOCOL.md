@@ -1,5 +1,11 @@
 # The PR queue — one PR on the remote at a time, taken in order
 
+> **This changed on 2026-11-25 (SPEC-099).** A failed scheduled night of `Model soak` that has not
+> been filed now makes `turn` answer `WAIT`, and the hook refuse every push but a clearing
+> branch's, until a pull request files that night in `tests/soak_known.py`. `Model soak` runs on
+> `main`'s head no longer count toward `IS RED`. The change takes effect only once `install.sh` is
+> re-run after the merge.
+
 Several agent sessions build different specs against one repo. Each works in its own worktree, so
 their trees never collide — but the remote is still shared. Two PRs open at once means each is
 tested against a `main` the other is about to move, and a merge race turns a green PR red for a
@@ -45,14 +51,17 @@ one call and an `acquire` in the next acquires from the wrong tree.
 `turn` says which refusal it is: someone is ahead of you, the lock is held, a **non-draft** PR is
 open on the remote, `main` is unsettled, or a check could not run. Two need a different response from waiting.
 **If it reports the trunk `IS RED`, stop and escalate to the human** — a red `main` is fixed before
-anything else merges. If it says `NO_TICKET` (exit **3**, not 1) you never got in line; run `ticket`.
+anything else merges. **If it reports that the nightly soak's verdict blocks, escalate that night to
+Andrew the same way, naming it** (the section *The nightly soak's verdict* below says what clears
+it). If it says `NO_TICKET` (exit **3**, not 1) you never got in line; run `ticket`.
 Every other refusal exits 1 and means keep polling.
 
 **The one exception to escalating is the session whose own merge turned `main` red: it fixes the red
 itself.** Its merge turned `main` red when a push run of its merge commit, `Release` or `Spec Lint`,
 failed because of its change. Everything else that reads `IS RED` is escalated to the human like any
 other red: drift the merge only triggered (a `pip-audit`, `Scorecard` or `Zizmor` push failure,
-such as an advisory published that day), a run that is not a push run (a scheduled run, a `dynamic`
+such as an advisory published that day), a run that is not a push run (a scheduled run other than
+the nightly `Model soak`, whose runs the queue reads as the soak's verdict instead, a `dynamic`
 CodeQL or Dependabot job), a GitHub billing block, and a CodeQL upload stall
 (`docs/process/operational-traps.md`). Whether to use `PR_QUEUE_BYPASS=1` for any of those is
 Andrew's call (`.claude/skills/supervise/SKILL.md`). For its own red, `turn` and `acquire` refuse
@@ -208,6 +217,82 @@ The queue only orders the agents that use it, so `turn` also asks the remote its
 covers sessions outside the set. **Both remote checks fail closed.** The trap they are written
 against: a `gh` invocation that *errors* returns empty output, and empty reads as "no PRs open". A
 check that could not run is never evidence that it passed.
+
+## The nightly soak's verdict
+
+`.github/workflows/model-soak.yml` (`Model soak`) soaks the model test every night on `main` (SPEC-099).
+Andrew decided on 2026-11-17 that a failed night blocks merging, so the queue reads the night's
+verdict as a durable fact, and only a recorded act clears it. `$Q/queue.sh soak-verdict` prints it:
+`0 none` when no scheduled night has a verdict, and otherwise `<state> <run id>-<attempt> <time>`,
+with `filed` after it when that attempt is filed. `$Q/queue.sh main-state` prints and exits with
+`main`'s state, which is 4 when the verdict blocks.
+
+- **Which runs count.** Only **scheduled** runs of `Model soak` carry a verdict. A dispatch or a pull
+  request's run never affects the queue: a red dispatch is someone's experiment. Runs of `Model soak`
+  on `main`'s head are left out of the head's reading entirely, so they never read `IS RED`.
+- **Which nights are read.** Every one of the last 30 scheduled runs, on any sha, newest first:
+  the first failing night that is not filed blocks, whatever came after it. **A later green night
+  clears nothing**; only a night's own filing does. On any sha, so a merge made while the night ran
+  cannot step past it. The residue: a red night older than 30 scheduled runs falls out of the
+  window unfiled, and nothing reads it again, so a failed night is escalated the morning it fails.
+- **The attempt rule.** `gh run list` reports only a run's latest attempt, so a re-run night is
+  read attempt by attempt through the API, and **a run blocks if any attempt concluded `failure` or
+  `timed_out`**. A re-run cannot turn a red night green. A one-attempt run's listed conclusion is
+  its own, so it costs no API call: an ordinary `turn` costs three `gh` calls (the open pull
+  requests, the head, the nights). If the API cannot show an attempt, the verdict is unreadable, and
+  `turn` waits on it.
+- **Bounded.** Each `gh` call and fetch the verdict makes runs under `timeout` (or `gtimeout`) for
+  20 s, `PR_QUEUE_GH_TIMEOUT` overriding it (a value that is not a positive whole number, `0`
+  included, reads as 20); an expiry reads as unreadable, so the hook lets the
+  push through as it does whenever it cannot read the verdict. Where neither command is installed
+  the calls are unbounded, and a hung `gh` holds the push until it returns.
+- **Which conclusions block.** `failure` and `timed_out` block; a timeout may be a hang the guard
+  could not catch. `success` is a verdict that does not block. `cancelled`, `startup_failure`,
+  `action_required`, `skipped`, `neutral`, `stale` and an attempt not yet finished are no verdict,
+  and a night with nothing else is passed over for the night before it. That reading is the
+  orchestrating session's, recorded as its call: the block was put to Andrew as "a failed night
+  would mean a new suspected data-loss bug", and a night that judged nothing suspects nothing. So
+  `turn`'s `READY` carries a note when the newest verdict is over 48 hours old, or when there is none
+  in the last 30 nights.
+- **The filing.** A night is cleared only by its own filing: the line
+  `    "<run id>-<attempt>": "<§12 lead>",` in `FILED_NIGHTS` in `tests/soak_known.py` on `main`,
+  for the attempt the verdict names (its last failing one). The queue reads it at a ref of its own,
+  `refs/pr-queue/main`, fetched with `--refmap=` so it never moves `origin/main`. A filing of
+  another night, of an earlier attempt, in a comment, at another indent or on a branch does not
+  clear it. Nothing else does either: not a re-run, not a later green night, not a time.
+- **The clearing branch.** While the verdict blocks, `turn` answers `READY` only to a branch whose
+  commits since its merge base with `refs/pr-queue/main` change `tests/soak_known.py` and
+  `docs/architecture.md` and nothing else, each left a regular file; `acquire` refuses to stamp the
+  lock onto any other branch, even for the lock's holder; and the hook refuses any other push,
+  whatever else is red, failing open only when it cannot read the verdict. A clearing branch adds
+  the night's `FILED_NIGHTS` entry, files the finding under its item of `docs/architecture.md` §12
+  (a new item under `### Open` when it is new), and adds a `KNOWN` row when the finding is a soak
+  signature of a new shape — never for a `repeat` whose record is Shape A's (`tests/soak_known.py`
+  says why). `tests/soak_ceilings.py` is not a clearing file, so it cannot raise a ceiling.
+- **Open pull requests.** An open non-draft pull request, a bot's included, or one pushed before
+  the night went red, holds every `turn`, a clearing branch's too, and nothing may merge on a 4. So
+  `turn`'s `WAIT` names the remedy while the verdict blocks: **the session filing the night, once
+  Andrew has answered, converts every open non-draft pull request to a draft with
+  `gh pr ready --undo <n>` before taking its turn, and marks each ready again with
+  `gh pr ready <n>` once the filing has merged.**
+- **Who writes it.** A session that reads the soak's `WAIT` escalates the night to Andrew, naming
+  the run, as it does any red. **A clearing pull request is written only once Andrew has answered
+  that escalation.** A finding no row can explain, a gating failure among them, is filed the same
+  way, and the next night is red again until its fix lands as an ordinary pull request.
+
+Three consequences:
+
+- **Stale-lock reaping stops while the verdict blocks**, since it breaks a lock only while `main` is
+  green. A lock whose holder died is kept until the night is filed, and while it is held no
+  clearing branch can acquire; breaking it is Andrew's, as under any red. A live holder can file the
+  night itself: convert its open pull request to a draft and re-acquire from a clearing branch.
+- **Merging needs no lock, and the `main` ruleset requires no status check**, so a holder whose pull
+  request was pushed before the night went red can still merge it. The merge does not clear the
+  night, but it lands unreviewed against the night's finding. **Run `$Q/queue.sh main-state` before
+  every merge**, and do not merge on a 4. Nothing enforces that.
+- **The installed queue must be updated.** Sessions run the copies `install.sh` wrote, so this
+  takes effect only when `install.sh` is run again after SPEC-099 merges. Until then a red scheduled
+  run on `main`'s head reads `IS RED` and escalates as before, which still blocks.
 
 ## Stale entries
 

@@ -20,6 +20,9 @@ rule, the soak's event record and its unowed-repeat rule, the two switches' pars
 command and the gate's margin line. The model file is copied to an older commit with this module
 for the same reason the cells are, and ``tests/conftest.py`` validates the switches through the
 parsers here before any file is collected.
+
+**SPEC-099 adds** the soak's :class:`Note`, the ``by`` labels on :class:`Arm` and :class:`Take`,
+and :func:`owed_between`, the one rule the soak item and ``tests/soak_verdict.py`` judge by.
 """
 
 from __future__ import annotations
@@ -737,6 +740,13 @@ def _worst(reports: Iterable[object], prop: str) -> tuple[float, str] | None:
 GATE_MARGIN = "model_gate_margin"
 """The property each gating run of ``tests/test_invariants_model.py`` records its margin under."""
 
+FORMS_SOAKED = ("emit", "deliver", "http")
+"""The passive forms the concurrent half and its soak run, one item each per seed.
+
+Kept here, not in the model file, so ``scripts/model-soak-report.py`` sizes the nightly floor from
+the same tuple the items are made from (SPEC-099).
+"""
+
 SEEDS_VARIABLE = "LOG_FOUNDRY_MODEL_SEEDS"
 """The environment variable that names the seeds both halves of the model run."""
 
@@ -774,14 +784,38 @@ class Arm:
     Attributes:
       by_writer: Whether the arm was recorded on a thread inside ``api._note_orphan_emit``, the
         orphan path's call that arms a sink for the write it is about to make.
+      by: The name of the library function that called ``arm``, read from the caller's frame,
+        or empty where nothing recorded it (SPEC-099 FR-001).
     """
 
     by_writer: bool
+    by: str = ""
 
 
 @dataclass(frozen=True)
 class Take:
-    """The library took a sink out of its owed record to close it (``_CloseRegistry.take``)."""
+    """The library took a sink out of its owed record to close it (``_CloseRegistry.take``).
+
+    Attributes:
+      by: The name of the library function that called ``take``, read from the caller's frame,
+        or empty where nothing recorded it (SPEC-099 FR-001).
+    """
+
+    by: str = ""
+
+
+@dataclass(frozen=True)
+class Note:
+    """An orphan log entered ``api._note_orphan_emit`` for the sink, before its owed check.
+
+    Recorded at the call's entry, so a log that finds the sink already owed and arms nothing is
+    still seen entering (SPEC-099 FR-001).
+
+    Attributes:
+      thread: The name of the thread that made the log.
+    """
+
+    thread: str
 
 
 @dataclass(frozen=True)
@@ -810,7 +844,7 @@ class Close:
     at: float
 
 
-SinkEvent = Arm | Take | Write | Close
+SinkEvent = Arm | Take | Write | Close | Note
 
 
 def take_of_each_close(events: Sequence[SinkEvent]) -> list[int | None]:
@@ -845,14 +879,15 @@ def take_of_each_close(events: Sequence[SinkEvent]) -> list[int | None]:
 
 
 def check_unowed_repeat(events: Sequence[SinkEvent]) -> None:
-    """Holds a sink to no second close at one write count that no writer's arm made owed.
+    """Holds a sink to no second close at one write count that nothing between the takes owed.
 
-    SPEC-086 FR-003. Two consecutive closes that entered at one count are a finding unless an
-    arm recorded on a thread inside ``api._note_orphan_emit`` lies strictly between the take the
-    first close discharges and the take the second discharges: that is a writer arming the sink
-    again after the first take, which invariant 5 records as owed a second close (SPEC-045). A
-    sink change's arm between the takes excuses nothing, since that is #339's double close. A
-    close with no take of its own is reported as ``untaken`` and excuses nothing either.
+    SPEC-086 FR-003, widened by SPEC-099 FR-001. Two consecutive closes that entered at one
+    count are a finding unless :func:`owed_between` finds what owes the second close strictly
+    between the take the first close discharges and the take the second discharges: a writer's
+    arm, or a log that entered after the first take and wrote before the second. Invariant 5
+    records either as owed a second close (SPEC-045). A sink change's arm between the takes
+    excuses nothing, since that is #339's double close. A close with no take of its own is
+    reported as ``untaken`` and excuses nothing either.
 
     Args:
       events: One sink's events, in the order recorded.
@@ -876,12 +911,48 @@ def check_unowed_repeat(events: Sequence[SinkEvent]) -> None:
             continue
         if first_take is not None and second_take is not None:
             low, high = sorted((first_take, second_take))
-            between = events[low + 1 : high]
-            if any(isinstance(event, Arm) and event.by_writer for event in between):
+            if owed_between(events[low + 1 : high]):
                 continue
         keys.append(f"repeat@{second.count}")
     if keys:
         raise CloseBroken(*keys, detail=f"{list(events)}")
+
+
+def owed_between(between: Sequence[SinkEvent]) -> bool:
+    """Returns whether the stretch between two closes' takes owes the sink its second close.
+
+    SPEC-099 FR-001. Invariant 5 owes a sink a second close when it is written after its first
+    close was taken (SPEC-045). Two records show that: a writer's arm, and a :class:`Note` on a
+    thread followed later in the stretch by a :class:`Write` on that same thread, which is a log
+    that entered after the first take and wrote before the second. The second is needed because
+    a log that finds the sink already owed, re-armed by something else such as a sink change,
+    takes the fast path and arms nothing of its own.
+
+    **Not any write.** A write whose log passed its owed check before the first take, and wrote
+    after it, is the race of §12's orphan-log item and owes nothing here: excusing any write
+    between the takes reads Shape A, a sink change arming a sink a ``shutdown()`` had already
+    taken and closed, as owed. Nothing else owes the second close either: not a ``Note`` alone,
+    not a ``Write`` with no ``Note`` of its thread before it in the stretch, and not a ``Note``
+    on one thread with a ``Write`` on another.
+
+    Args:
+      between: One sink's events strictly between the two takes, in the order recorded.
+
+    Returns:
+      Whether the second close is owed.
+
+    Raises:
+      None.
+    """
+    entered: set[str] = set()
+    for event in between:
+        if isinstance(event, Arm) and event.by_writer:
+            return True
+        if isinstance(event, Note):
+            entered.add(event.thread)
+        elif isinstance(event, Write) and event.thread in entered:
+            return True
+    return False
 
 
 def parse_seeds(value: str) -> tuple[int, ...]:

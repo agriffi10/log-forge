@@ -10,6 +10,11 @@
 #   queue.sh release SPEC-207   # drop the lock and the ticket; always exit 0
 #   queue.sh status             # who holds it, who is waiting, what is on the remote
 #   queue.sh reap               # drop dead waiters and a dead holder (also runs automatically)
+#   queue.sh main-state         # print and exit with main's state: 0 green · 1 red · 2 building
+#                               #   · 3 could not read · 4 the nightly soak's verdict blocks
+#   queue.sh soak-verdict       # the soak's 30-night window: "4 <night> <time>" for a failed
+#                               #   night not filed, else "0 <night> <time> [filed]" or "0 none"
+#   queue.sh clearing-range A B # 0 when A..B changes only the soak's two clearing files
 #
 # THIS SCRIPT LIVES OUTSIDE THE REPO. Its own directory is the queue, so every session on the
 # checkout sees one lock and one line. A copy inside a worktree would be invisible to peers, and
@@ -104,21 +109,42 @@ all_prs() {
   return 0
 }
 
-# main_green  0 green · 1 RED · 2 building or unsettled · 3 the check could not run.
-#             Only 0 lets the queue move, so a check that could not run is never read as
-#             evidence that it passed.
+# main_green  0 green · 1 RED · 2 building or unsettled · 3 the check could not run · 4 the
+#             nightly soak has a scheduled night in its 30-run window that failed and is not
+#             filed (SPEC-099). Only 0
+#             lets the queue move, so a check that could not run is never read as evidence that
+#             it passed. The head's runs are read first; only when they are clear is the soak's
+#             verdict read, and a verdict that cannot be read is 3.
 main_green() {
   [ -x "$Q/main-green" ] && { "$Q/main-green"; return $?; }
-  local sha runs rsha status conclusion any=0 building=0 red=0
+  local hs
+  head_green; hs=$?
+  [ "$hs" -eq 0 ] || return "$hs"
+  soak_read
+  case "$SOAK_RC" in 0) return 0 ;; 4) return 4 ;; *) return 3 ;; esac
+}
+
+# head_green  main_green's reading of the runs on main's head, as it was before SPEC-099, with the
+#             nightly soak's runs left out: a soak run on the head is a dispatch's or a night's, and
+#             only soak_verdict reads those. A red dispatch is someone's experiment, not a red main.
+#
+#             Every multi-field line read from gh renders each field through GH_FIELDS: `gh run list
+#             --json` gives a run with no conclusion yet as "" and the API gives null, and an empty
+#             field between two others vanishes under `read`, shifting every field after it (an
+#             in-progress `Model soak` run read as `conclusion=Model wf=soak`). So no field is ever
+#             empty: a missing value is the token "-".
+head_green() {
+  local sha runs rsha status conclusion wf any=0 building=0 red=0
   # ls-remote rather than a fetch: it reads the remote's head without touching local refs, which
   # several worktrees hitting FETCH_HEAD at once would race on.
   sha="$( cd "$REPO" && git ls-remote origin "refs/heads/$MAIN" 2>/dev/null | cut -f1 )" || return 3
   [ -n "$sha" ] || return 3
   runs="$( cd "$REPO" && gh run list --branch "$MAIN" --limit 30 \
-             --json headSha,status,conclusion \
-             --jq '.[] | "\(.headSha) \(.status) \(.conclusion)"' )" || return 3
-  while read -r rsha status conclusion; do
+             --json headSha,status,conclusion,workflowName \
+             --jq ".[] | [.headSha, .status, .conclusion, .workflowName] | $GH_FIELDS" )" || return 3
+  while read -r rsha status conclusion wf; do
     [ "$rsha" = "$sha" ] || continue
+    [ "$wf" = "$SOAK_WORKFLOW" ] && continue
     any=1
     [ "$status" = "completed" ] || { building=1; continue; }
     case "$conclusion" in success|skipped|neutral) ;; *) red=1 ;; esac
@@ -136,6 +162,185 @@ main_green() {
   [ "$building" -eq 1 ] && return 2
   return 0
 }
+
+# --- the nightly soak's verdict (SPEC-099) ----------------------------------------------------
+# `.github/workflows/model-soak.yml` soaks the model test every night. A failed SCHEDULED night
+# stops the queue as a durable fact until a pull request files that night; tests/
+# test_model_soak_workflow.py holds the workflow's `name:` and file name to these two values.
+SOAK_WORKFLOW="Model soak"
+SOAK_FILE="model-soak.yml"
+SOAK_LOOKBACK=30        # scheduled runs read back through nights with no verdict: a month
+SOAK_QUIET_HOURS=48     # a verdict older than this is named in turn's READY answer
+SOAK_REF="refs/pr-queue/$MAIN"
+SOAK_LINE=""; SOAK_RC=""
+
+# soak_read  reads soak_verdict once per queue.sh process into SOAK_LINE and SOAK_RC, so turn,
+#            acquire, the note and status all decide on one reading of the night. It runs
+#            soak_verdict in this shell, through a temp file, not a $( ) subshell, so the fetch
+#            cache (FETCHED_QUEUE_REF) it sets survives and clearing_branch does not fetch again.
+soak_read() {
+  [ -n "$SOAK_RC" ] && return 0
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/queue-soak.XXXXXX")" || { SOAK_LINE="3 unreadable"; SOAK_RC=3; return 0; }
+  soak_verdict > "$tmp"; SOAK_RC=$?
+  SOAK_LINE="$(cat "$tmp")"; rm -f "$tmp"
+}
+
+# soak_verdict  0 nothing blocks · 4 a scheduled night in the window failed and its failing
+#               attempt is not filed · 3 the verdict could not be read. Prints "0 none" when no
+#               night has a verdict, "0 off" under a main-green override (a project whose CI is not
+#               GitHub Actions has no nightly soak), "3 unreadable", "4 <run id>-<attempt> <time>"
+#               for the newest unfiled failing night, and otherwise "0 <run id>-<attempt> <time>"
+#               for the newest night with a verdict, with "filed" after it when that night failed
+#               and is filed. The time is when the night ran (a run's createdAt) for a one-attempt
+#               night, and the attempt's updated_at for a re-run one.
+#
+# Only SCHEDULED runs carry a verdict: a dispatch or a pull request's run is someone's experiment.
+# Every night in the last SOAK_LOOKBACK scheduled runs is read, on any sha, newest first, and the
+# first failing night not filed blocks: a later green night clears nothing, since only a night's
+# own filing does. A red night older than SOAK_LOOKBACK scheduled runs falls out of the window
+# unfiled; that is the residue of a bounded read, and PROTOCOL.md says so. A failure or timed_out
+# in ANY attempt makes a night failing, whatever a re-run did later. `gh run list` reports only a
+# run's latest attempt, so a run with more than one is read attempt by attempt through the API; a
+# one-attempt run's listed conclusion is that attempt's, so it costs no API call. A run is listed
+# whatever its status, so a re-run in progress hides none of the attempts before it. A night with
+# no verdict (in progress, cancelled, startup_failure, action_required, skipped, neutral, stale)
+# blocks nothing and is passed over. The attempt a failing night names is its last failing one.
+soak_verdict() {
+  [ -x "$Q/main-green" ] && { echo "0 off"; return 0; }
+  local runs id attempts status conc created n a c t bad when good goodwhen newest=""
+  runs="$( cd "$REPO" && bounded gh run list --workflow "$SOAK_FILE" --event schedule \
+             --limit "$SOAK_LOOKBACK" --json databaseId,attempt,status,conclusion,createdAt \
+             --jq ".[] | [.databaseId, .attempt, .status, .conclusion, .createdAt] | $GH_FIELDS" \
+             </dev/null )" || { echo "3 unreadable"; return 3; }
+  while read -r id attempts status conc created; do
+    [ -n "$id" ] || continue
+    case "$id/$attempts" in *[!0-9/]*|/*|*/) echo "3 unreadable"; return 3 ;; esac
+    bad=""; when=""; good=""; goodwhen=""
+    if [ "$attempts" -eq 1 ]; then
+      [ "$status" = completed ] || conc="-"
+      case "$conc" in
+        failure|timed_out) bad=1; when="$created" ;;
+        success)           good=1; goodwhen="$created" ;;
+      esac
+    else
+      n=1
+      while [ "$n" -le "$attempts" ]; do
+        a="$( cd "$REPO" && bounded gh api "repos/{owner}/{repo}/actions/runs/$id/attempts/$n" \
+                --jq "[.conclusion, .updated_at] | $GH_FIELDS" </dev/null )" || { echo "3 unreadable"; return 3; }
+        c="${a%% *}"; t="${a#* }"
+        case "$c" in
+          failure|timed_out) bad="$n"; when="$t" ;;
+          success)           good="$n"; goodwhen="$t" ;;
+        esac
+        n=$((n + 1))
+      done
+    fi
+    if [ -n "$bad" ]; then
+      filed "$id-$bad"
+      case $? in
+        0) [ -n "$newest" ] || newest="0 $id-$bad $when filed" ;;
+        1) echo "4 $id-$bad $when"; return 4 ;;
+        *) echo "3 unreadable"; return 3 ;;
+      esac
+    elif [ -n "$good" ]; then
+      [ -n "$newest" ] || newest="0 $id-$good $goodwhen"
+    fi
+  done <<< "$runs"
+  echo "${newest:-0 none}"; return 0
+}
+
+# bounded <command...>  runs the command under timeout(1), or gtimeout, for GH_TIMEOUT seconds when
+#             either exists, so a hung gh or fetch cannot hold a push or a turn: an expiry is a
+#             failure, which every caller reads as unreadable, and the hook then fails open. With
+#             neither installed the call is unbounded, which PROTOCOL.md says.
+GH_TIMEOUT="${PR_QUEUE_GH_TIMEOUT:-20}"
+# A bound that is not a positive whole number is the default: 0 would disable GNU timeout, and a
+# word would make every bounded call fail, which reads as unreadable forever.
+[ "$GH_TIMEOUT" -gt 0 ] 2>/dev/null || GH_TIMEOUT=20
+bounded() {
+  if command -v timeout >/dev/null 2>&1; then timeout "$GH_TIMEOUT" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$GH_TIMEOUT" "$@"
+  else "$@"
+  fi
+}
+
+# fetch_queue_ref  fetches the trunk into SOAK_REF, a ref no session works on. `--refmap=` is what
+#             keeps it there: without it git also updates refs/remotes/origin/<trunk> from the
+#             same fetch (measured, git 2.54.0), and moving origin/main under a session in the
+#             middle of a rebase is a known hazard. --no-write-fetch-head, because several
+#             worktrees hitting FETCH_HEAD at once would race. Every soak fetch is this one.
+FETCHED_QUEUE_REF=0
+fetch_queue_ref() {
+  [ "$FETCHED_QUEUE_REF" = 1 ] && return 0
+  bounded git -C "$REPO" fetch -q --no-write-fetch-head --refmap= origin \
+      "+refs/heads/$MAIN:$SOAK_REF" </dev/null 2>/dev/null || return 1
+  FETCHED_QUEUE_REF=1
+}
+
+# filed <run id>-<attempt>  0 when tests/soak_known.py at SOAK_REF files that attempt in
+#             FILED_NIGHTS, one entry a line as soak_known.py writes it; 1 when it does not; 2
+#             when the trunk could not be read. The filing is the night's own key, so no clock is
+#             compared, and a filing cannot be carried by the tree the night tested.
+filed() {
+  local text
+  fetch_queue_ref || return 2
+  text="$(git -C "$REPO" show "$SOAK_REF:tests/soak_known.py" 2>/dev/null)" || return 2
+  printf '%s\n' "$text" | grep -qE "^    \"$1\": \".+\",\$" && return 0
+  return 1
+}
+
+# clearing_range <from> <to>  0 when the commits from..to in $PWD change something, and only
+#             tests/soak_known.py and docs/architecture.md, each left a regular file (100644).
+#             Names are read NUL-delimited and compared whole; a rename reads as a deletion and an
+#             addition; an empty range, or one whose changes revert each other, is not clearing.
+#             Read with the plumbing `diff-tree`, not porcelain `diff`, so no diff.* or color.*
+#             setting can change what is read: `diff.ignoreSubmodules all` hid an added gitlink
+#             from `git diff --raw`, and --ignore-submodules=none says so for the plumbing too.
+clearing_range() {
+  local meta path mode n=0
+  while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
+    n=$((n + 1))
+    read -r _ mode _ <<< "${meta#:}"
+    [ "$mode" = 100644 ] || return 1
+    [ "$path" = tests/soak_known.py ] || [ "$path" = docs/architecture.md ] || return 1
+  done < <(git -C "$PWD" diff-tree -r -z --no-abbrev --no-renames --ignore-submodules=none "$1" "$2" -- 2>/dev/null)
+  [ "$n" -gt 0 ]
+}
+
+# clearing_branch  0 when the branch in $PWD is a clearing range from its merge base with
+#             SOAK_REF, fetched first. Never origin/main: a session's origin/main can be stale, and
+#             a stale base counts a peer's merged commits as the branch's own.
+clearing_branch() {
+  local base
+  fetch_queue_ref || return 1
+  base="$(git -C "$PWD" merge-base HEAD "$SOAK_REF" 2>/dev/null)" || return 1
+  clearing_range "$base" HEAD
+}
+
+# soak_note  turn's and status's line about a soak that is checking nothing: a verdict older than
+#            SOAK_QUIET_HOURS, no verdict in the last SOAK_LOOKBACK nights, a verdict that could
+#            not be read, or a main-green override under which it is not read. Silent otherwise.
+soak_note() {
+  local t cut
+  soak_read
+  case "$SOAK_LINE" in
+    "0 off"*)  echo "  note: the nightly soak is not read: a main-green override is installed"; return 0 ;;
+    "0 none"*) echo "  note: the nightly soak has no verdict in its last $SOAK_LOOKBACK scheduled runs"; return 0 ;;
+    3*)        echo "  note: the nightly soak's verdict could not be read"; return 0 ;;
+  esac
+  t="$(printf '%s' "$SOAK_LINE" | awk '{print $3}')"
+  cut="$(date -u -v-"${SOAK_QUIET_HOURS}"H +%Y-%m-%dT%H:%M:%S 2>/dev/null \
+         || date -u -d "$SOAK_QUIET_HOURS hours ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null)"
+  if [ -n "$t" ] && [ -n "$cut" ] && [[ "${t:0:19}" < "$cut" ]]; then
+    echo "  note: the nightly soak's newest verdict is from $t"
+  fi
+  return 0
+}
+
+# GH_FIELDS  joins a jq array of fields with single spaces, each null or "" rendered as "-", so a line
+#            of gh output always has every field, whatever the client renders for a missing value.
+GH_FIELDS='map(if . == null or . == "" then "-" else tostring end) | join(" ")'
 
 # --- the holder file --------------------------------------------------------------------------
 # `key value` lines, one fact per line, read by field name. The branch is compared as a STRING,
@@ -257,11 +462,27 @@ cmd_turn() {
   # The lock only orders the agents that take it. Sessions outside the set push without one, so
   # ask the remote itself as well.
   pr="$(open_prs)" || { echo "WAIT — could not read the remote (the check failed). Not assuming it is clear."; return 1; }
-  [ -z "$pr" ] || { echo "WAIT — a PR is open on the remote:"; echo "$pr" | head -3; return 1; }
+  if [ -n "$pr" ]; then
+    echo "WAIT — a PR is open on the remote:"; echo "$pr" | head -3
+    # While the soak's verdict blocks, an open PR (a bot's, or one pushed before the night went
+    # red) would hold the night's filing out indefinitely, and PROTOCOL.md forbids merging it on a
+    # 4. So the WAIT names the remedy.
+    soak_read
+    if [ "$SOAK_RC" = 4 ]; then
+      echo "  The nightly soak's verdict blocks ($(printf '%s' "$SOAK_LINE" | cut -d' ' -f2,3)). Once Andrew has answered, the session filing that night converts every open non-draft PR, a bot's included, to a draft (gh pr ready --undo <n>) before its turn, and marks them ready again once the filing has merged ($Q/PROTOCOL.md)."
+    fi
+    return 1
+  fi
   main_green; rc=$?
   case $rc in
-    0) echo "READY — your turn, no PR open, $MAIN green"; return 0 ;;
+    0) echo "READY — your turn, no PR open, $MAIN green"; soak_note; return 0 ;;
     1) echo "WAIT — $MAIN IS RED. Stop and escalate; a red $MAIN is fixed before anything merges."; return 1 ;;
+    4) if clearing_branch; then
+         echo "READY — the nightly soak's verdict blocks ($(printf '%s' "$SOAK_LINE" | cut -d' ' -f2,3)), and this branch only files a night"
+         return 0
+       fi
+       echo "WAIT — the nightly soak's verdict blocks ($(printf '%s' "$SOAK_LINE" | cut -d' ' -f2,3)). Escalate the night to Andrew, naming it; once he has answered, only a branch that files it may land ($Q/PROTOCOL.md)."
+       return 1 ;;
     3) echo "WAIT — could not read $MAIN's status (the check failed). Not assuming it is green."; return 1 ;;
     *) echo "WAIT — $MAIN is building or unsettled"; return 1 ;;
   esac
@@ -304,7 +525,20 @@ MSG
     echo "  note: pre-push does not enforce '$branch' — it is outside enforce-branches, so this" >&2
     echo "        lock orders the agents that take one and stops nobody else pushing it." >&2
   fi
-  out="$(cmd_turn "$spec")" || { echo "BUSY — $out"; return 1; }
+  # turn runs in this shell, not a $( ) subshell, so the soak's one reading (soak_read) is shared
+  # with the check below rather than read twice and possibly disagreeing.
+  local tmp rc
+  tmp="$(mktemp "${TMPDIR:-/tmp}/queue-turn.XXXXXX")" || { echo "BUSY — could not make a temp file"; return 1; }
+  cmd_turn "$spec" > "$tmp"; rc=$?
+  out="$(cat "$tmp")"; rm -f "$tmp"
+  [ "$rc" -eq 0 ] || { echo "BUSY — $out"; return 1; }
+  # A holder's turn answers READY before it reads the trunk, so the soak's verdict is read here
+  # too: while it blocks, the lock is never stamped onto a branch that does more than file a night.
+  soak_read   # the reading turn made, when it made one
+  if [ "$SOAK_RC" = 4 ] && ! clearing_branch; then
+    echo "REFUSED — the nightly soak's verdict blocks ($(printf '%s' "$SOAK_LINE" | cut -d' ' -f2,3)), and '$branch' changes more than tests/soak_known.py and docs/architecture.md."
+    return 1
+  fi
   # mkdir IS the atomicity: it either creates or fails, with no window between the two. A
   # test-then-create has a gap, and agents polling on similar cadences land in it.
   if ! mkdir "$LOCK" 2>/dev/null; then
@@ -351,6 +585,9 @@ cmd_status() {
     printf '  %s  %s  (%ss since heartbeat)\n' \
       "$n" "$(cat "$TICKETS/$n/spec" 2>/dev/null)" "$(ticket_age "$TICKETS/$n")"
   done
+  soak_read
+  echo "SOAK: $SOAK_LINE"
+  soak_note
   echo "OPEN PRs:"
   # Assigned first, then printed: in a pipeline `||` would test sed's exit status, not the
   # check's, and the "could not read" branch would never fire.
@@ -368,6 +605,9 @@ case "${1:-}" in
   acquire) cmd_acquire "${2:?spec id required}" ;;
   release) cmd_release "${2:?spec id required}" ;;
   status)  cmd_status ;;
+  main-state)     main_green; rc=$?; echo "$rc"; exit "$rc" ;;
+  soak-verdict)   soak_read; printf '%s\n' "$SOAK_LINE"; exit "$SOAK_RC" ;;
+  clearing-range) clearing_range "${2:?from}" "${3:?to}"; exit $? ;;
   reap)    mkdir -p "$TICKETS"; reap; echo "reaped" ;;
-  *) sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 64 ;;
+  *) sed -n '2,20p' "${BASH_SOURCE[0]}"; exit 64 ;;
 esac

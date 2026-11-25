@@ -1,0 +1,105 @@
+name: Model soak
+
+# SPEC-099: the model test's close count under four callers, soaked every night on `main`.
+#
+# A red soak item whose every finding has a shape an open item of `docs/architecture.md` §12
+# records (`tests/soak_known.py`) ends as an expected failure and the run stays green, under each
+# shape's nightly ceiling (`tests/soak_ceilings.py`). Anything else turns the run red, and a red
+# SCHEDULED night stops the PR queue until a pull request files it (`scripts/pr-queue/PROTOCOL.md`);
+# a dispatch's or a pull request's run never reaches the queue. `tests/test_model_soak_workflow.py`
+# holds this file to what the soak needs, and `scripts/pr-queue/queue.sh` reads its runs by this
+# file's name and its `name:` above, which that test ties to `SOAK_FILE` and `SOAK_WORKFLOW`.
+on:
+  # Once a day, off the hour as GitHub advises, after the Monday schedules of the other workflows.
+  schedule:
+    - cron: "37 9 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "LOG_FOUNDRY_MODEL_SEEDS for this run, at most 10,000 seeds; empty for this run's window"
+        required: false
+        default: ""
+  # The only way the job body runs on a runner before a merge: a schedule fires only from the
+  # default branch. The paths are what defines the soak or installs what it runs, every module
+  # under tests/ the model file and conftest.py import included, derived and held by the test.
+  pull_request:
+    paths:
+      - ".github/workflows/model-soak.yml"
+      - ".github/actions/install-poetry/**"
+      - "scripts/model-soak-report.py"
+      - "tests/soak_known.py"
+      - "tests/soak_verdict.py"
+      - "tests/soak_ceilings.py"
+      - "tests/_reentry.py"
+      - "tests/conftest.py"
+      - "tests/ledger_check.py"
+      - "tests/model_oracles.py"
+      - "tests/model_pins.py"
+      - "tests/model_sinks.py"
+      - "tests/shadow_check.py"
+      - "tests/sink_rigs.py"
+      - "tests/test_fork_lifecycle.py"
+      - "tests/test_invariants_model.py"
+      - "tests/test_public_surface.py"
+      - "tests/test_sink_concurrency.py"
+      - "tests/test_sinks_http.py"
+      - "pyproject.toml"
+      - "poetry.lock"
+
+permissions:
+  contents: read
+
+# Concurrency groups are repository-wide, so the prefix keeps this apart from ci.yml's `ci-`
+# group. A pull request's run supersedes its own earlier run; a scheduled or dispatched run keys
+# on its own run_id, so no later dispatch can displace a pending night.
+concurrency:
+  group: model-soak-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    name: soak the close count
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # nothing here runs git; don't leave a token on disk
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        uses: ./.github/actions/install-poetry
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      # A dispatch's input, a pull request's 0-99, or the run number's window; refused input fails
+      # the step with nothing written to GITHUB_OUTPUT. Every expression is a whole env value.
+      - name: Choose the seeds
+        id: seeds
+        env:
+          ASKED: ${{ inputs.seeds }}
+          EVENT: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          seeds="$(poetry run python scripts/model-soak-report.py seeds --event="$EVENT" --asked="$ASKED" --run-number="$RUN_NUMBER")"
+          echo "seeds=$seeds" >> "$GITHUB_OUTPUT"
+
+      # A bare pytest, so it inherits addopts' -n 12: at -n 4 the same items took three times as long.
+      - name: Soak
+        env:
+          LOG_FOUNDRY_MODEL_SOAK: "1"
+          LOG_FOUNDRY_MODEL_SEEDS: ${{ steps.seeds.outputs.seeds }}
+        run: poetry run pytest tests/test_invariants_model.py -k "test_soak_the_close_count_under_concurrency or test_the_soak_is_wired or test_the_soak_records_the_worker_path or test_a_name_the_soak_cannot_wrap_fails_it" -p no:cacheprovider -rfEx --junitxml=soak.xml
+
+      # Writes the summary itself rather than through a pipe, which bash -e without pipefail
+      # would let hide the report's exit status.
+      - name: Report
+        if: always()
+        env:
+          SEEDS: ${{ steps.seeds.outputs.seeds }}
+        run: poetry run python scripts/model-soak-report.py report soak.xml "$SEEDS" --summary "$GITHUB_STEP_SUMMARY"

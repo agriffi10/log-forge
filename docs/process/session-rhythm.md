@@ -53,7 +53,7 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
 - Before pushing, run **this repo's six gates** locally and get them green: `poetry run ruff check .`,
   `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
   `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that
-  linter, the shared frontmatter reader or the index generator — plus `sh scripts/pr-queue-test.sh` if you touched the queue or its hook, and
+  linter, the shared frontmatter reader or the index generator — plus `sh scripts/pr-queue-test.sh` and `pr-queue-soak-test.sh` if you touched the queue or its hook, and
   `sh scripts/pr-queue/install-test.sh` if you touched its installer.
   **`docs-lint.sh` and `docstring-lint.py` are in that set and nothing in CI runs either.** They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
