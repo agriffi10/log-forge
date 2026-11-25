@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-099
 title: "A Nightly Soak of the Model Test: Known Findings Named by Their Open Item, New Ones Block the Queue Until Filed"
 description: "Runs SPEC-086's soak of the model test's close count every night on main, reads a second close that a log entering after the first take owes as owed, names each red item whose shape an open item of architecture.md §12 already records as known by that item until the item closes or its nightly ceiling is passed, and turns the run red for anything else; a scheduled night that fails stops the PR queue until a pull request files that night, so that what the soak finds is seen and answered rather than learned to be ignored."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-085, SPEC-086, SPEC-097]
 arc: audit-2026-11-14
 arc_order: 15
