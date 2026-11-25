@@ -18,11 +18,12 @@ batch is small (ten spans, because the last batch before the stop failed) delive
 the rate rule then makes the next batch more than ten times longer than any attempt the prediction
 has seen. With 2 ms an event, 20 events in 0.04 s lead to a second batch of 220 to 250 events,
 about 0.5 s of work, and the prediction, which allows for 0.04 s plus the margin, lets it start.
-With a `shutdown()` budget of 0.45 to 0.65 s that batch ends past the deadline, the join expires,
-and the sink is left open. That is the outcome the exit budget exists to prevent (invariants 3 and
-5). A sink that flaps at exit reaches the same outcome by another route: a target set after a
-delivered batch is kept through the failed batches after it, while the time they spend shrinks the
-budget.
+When the failing pre-stop batch returns 0.2 s into the budget, leaving the exit drain the timeout
+less about 0.2 s, a `shutdown()` budget of 0.45 to 0.65 s sees that batch end past the deadline:
+the join expires, and the sink is left open. That is the outcome the exit budget exists to
+prevent (invariants 3 and 5). A sink that flaps at exit reaches the same outcome by another route:
+a target set after a delivered batch is kept through the failed batches after it, while the time
+they spend shrinks the budget.
 
 This spec closes both. The worker records the rate of the most recent delivered exit batch, and
 after every exit batch from then on, delivered or failed, the next batch is held to what that rate
@@ -61,8 +62,9 @@ stay open (*Out of Scope*).
   event is delivered or counted in an existing line, on the 1.x and the engine path (FR-004).
 - Where the budget does not bind, the batches are what they are today; in the last margin before
   the deadline, the batch is trimmed and the tail declined (FR-005).
-- The record: the two decisions, the docstrings, the inventory, the §12 item's first shape,
-  SPEC-103's marker, the README and the pending release notes (FR-006).
+- The record: the two decisions, the docstrings, the inventory, the §12 item's first shape, a
+  qualification at each site the item lists as shown false, SPEC-103's marker, the README and the
+  pending release notes (FR-006).
 
 **The twin paths** (invariant 6). The bound sits in `Worker._emit_pending`, which every batch of
 both drains goes through, above both branches of `_emit`: the 1.x `emit` loop and the delivery
@@ -195,13 +197,16 @@ minimum, so it never raises the kept target; a target that reads zero stays zero
 - [ ] Removing the bound from the failed path makes that test fail: the exit batches are 20, 118,
       118, 118 and 118, and the fifth ends at 0.7265625, past the deadline. This is mutation-tested
       (invariants 3 and 5).
-- [ ] An exit batch that fails across a `retarget` leaves `_target` and `_target_generation` as they
-      were before it, with a rate recorded and a deadline under which the bound would lower it
+- [ ] An exit batch that fails across a `retarget`, with a rate recorded and a deadline under which
+      the bound would lower the target, leaves `_target` and `_target_generation` as they were
+      before it. This pins the state rather than an outcome (a stale-generation target reads 0.0
+      either way, Out of Scope), so a mutant that drops the generation check is visible
       (invariant 6).
-- [ ] After a `retarget` between two exit batches, with a rate recorded from the old sink and the
-      new sink's first exit batch failing, `_size_target()` reads 0.0 before the next exit batch,
-      and the new sink's first delivered exit batch replaces `_exit_rate` with its own rate
-      (invariant 6).
+- [ ] On FR-001's clock (the pre-stop call charged nothing), after a `retarget` between two exit
+      batches, with a rate recorded from the old sink at 0.00390625 s an event, a new sink at
+      0.0078125 s an event, and the new sink's first exit batch failing, `_size_target()` reads 0.0
+      before the next exit batch, and after the new sink's first delivered exit batch `_exit_rate`
+      reads 128.0, the new sink's rate, not the old sink's 256.0 (invariant 6).
 - [ ] A dead sink at exit with no exit batch delivered is handed exactly what `main` hands it, the
       target kept through each failed exit batch, and `_exit_rate` reads 0.0 throughout;
       `test_a_dead_engine_sink_at_exit_is_handed_batches_at_the_cap` and
@@ -253,11 +258,17 @@ once the deadline has passed and the weakened guard refuses there too; it is kil
 
 #### Description:
 
-The end-to-end outcome on the real clock, in `tests/test_exit_drain_batches.py`'s style: a 1.0 s
-interval, `max_retries=0`, a pre-stop batch that fails so the target is zero at the stop, a sink
-healthy at exit at 2 ms an event, and 2,000 two-event spans queued. The committed probe
+The end-to-end outcome on the real clock, with `tests/test_exit_drain_batches.py`'s fixtures: a
+1.0 s interval, `max_retries=0`, a sink healthy at exit at 2 ms an event, and 2,000 two-event spans
+queued. The pre-stop call, released by the stop, idles 0.2 s and then fails, so the target is zero
+at the stop and the exit drain has the timeout less about 0.2 s. That idle is what makes the defect
+reproduce: a pre-stop call that returns the instant the stop is claimed, as the file's other tests
+have it, leaves the exit drain nearly the whole timeout, and with the delivered-path bound removed
+the join then still completed in 2 of 10 runs at 0.45 s and 6 of 6 at 0.5 to 0.65 s in the spec
+review; with the idle, that mutant expired 10 of 10 at 0.45 s on both twins. The committed probe
 `docs/audits/2026-11-14-probes/core-pipeline/spec103_recovered_slow_exit.py` (cited, not copied)
-gives the same shape from a script.
+gives this shape from a script, its pre-stop batch failing about 0.2 s into the budget as the §12
+item describes.
 
 An expired join still returns within its budget, so elapsed time alone cannot tell this design
 from a tree without the bound. `stopped_reason` and the count of `close()` calls at the return are
@@ -265,9 +276,9 @@ the assertions that do.
 
 #### Acceptance Criteria:
 
-- [ ] Under `shutdown(timeout=0.45)`, the call returns within 0.45 s plus the file's `_SLACK`,
-      `stopped_reason` is `None`, no expiry line is written, and `close()` has run once when it
-      returns (invariants 3 and 5).
+- [ ] In the shape above, the pre-stop call idling 0.2 s, under `shutdown(timeout=0.45)` the call
+      returns within 0.45 s plus the file's `_SLACK`, `stopped_reason` is `None`, no expiry line
+      is written, and `close()` has run once when it returns (invariants 3 and 5).
 - [ ] In that run, the events the sink returned from, the pre-stop batch's 20 in its abandoned line
       and the count in the declined line add to 4,020, and `ledger_check.worker_problems(worker)`
       is empty (invariant 2).
@@ -338,7 +349,8 @@ tail declined, which Andrew chose on 2026-11-17. It also records that a `retarge
 batches costs nothing, since the old sink's rate can lower only a target `_size_target` already
 reads as zero (Out of Scope), so the next reader does not file it.
 
-The decision's **Rejected** list gains two alternatives, each on its own terms. **A growth-tied
+The decision's **Rejected** list, which names none of these today, gains four alternatives, each
+on its own terms. **A growth-tied
 bound**, which holds the next batch to `events × (_exit_longest + _JOIN_MARGIN) / _exit_longest`,
 lets each delivered batch's attempt run at most one margin, 0.1 s, longer than the longest before
 it, whatever the budget: at 2 ms an event a healthy exit drain would go 20, 70, 120, 170 and 220
@@ -348,10 +360,14 @@ it is. It ties growth to the margin, a quantity unrelated to how much time is le
 exit**, no exit batch above the target in force at the stop, which the §12 item measured: it slows
 a healthy exit that starts from a zero target, most for a sink that sends one request a batch, and
 from a measured target it leaves the 1,000 in force at the stop, so it does not close the
-slowdown there. The list keeps the floor and `max(0, …)`, each with its reason (*Revision
-history*, spec review).
+slowdown there. **A floor of one event** and **`max(0, …)`**, each with its reason (*Revision
+history*, the spec review of 2026-11-17).
 
-The §12 item is not struck whole, because two of its shapes stay open (Out of Scope).
+The §12 item is not struck whole, because two of its shapes stay open (Out of Scope). For the same
+reason, each sentence the item lists as shown false gains a qualification in this change, since on
+`main` none carries one: it states what can still overrun the budget (a sink that slows during the
+exit, a retry after a call that failed at once, and a first exit batch longer than the budget) and
+points at the §12 item.
 
 #### Acceptance Criteria:
 
@@ -359,9 +375,9 @@ The §12 item is not struck whole, because two of its shapes stay open (Out of S
       failed exit batch, its guard, and why it holds the prediction to the budget; its trade
       paragraph gains the two trades above with this spec's numbers and Andrew's decision, and the
       `retarget` note; its **Rejected** list gains the growth-tied bound with the arithmetic above,
-      no growth at exit with the §12 item's measured reason, and the floor and `max(0, …)` with
-      their reasons; and its History gains a dated SPEC-105 entry at the top (serves no invariant:
-      the register's record, judged by the completion ritual).
+      no growth at exit with the §12 item's measured reason, and the floor of one event and
+      `max(0, …)` with their reasons; and its History gains a dated SPEC-105 entry at the top
+      (serves no invariant: the register's record, judged by the completion ritual).
 - [ ] The pipeline decision *A backlog drains in larger batches, and capacity is not a setting*
       names the exit bound in its size-target bullet, pointing at the sink-lifecycle decision, and
       gains a dated History entry; its fence is unchanged, since the bound only lowers a target
@@ -369,8 +385,19 @@ The §12 item is not struck whole, because two of its shapes stay open (Out of S
 - [ ] The docstrings of `_emit_pending`, `_set_target`, `_retry_declined`, `Worker.__init__`'s exit
       fields and `_reinit_after_fork`, the new `_fit_exit_target`, the module text on
       `_JOIN_MARGIN`, and the `Worker` row of `docs/component-inventory.md` state the bound and its
-      guard, and each sentence the §12 item lists as shown false keeps its qualification for the
-      shapes still open (serves no invariant: prose hygiene).
+      guard (serves no invariant: prose hygiene).
+- [ ] Each sentence the §12 item lists as shown false gains a qualification naming what can still
+      overrun (a sink that slows during the exit, a retry after a call that failed at once, a first
+      exit batch longer than the budget) and pointing at the §12 item: the `Worker` class
+      docstring's "The exit drain fits the caller's budget"; the `_JOIN_MARGIN` docstring's "so an
+      attempt permitted by the rule leaves the join time to return"; `_set_target`'s "so an emit
+      stays shorter than the time trigger's interval"; `_emit`'s "On the exit drain a retry fits the
+      caller's budget or is not made"; `src/log_foundry/sinks/nats.py`'s module headline "The exit
+      drain fits the join", though not the arithmetic under it; `docs/invariants.md` section 3's
+      *Guarded* clause "the exit drain's retries fit the `shutdown()` budget"; the pipeline
+      decision's "so an emit stays shorter than the time trigger's interval"; and the
+      sink-lifecycle decision's trade paragraph, which names only a prediction that runs long
+      (serves no invariant: prose hygiene).
 - [ ] In `docs/architecture.md` §12, the item "The exit drain sizes a batch from a rate it measured
       earlier…" stays open: its first shape, *A sink that recovers by exit*, is marked closed by
       SPEC-105 in place with this spec's before and after rows; its **Closed by** sentence names
@@ -439,6 +466,7 @@ tests/test_lifecycle_inventory.py       # the _exit_rate row
 docs/decisions/sink-lifecycle/the-exit-drain-declines-only-a-retry-predicted-to-end-past-the-shutdown-deadline.md
 docs/decisions/pipeline/a-backlog-drains-in-larger-batches-and-capacity-is-not-a-setting.md
 docs/architecture.md, docs/component-inventory.md                             # FR-006
+src/log_foundry/sinks/nats.py, docs/invariants.md                             # FR-006's qualifications
 docs/specs/SPEC-103-repeated-sink-lines-at-exit-are-folded.md                 # FR-006's marker
 README.md, docs/release-notes/v1.2.1.md                                       # FR-006
 ```
@@ -461,6 +489,9 @@ README.md, docs/release-notes/v1.2.1.md                                       # 
 - Refine the two decisions, rewrite the docstrings and the inventory row, mark the §12 item's first
   shape closed and add its *Resolved* entry, mark SPEC-103's bullet, and narrow the README's and
   the pending release notes' caveat.
+- Add the qualification at each site the §12 item lists as shown false: the four `worker.py`
+  docstrings, `src/log_foundry/sinks/nats.py`'s module headline, section 3's *Guarded* clause in
+  `docs/invariants.md`, and the two decisions.
 
 ## Evidence
 
@@ -637,10 +668,33 @@ design hands 100 to 110 and declines 20 to 30; at 0.5 s on 3.12.12, today hands 
     predicted from a fast failure) and a sink slow from its very first exit call as not closed
     here, with the item staying open for them.
   - FR-006 no longer strikes the §12 item whole: it marks the first shape closed in place, updates
-    its **Closed by**, keeps the sentences it lists as shown false qualified, and adds a *Resolved*
-    entry. SPEC-103's marker goes on its Out of Scope bullet ending "SPEC-105 is its spec." alone,
+    its **Closed by**, ~~keeps the sentences it lists as shown false qualified~~ (on `main` none
+    carries a qualification; the spec review below has FR-006 add one at each), and adds a
+    *Resolved* entry. SPEC-103's marker goes on its Out of Scope bullet ending "SPEC-105 is its spec." alone,
     since SPEC-103 has no FR-003 paragraph filing the item. The README and release-notes caveat
     "a batch the exit has grown since" is narrowed rather than dropped. The decision's **Rejected**
     list describes the growth-tied bound on its own terms and gains no growth at exit.
   - *Evidence* leads with the 2026-11-24 re-measurement on `main`; the 2026-11-17 figures on
     SPEC-103's branch are kept as history.
+  - **Spec review, 2026-11-24.** Buildable as written; every figure confirmed on a build. The
+    findings and what each changed:
+    - Major: FR-004's shape, with the pre-stop call returning the instant the stop is claimed, did
+      not reproduce the defect: with the delivered-path bound removed the join still completed in
+      2 of 10 runs at 0.45 s and 6 of 6 at 0.5 to 0.65 s, so the recorded kill was a coin-flip.
+      FR-004's Description now has the pre-stop call, released by the stop, idle 0.2 s and then
+      fail, leaving the exit drain the timeout less about 0.2 s (that mutant then expired 10 of 10
+      at 0.45 s on both twins, and the build passed all four timeouts); its first criterion names
+      that shape; the probe is said to give this shape, as the §12 item describes it; and the
+      Overview states the 0.2 s premise beside its 0.45 to 0.65 s budgets.
+    - Should-fix: on `main` none of the code-side sentences the §12 item lists as shown false
+      carries a qualification, so "keeps its qualification" had nothing to keep. The orchestrator
+      decided SPEC-105 adds one at each site in the same change; FR-006 gains a criterion listing
+      every site, each quoted sentence checked against `main`, and File structure and Phase 2 add
+      `src/log_foundry/sinks/nats.py` and `docs/invariants.md`.
+    - Nit: the sink-lifecycle decision's **Rejected** list names neither the floor nor
+      `max(0, …)`, so FR-006's Description now says the list gains them, as its criterion does.
+    - Nit: FR-002's `retarget`-between criterion passed vacuously when both sinks cost the same;
+      the new sink now costs 0.0078125 s an event and the criterion asserts `_exit_rate` reads
+      128.0, the new sink's rate, not 256.0.
+    - Nit: FR-002's straddle criterion now says it pins the state rather than guarding an outcome,
+      so a mutant without the generation check is visible.
