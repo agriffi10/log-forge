@@ -2126,12 +2126,32 @@ an item leaves this list when a spec closes it, not because the arc names it.
   admits that interleaving and the failure matches it, the premise assertion having passed, but
   it was not reproduced. The outer test fails on any red test in the two child modules, so it
   inherits every timing assumption they make.
+  Since SPEC-099, `test_the_soak_is_wired[http]` is also one of the eight wiring items that
+  `model-soak.yml` runs every night on `main` (`WIRING` in `scripts/model-soak-report.py`), and
+  no known-shape row explains a wiring item. A night on a loaded runner can therefore go red on
+  this bound, and a red scheduled night stops the PR queue until a pull request files it in
+  `FILED_NIGHTS` (`scripts/pr-queue/PROTOCOL.md`). Filing such a night is the existing clearing
+  path, and this item is what the filing names.
   **Closed by** two test changes. The soak's bound needs to hold on a loaded 4-CPU runner
   without letting a real stall through, for instance by subtracting the time the calling thread
   was not scheduled rather than widening `EPSILON`, which `_machine` rules out. The fast-return
   test needs to hold span `a` in the queue until the marker is stamped, for instance with a sink
   or a drain gated on an event the test sets after `flush()` has read `failed_batches`, in place
   of the 0.01 s window.
+
+- **zizmor's `self-repository` finding is open on five workflows** (no invariant: it concerns the
+  workflows, not the library; found by SPEC-099's session on 2026-11-25, when the alert on its new
+  workflow appeared on PR #423). Code scanning holds open alerts 23 to 26 and 29, one for each
+  `uses: ./.github/actions/install-poetry` or `uses: ./.github/workflows/ci.yml` reference, at
+  `ci.yml:131`, `integration.yml:87`, `pip-audit.yml:61`, `release.yml:14` and
+  `model-soak.yml:75`. The comment above *Audit the workflows* in `.github/workflows/zizmor.yml`
+  declined the finding while the action's `latest` zizmor (1.29.0) did not ship the rule, and
+  called it a one-line fix once the alert appeared; it has now appeared, and that comment's claim
+  that code scanning holds zero zizmor alerts is no longer true. The finding is low severity and
+  the job does not fail on it, because `advanced-security` reports to code scanning and exits
+  zero. **Closed by** a pull request that rewrites each of the five references to the form
+  zizmor accepts, or dismisses the alerts in code scanning with a written reason, and in either
+  case rewrites that comment in `zizmor.yml` to say which was done.
 
 ### Resolved
 
