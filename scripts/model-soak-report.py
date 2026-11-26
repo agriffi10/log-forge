@@ -33,20 +33,28 @@ if TYPE_CHECKING:
 
     from soak_known import Known
 
-# Measured at d9f2f097 on the 4-CPU Linux stand-in: 15,000 soak items took 307.6 s and 284.3 s.
+# Measured at eee6737d on ubuntu-latest: one window, 15,000 soak items, took 749.9 s (dispatch
+# 45625671047) and 415.1 s (night 45793914793), 150 ms and 83 ms a seed.
 WINDOW = 5000
-"""Seeds one night soaks, 15,000 soak items: about five minutes on a 4-CPU runner at ``-n 12``."""
+"""Seeds one night soaks, 15,000 soak items: 7 to 12.5 minutes on ``ubuntu-latest`` at ``-n 12``.
+
+It is held to the same bound as ``MAX_SEEDS``, below, and is exactly at it, so a dispatch with no
+input soaks one window and a dispatch may ask for at most one window's worth of seeds.
+"""
 
 WINDOWS = 30
 """Windows the nights rotate through, so the nights cover seeds 0 to 149,999 every 30 runs."""
 
-# Measured at d9f2f097 on the 4-CPU Linux stand-in: 61.5 ms a seed, so 10,000 seeds is 615 s.
-MAX_SEEDS = 10_000
+# Measured at eee6737d on ubuntu-latest: 150 ms a seed at the slowest, so 5,000 seeds is 750 s.
+MAX_SEEDS = 5000
 """The most seeds a dispatch may ask for, so it ends with its report rather than being killed.
 
 The job has 1,800 s. 180 s is allowed for the install and 600 s for one hung item's guard and its
-dump, which leaves 1,020 s. At the stand-in's cost per seed, 10,000 seeds takes 615 s, and half as
-much again is 923 s, both under 1,020 s.
+dump, which leaves 1,020 s. At the slowest cost per seed measured on ``ubuntu-latest``, 5,000
+seeds takes 750 s, and a third as much again is 1,000 s, both under 1,020 s. The margin is a third
+rather than the half the first derivation used, because that half covered a stand-in's single
+figure before any run on the real runner; the bound now rests on the slower of two real runs,
+which are 1.8 times apart.
 """
 
 PULL_REQUEST_SEEDS = "0-99"

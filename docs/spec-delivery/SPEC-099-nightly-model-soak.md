@@ -104,17 +104,20 @@
   18.4 s. That is about 1.8% of items against the Docker stand-in's 1 in 30,000, so a ceiling of 21
   would have stopped the queue every night; on Andrew's decision the ceiling is 800, from the most
   measured rate (350 a night: 700 under, 1,050 over).
-- **Owed:**
-  - **Before the merge:** this pull request's own Model soak run, reading `0-99` and `300 of 300`.
-  - **After the merge**, recorded by a docs-only follow-up pull request cut from fresh `main`:
-    - `install.sh` re-run, **only after the merge has put `model-soak.yml` on `main`**, and
-      `queue.sh soak-verdict` printing its pinned form. Installed any earlier, the queue's
+- **Owed, now settled:**
+  - **Before the merge:** this pull request's own Model soak run read `0-99` and `300 of 300`
+    (run 45561346799, above).
+  - **After the merge**, recorded by the follow-up pull request on 2026-11-26, all at `eee6737d` on
+    `ubuntu-latest` (the spec's *Evidence*, *After the merge*, has the table):
+    - `install.sh` re-run once `model-soak.yml` was on `main`; `queue.sh soak-verdict` printed
+      `0 none`, its pinned form, and `main-state` 0. Installed any earlier, the queue's
       `gh run list --workflow model-soak.yml` answers HTTP 404, so every session reads 3 and waits;
-    - a no-input `workflow_dispatch` on `main`;
-    - the first scheduled night within 26 hours, with its summary and the pytest step's duration;
-    - ~~the late-write ceiling re-derived from the Linux nights~~: re-derived before the merge from
-      the pull request's own real-runner runs (below); the first scheduled nights confirm the
-      ceiling;
-    - the first night's pytest step duration re-checks `WINDOW` and `MAX_SEEDS`: the real runner's
-      per-item cost from the pull request's small runs, about 33 to 55 ms an item with the job's
-      startup included, is above the stand-in's 18.7 ms the two rest on.
+    - the no-input dispatch, run 45625671047: seeds 15000 to 19999, `15000 of 15000`, 303 known,
+      0 new, wiring 8 of 8, pytest step 749.9 s;
+    - the first scheduled night, run 45793914793, created 09:38:53 UTC on 2026-11-26: seeds 20000
+      to 24999, `15000 of 15000`, 62 known, 0 new, wiring 8 of 8, pytest step 415.1 s;
+    - the ceiling of 800 holds: 303 and 62 are both under the 350 a night it is derived from;
+    - `WINDOW` and `MAX_SEEDS` re-checked: the window cost 83 to 150 ms a seed, so `MAX_SEEDS` is
+      re-derived from 10,000 to 5,000 and `WINDOW` stays 5,000, held to the same bound by
+      `test_a_night_soaks_no_more_than_a_dispatch_may_ask_for`; the owed "at most 10 minutes",
+      which the dispatch broke, now reads "fits the 1,020 s the dispatch bound is derived against".

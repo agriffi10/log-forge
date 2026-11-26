@@ -16,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       seeds:
-        description: "LOG_FOUNDRY_MODEL_SEEDS for this run, at most 10,000 seeds; empty for this run's window"
+        description: "LOG_FOUNDRY_MODEL_SEEDS for this run, at most 5,000 seeds; empty for this run's window"
         required: false
         default: ""
   # The only way the job body runs on a runner before a merge: a schedule fires only from the
