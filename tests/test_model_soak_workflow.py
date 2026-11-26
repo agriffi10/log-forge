@@ -516,6 +516,16 @@ def test_a_night_soaks_no_more_than_a_dispatch_may_ask_for() -> None:
     assert report_mod.WINDOW <= report_mod.MAX_SEEDS, (report_mod.WINDOW, report_mod.MAX_SEEDS)
 
 
+def test_the_dispatch_input_names_the_bound_the_script_enforces() -> None:
+    """FR-003: the ``seeds`` input's description states ``MAX_SEEDS``, the bound ``seeds`` refuses past.
+
+    The description is a second copy of the number, written by hand; a re-derivation that moved only
+    the constant would leave the form a dispatcher reads promising seeds the script then refuses.
+    """
+    stated = f"at most {report_mod.MAX_SEEDS:,} seeds;"
+    assert stated in WORKFLOW.read_text(encoding="utf-8"), stated
+
+
 @pytest.mark.parametrize(
     ("event", "asked", "chosen"),
     [

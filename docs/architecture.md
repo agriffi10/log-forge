@@ -2140,15 +2140,16 @@ an item leaves this list when a spec closes it, not because the arc names it.
   of the 0.01 s window.
 
 - **zizmor's `self-repository` finding is open on five workflows** (no invariant: it concerns the
-  workflows, not the library; found by SPEC-099's session on 2026-11-25, when the alert on its new
-  workflow appeared on PR #423). Code scanning holds open alerts 23 to 26 and 29, one for each
+  workflows, not the library; recorded by SPEC-099's session on 2026-11-25, when the alert on its
+  new workflow appeared on PR #423). Code scanning holds open alerts 23 to 26, opened on
+  2026-09-08, and alert 29, opened on 2026-11-25 with `model-soak.yml`, one for each
   `uses: ./.github/actions/install-poetry` or `uses: ./.github/workflows/ci.yml` reference, at
   `ci.yml:131`, `integration.yml:87`, `pip-audit.yml:61`, `release.yml:14` and
   `model-soak.yml:75`. The comment above *Audit the workflows* in `.github/workflows/zizmor.yml`
   declined the finding while the action's `latest` zizmor (1.29.0) did not ship the rule, and
-  called it a one-line fix once the alert appeared; it has now appeared, and that comment's claim
-  that code scanning holds zero zizmor alerts is no longer true. The finding is low severity and
-  the job does not fail on it, because `advanced-security` reports to code scanning and exits
+  called it a one-line fix once the alert appeared; the alerts have been open since 2026-09-08,
+  so that comment's claim that code scanning holds zero zizmor alerts has been false since then.
+  Code scanning rates the finding severity `note`, and the job does not fail on it, because `advanced-security` reports to code scanning and exits
   zero. **Closed by** a pull request that rewrites each of the five references to the form
   zizmor accepts, or dismisses the alerts in code scanning with a written reason, and in either
   case rewrites that comment in `zizmor.yml` to say which was done.

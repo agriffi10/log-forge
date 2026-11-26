@@ -113,9 +113,9 @@
       `0 none`, its pinned form, and `main-state` 0. Installed any earlier, the queue's
       `gh run list --workflow model-soak.yml` answers HTTP 404, so every session reads 3 and waits;
     - the no-input dispatch, run 45625671047: seeds 15000 to 19999, `15000 of 15000`, 303 known,
-      0 new, wiring 8 of 8, pytest step 749.9 s;
+      0 new, wiring 8 of 8, pytest session 749.9 s (Soak step 752 s);
     - the first scheduled night, run 45793914793, created 09:38:53 UTC on 2026-11-26: seeds 20000
-      to 24999, `15000 of 15000`, 62 known, 0 new, wiring 8 of 8, pytest step 415.1 s;
+      to 24999, `15000 of 15000`, 62 known, 0 new, wiring 8 of 8, pytest session 415.1 s (Soak step 418 s);
     - the ceiling of 800 holds: 303 and 62 are both under the 350 a night it is derived from;
     - `WINDOW` and `MAX_SEEDS` re-checked: the window cost 83 to 150 ms a seed, so `MAX_SEEDS` is
       re-derived from 10,000 to 5,000 and `WINDOW` stays 5,000, held to the same bound by

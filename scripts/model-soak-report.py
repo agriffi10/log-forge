@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from soak_known import Known
 
 # Measured at eee6737d on ubuntu-latest: one window, 15,000 soak items, took 749.9 s (dispatch
-# 45625671047) and 415.1 s (night 45793914793), 150 ms and 83 ms a seed.
+# 45625671047) and 415.1 s (night 45793914793) of pytest session, 150 ms and 83 ms a seed.
 WINDOW = 5000
 """Seeds one night soaks, 15,000 soak items: 7 to 12.5 minutes on ``ubuntu-latest`` at ``-n 12``.
 
@@ -51,10 +51,15 @@ MAX_SEEDS = 5000
 
 The job has 1,800 s. 180 s is allowed for the install and 600 s for one hung item's guard and its
 dump, which leaves 1,020 s. At the slowest cost per seed measured on ``ubuntu-latest``, 5,000
-seeds takes 750 s, and a third as much again is 1,000 s, both under 1,020 s. The margin is a third
-rather than the half the first derivation used, because that half covered a stand-in's single
-figure before any run on the real runner; the bound now rests on the slower of two real runs,
-which are 1.8 times apart.
+seeds takes 750 s, and a third as much again is 1,000 s, both under 1,020 s.
+
+The margin is a third because a third is what keeps one window inside the bound: the half the
+first derivation used allows about 4,533 seeds, which would force ``WINDOW`` below 5,000 too. A
+third is less than the 1.8 times the two real runs differed by, so a run more than a third slower
+than the slowest seen that also meets a hung item is killed without its report. That is accepted
+because it takes both at once. With no hung item the soak has the 1,620 s left after the install,
+which 5,000 seeds fits up to 324 ms a seed, more than twice the slowest seen; and a killed night is
+not silent, since it is a failed night, which stops the PR queue until a pull request files it.
 """
 
 PULL_REQUEST_SEEDS = "0-99"

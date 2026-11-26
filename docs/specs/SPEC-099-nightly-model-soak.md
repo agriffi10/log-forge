@@ -458,9 +458,13 @@ a soak, the red night is how the owner hears.
   rather than being killed with none. It was 10,000 until the first runs on the real runner: the
   stand-in's 56 ms a seed at `eda19f32` and 61.5 ms at `d9f2f097` made 10,000 seeds 615 s, and half
   again 923 s, but at the real runner's 150 ms 10,000 seeds is 1,500 s, past the 1,020 s. The
-  margin is a third rather than that half, because the half covered a stand-in's single figure
-  before any run on the real runner, and the bound now rests on the slower of two real runs that
-  are 1.8 times apart.
+  margin is a third because a third is what keeps one window inside the bound: that half allows
+  about 4,533 seeds, which would force `WINDOW` below 5,000 too. A third is less than the 1.8
+  times the two real runs differed by, so a run more than a third slower than the slowest seen
+  that also meets a hung item is killed without its report. That is accepted because it takes
+  both at once. With no hung item the soak has the 1,620 s left after the install, which 5,000
+  seeds fits up to 324 ms a seed, more than twice the slowest seen; and a killed night is not
+  silent, since it is a failed night, which stops the queue until a pull request files it.
 - **The run.** The test step is:
 
   ```
@@ -523,8 +527,8 @@ a soak, the red night is how the owner hears.
         dispatch took 12.5; *Revision history*, 2026-11-26). The
         build's delivery doc is written before the push, so it names them as owed. After the
         merge the orchestrator makes the dispatch and records it, and the first scheduled night
-        once it has run, in a docs-only follow-up pull request cut from fresh `main`, never
-        stacked on the build's.
+        once it has run, in a follow-up pull request cut from fresh `main`, never stacked on
+        the build's (docs-only unless a re-derivation changes a bound, as on 2026-11-26).
 
       A missing scheduled run is a finding for the owner, not a pass.
 - [ ] This FR serves no invariant: it decides when the soak runs and where its verdict goes. What
@@ -1128,8 +1132,9 @@ and `install-test.sh`, and `install.sh` is run once after the merge (FR-006).
 
 ## Evidence
 
-Three commits are measured here. **`eee6737d`** (the merge) holds what FR-003 owed after it, measured on `ubuntu-latest`. **`d9f2f097`** (`main` on 2026-11-24) is what the spec must be true
-of, and the first subsection holds everything measured there. **`eda19f32`** (`main` on 2026-11-16
+Three commits are measured here. **`eee6737d`** (the merge) holds what FR-003 owed after it,
+measured on `ubuntu-latest`, in the first subsection. **`d9f2f097`** (`main` on 2026-11-24) is
+what the spec must be true of, and the second subsection holds everything measured there. **`eda19f32`** (`main` on 2026-11-16
 and 2026-11-17, when the spec was written) is history; FR-001's Shape B and boundary records, one
 of FR-002's two late-write rates, the `-n 4` cost and every prototype result rest on it, and none
 of that was re-run at `d9f2f097`.
@@ -1145,10 +1150,13 @@ What FR-003 owed after the merge, all on `main` at `eee6737d` on `ubuntu-latest`
 - The first scheduled night, run 45793914793 (run number 4), created 09:38:53 UTC on 2026-11-26,
   inside the 26 hours.
 
-| Run | Seeds | Items | Clean | Known (orphan late write) | New | Wiring | pytest step |
-|---|---|---|---|---|---|---|---|
-| dispatch 45625671047 | 15000 to 19999 | 15000 of 15000 | 14,697 | 303 | 0 | 8 of 8 | 749.9 s (12 min 30 s) |
-| night 45793914793 | 20000 to 24999 | 15000 of 15000 | 14,938 | 62 | 0 | 8 of 8 | 415.1 s (6 min 55 s) |
+| Run | Seeds | Items | Clean | Known (orphan late write) | New | Wiring | pytest session | Soak step |
+|---|---|---|---|---|---|---|---|---|
+| dispatch 45625671047 | 15000 to 19999 | 15000 of 15000 | 14,697 | 303 | 0 | 8 of 8 | 749.9 s | 752 s (12 min 32 s) |
+| night 45793914793 | 20000 to 24999 | 15000 of 15000 | 14,938 | 62 | 0 | 8 of 8 | 415.1 s | 418 s (6 min 58 s) |
+
+The per-seed costs below divide pytest's session time by 5,000; the step's own duration, from
+the job's step timestamps, is about 3 s longer.
 
 Both were green. The late-write rate was 2.0% on the dispatch and 0.4% on the night; 303, the
 higher, is under the 350 a night the ceiling of 800 is derived from (FR-002), so neither run
@@ -1367,7 +1375,8 @@ under load", read as known. Both now break the floor.
 
 The first prototype wrote `"1,\n2"` raw into `$GITHUB_OUTPUT`. Run numbers 1, 2, 29, 30 and 31 give
 the windows `5000-9999`, `10000-14999`, `145000-149999`, `0-4999` and `5000-9999`. A dispatch of
-`0-9999` is accepted and `0-10000` refused.
+`0-9999` is accepted and `0-10000` refused (the bound was 10,000 then; 5,000 since 2026-11-26,
+FR-003's *dispatch bound*).
 
 **What gh reports, measured 2026-11-17 with gh 2.93.0 against this repository.**
 - `gh run list` reports a run's latest attempt only. Run 43801629163 read `attempt=2 completed
@@ -1480,7 +1489,8 @@ nothing.
   first dispatch and the first scheduled night on `ubuntu-latest` (*Evidence*, *After the merge*).
   Both were green with 0 new. The dispatch's pytest step took 12.5 minutes and the night's 7, so a
   window costs 83 to 150 ms a seed on the real runner. `MAX_SEEDS` falls from 10,000 to 5,000,
-  derived from the slower run with a third as margin, and `WINDOW` stays 5,000, held to the same
+  derived from the slower run with a third as margin, the margin that keeps one window inside the
+  bound (FR-003 says what it leaves uncovered), and `WINDOW` stays 5,000, held to the same
   bound by a new default-suite test. The owed criterion's "at most 10 minutes" becomes "fits the
   1,020 s the dispatch bound is derived against", since the real runner varies by 1.8 times and a
   10-minute line would sit inside that spread. This was to be a docs-only follow-up; changing the
