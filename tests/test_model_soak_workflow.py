@@ -16,6 +16,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 import tracemalloc
 from typing import TYPE_CHECKING
 
@@ -514,6 +515,19 @@ def test_a_night_soaks_no_more_than_a_dispatch_may_ask_for() -> None:
     night is a failed night, which stops the PR queue until it is filed.
     """
     assert report_mod.WINDOW <= report_mod.MAX_SEEDS, (report_mod.WINDOW, report_mod.MAX_SEEDS)
+
+
+def test_the_hang_guard_leaves_the_soak_the_budget_its_bound_rests_on() -> None:
+    """FR-003: the job's 1,800 s less the install and ``faulthandler_timeout`` leaves 1,020 s.
+
+    ``MAX_SEEDS`` is derived against 1,020 s: 1,800 s of ``timeout-minutes: 30``, less 180 s for the
+    install and the hung-item guard, which is ``faulthandler_timeout`` in ``pyproject.toml``. A
+    guard raised for a slow test elsewhere would shrink that budget with the suite still green, so
+    this reads the real value rather than the 600 s the derivation's prose names.
+    """
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    guard = int(config["tool"]["pytest"]["ini_options"]["faulthandler_timeout"])
+    assert 30 * 60 - 180 - guard >= 1020, guard
 
 
 def test_the_dispatch_input_names_the_bound_the_script_enforces() -> None:

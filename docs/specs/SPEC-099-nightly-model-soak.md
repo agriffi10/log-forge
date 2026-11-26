@@ -463,8 +463,10 @@ a soak, the red night is how the owner hears.
   times the two real runs differed by, so a run more than a third slower than the slowest seen
   that also meets a hung item is killed without its report. That is accepted because it takes
   both at once. With no hung item the soak has the 1,620 s left after the install, which 5,000
-  seeds fits up to 324 ms a seed, more than twice the slowest seen; and a killed night is not
-  silent, since it is a failed night, which stops the queue until a pull request files it.
+  seeds fits up to 324 ms a seed, more than twice the slowest seen. The 600 s is
+  `faulthandler_timeout` in `pyproject.toml`, which a default-suite test holds to this budget. A
+  night the job's timeout kills stops the queue only if GitHub reports it `failure` or
+  `timed_out`, which no run here has yet shown; `docs/architecture.md` §12 carries that.
 - **The run.** The test step is:
 
   ```

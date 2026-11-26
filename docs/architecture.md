@@ -2149,10 +2149,28 @@ an item leaves this list when a spec closes it, not because the arc names it.
   declined the finding while the action's `latest` zizmor (1.29.0) did not ship the rule, and
   called it a one-line fix once the alert appeared; the alerts have been open since 2026-09-08,
   so that comment's claim that code scanning holds zero zizmor alerts has been false since then.
-  Code scanning rates the finding severity `note`, and the job does not fail on it, because `advanced-security` reports to code scanning and exits
-  zero. **Closed by** a pull request that rewrites each of the five references to the form
-  zizmor accepts, or dismisses the alerts in code scanning with a written reason, and in either
-  case rewrites that comment in `zizmor.yml` to say which was done.
+  Code scanning rates the finding severity `note`, and the job does not fail on it, because
+  `advanced-security` reports to code scanning and exits zero. **Closed by** a pull request that
+  rewrites each of the five references to the form zizmor accepts (`uses: $/...` in zizmor
+  1.32.0), or dismisses the alerts in code scanning with a written reason, and in either case
+  rewrites that comment in `zizmor.yml` to say which was done. The rewrite turns two
+  default-suite tests red until they accept the new form: `check_pins` in
+  `tests/test_model_soak_workflow.py`, which allows only `./` or a SHA-pinned remote, and
+  `_CI_CALLER_JOB` in `tests/test_python_version_roster.py`, whose pattern requires
+  `./.github/workflows/ci.yml`.
+
+- **No run here has shown what GitHub reports for a night its job timeout kills** (no invariant:
+  it concerns the PR queue; found by SPEC-099's follow-up review on 2026-11-26). `soak_verdict` in
+  `scripts/pr-queue/queue.sh` blocks the queue on a scheduled night whose conclusion is `failure`
+  or `timed_out` and passes over a `cancelled` one. `model-soak.yml` keys a night's concurrency
+  group on its own `run_id`, so nothing but the job's `timeout-minutes: 30` or a person cancels a
+  night, and no run in this repository has yet ended on that timeout. If GitHub reports such a
+  night `cancelled`, a night that met a hung item and ran slow enough to be killed is skipped by
+  the queue unseen. It takes a night more than a third slower than the slowest measured *and* a
+  hung item (FR-003's dispatch bound in SPEC-099). **Closed by** measuring the conclusion once,
+  with a throwaway workflow whose job sleeps past a one-minute `timeout-minutes`, and, if it reads
+  `cancelled`, a queue change, decided for the queue, that treats a cancelled scheduled night of
+  `model-soak.yml` as failed, with a plant in `scripts/pr-queue-soak-test.sh`.
 
 ### Resolved
 
