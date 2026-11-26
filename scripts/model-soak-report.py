@@ -33,20 +33,35 @@ if TYPE_CHECKING:
 
     from soak_known import Known
 
-# Measured at d9f2f097 on the 4-CPU Linux stand-in: 15,000 soak items took 307.6 s and 284.3 s.
+# Measured at eee6737d on ubuntu-latest: one window, 15,000 soak items, took 749.9 s (dispatch
+# 45625671047) and 415.1 s (night 45793914793) of pytest session, 150 ms and 83 ms a seed.
 WINDOW = 5000
-"""Seeds one night soaks, 15,000 soak items: about five minutes on a 4-CPU runner at ``-n 12``."""
+"""Seeds one night soaks, 15,000 soak items: 7 to 12.5 minutes on ``ubuntu-latest`` at ``-n 12``.
+
+It is held to the same bound as ``MAX_SEEDS``, below, and is exactly at it, so a dispatch with no
+input soaks one window and a dispatch may ask for at most one window's worth of seeds.
+"""
 
 WINDOWS = 30
 """Windows the nights rotate through, so the nights cover seeds 0 to 149,999 every 30 runs."""
 
-# Measured at d9f2f097 on the 4-CPU Linux stand-in: 61.5 ms a seed, so 10,000 seeds is 615 s.
-MAX_SEEDS = 10_000
+# Measured at eee6737d on ubuntu-latest: 150 ms a seed at the slowest, so 5,000 seeds is 750 s.
+MAX_SEEDS = 5000
 """The most seeds a dispatch may ask for, so it ends with its report rather than being killed.
 
 The job has 1,800 s. 180 s is allowed for the install and 600 s for one hung item's guard and its
-dump, which leaves 1,020 s. At the stand-in's cost per seed, 10,000 seeds takes 615 s, and half as
-much again is 923 s, both under 1,020 s.
+dump, which leaves 1,020 s. At the slowest cost per seed measured on ``ubuntu-latest``, 5,000
+seeds takes 750 s, and a third as much again is 1,000 s, both under 1,020 s.
+
+The margin is a third because a third is what keeps one window inside the bound: the half the
+first derivation used allows about 4,533 seeds, which would force ``WINDOW`` below 5,000 too. A
+third is less than the 1.8 times the two real runs differed by, so a run more than a third slower
+than the slowest seen that also meets a hung item is killed without its report. That is accepted
+because it takes both at once. With no hung item the soak has the 1,620 s left after the install,
+which 5,000 seeds fits up to 324 ms a seed, more than twice the slowest seen. The 600 s is
+``faulthandler_timeout`` in ``pyproject.toml``, which a default-suite test holds to this budget. A
+night the job's timeout kills stops the PR queue only if GitHub reports it ``failure`` or
+``timed_out``, which no run here has yet shown; ``docs/architecture.md`` §12 carries that.
 """
 
 PULL_REQUEST_SEEDS = "0-99"

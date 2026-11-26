@@ -444,13 +444,29 @@ a soak, the red night is how the owner hears.
   of 15,008 items took 281.6 s and 280.5 s in two runs. At `d9f2f097` the soak items of a window,
   15,000, took 307.6 s over seeds 0 to 4999 and 284.3 s over 5000 to 9999, at most 20.5 ms an item
   (*Evidence*). At `-n 4` the same items took three times as long at `eda19f32`, so the step stays
-  a bare `pytest` and inherits `addopts`. `timeout-minutes: 30`.
-- **The dispatch bound.** `MAX_SEEDS` is 10,000. Here is why, beside the number. The job has 1,800
+  a bare `pytest` and inherits `addopts`. `timeout-minutes: 30`. On `ubuntu-latest` at
+  `eee6737d` a window cost far more and varied: 749.9 s on the first dispatch and 415.1 s on the
+  first scheduled night, 150 and 83 ms a seed (*Evidence*), so `WINDOW` is held to the dispatch
+  bound below and stays at 5,000.
+- **The dispatch bound.** `MAX_SEEDS` is 5,000. Here is why, beside the number. The job has 1,800
   s. 180 s is allowed for the install, and 600 s for one hung item's guard and its dump, which leaves
-  1,020 s for the soak. 10,000 seeds is 561 s at the stand-in's 56 ms a seed at `eda19f32`, and
-  842 s at half again that. At `d9f2f097` its 61.5 ms a seed makes 615 s, and half again 923 s,
-  both under 1,020 s. A dispatch never reaches the queue (FR-006). The bound keeps it inside the job's own
-  timeout, so that it ends with its report rather than being killed with none.
+  1,020 s for the soak. At the slowest cost per seed measured on `ubuntu-latest` at `eee6737d`, 150
+  ms, 5,000 seeds is 750 s, and a third as much again is 1,000 s, both under 1,020 s. `WINDOW` is
+  held to the same bound and is at it, so a dispatch may ask for at most one window's seeds, and a
+  default-suite test fails if `WINDOW` passes `MAX_SEEDS`. A dispatch never reaches the queue
+  (FR-006). The bound keeps it inside the job's own timeout, so that it ends with its report
+  rather than being killed with none. It was 10,000 until the first runs on the real runner: the
+  stand-in's 56 ms a seed at `eda19f32` and 61.5 ms at `d9f2f097` made 10,000 seeds 615 s, and half
+  again 923 s, but at the real runner's 150 ms 10,000 seeds is 1,500 s, past the 1,020 s. The
+  margin is a third because a third is what keeps one window inside the bound: that half allows
+  about 4,533 seeds, which would force `WINDOW` below 5,000 too. A third is less than the 1.8
+  times the two real runs differed by, so a run more than a third slower than the slowest seen
+  that also meets a hung item is killed without its report. That is accepted because it takes
+  both at once. With no hung item the soak has the 1,620 s left after the install, which 5,000
+  seeds fits up to 324 ms a seed, more than twice the slowest seen. The 600 s is
+  `faulthandler_timeout` in `pyproject.toml`, which a default-suite test holds to this budget. A
+  night the job's timeout kills stops the queue only if GitHub reports it `failure` or
+  `timed_out`, which no run here has yet shown; `docs/architecture.md` §12 carries that.
 - **The run.** The test step is:
 
   ```
@@ -489,8 +505,8 @@ a soak, the red night is how the owner hears.
       no finding that it does not also report against `ci.yml`.
 - [ ] `seeds` returns `5000-9999` for run number 1 and the same for run number 31. It returns
       `0-99` for `pull_request`, and `1-2,4` for a dispatch of `"1,\n2, 4"`. It refuses a dispatch
-      of 10,001 seeds, or of `"0-3\nfoo=bar"`, with exit 1 and no output, and accepts one of
-      exactly 10,000. A mutant that takes the window from anything but the run number reddens a
+      of 5,001 seeds, or of `"0-3\nfoo=bar"`, with exit 1 and no output, and accepts one of
+      exactly 5,000. A mutant that takes the window from anything but the run number reddens a
       test. A dispatch of `0-300000` is refused with less than 1 MB traced, so the bound is read
       before the set is built, and a mutant that builds it first reddens that test.
 - [ ] Collected with the workflow's own `-k` and `LOG_FOUNDRY_MODEL_SEEDS=0-1`, the selection is
@@ -508,11 +524,13 @@ a soak, the red night is how the owner hears.
         --branch main` lists a completed run, and its summary reads `15000 of 15000`.
       - A `workflow_dispatch` run on `main` with no input is made the day of the merge, and its
         summary is recorded too.
-      - Both are recorded, with the pytest step's duration, which is at most 10 minutes. The
+      - Both are recorded, with the pytest step's duration, which fits the 1,020 s the
+        dispatch bound is derived against (it read "at most 10 minutes" until the first
+        dispatch took 12.5; *Revision history*, 2026-11-26). The
         build's delivery doc is written before the push, so it names them as owed. After the
         merge the orchestrator makes the dispatch and records it, and the first scheduled night
-        once it has run, in a docs-only follow-up pull request cut from fresh `main`, never
-        stacked on the build's.
+        once it has run, in a follow-up pull request cut from fresh `main`, never stacked on
+        the build's (docs-only unless a re-derivation changes a bound, as on 2026-11-26).
 
       A missing scheduled run is a finding for the owner, not a pass.
 - [ ] This FR serves no invariant: it decides when the soak runs and where its verdict goes. What
@@ -1009,7 +1027,7 @@ def ceiling_of(name: str) -> int: ...
 #   tests/soak_verdict.py.
 WINDOW = 5000
 WINDOWS = 30
-MAX_SEEDS = 10_000
+MAX_SEEDS = 5000
 PULL_REQUEST_SEEDS = "0-99"
 WIRING: tuple[str, ...]      # the eight items of FR-003's wiring set
 def normalise(seeds: tuple[int, ...]) -> str: ...
@@ -1034,7 +1052,7 @@ queue.sh main-state | soak-verdict | clearing-range A B
 
 | Name | Where | Meaning |
 |---|---|---|
-| `seeds` | `workflow_dispatch` input of `model-soak.yml` | `LOG_FOUNDRY_MODEL_SEEDS` for that run, at most 10,000 seeds; empty for the run's window |
+| `seeds` | `workflow_dispatch` input of `model-soak.yml` | `LOG_FOUNDRY_MODEL_SEEDS` for that run, at most 5,000 seeds; empty for the run's window |
 
 No new environment variable and no library setting. The workflow sets SPEC-086's two switches.
 
@@ -1116,11 +1134,39 @@ and `install-test.sh`, and `install.sh` is run once after the merge (FR-006).
 
 ## Evidence
 
-Two commits are measured here. **`d9f2f097`** (`main` on 2026-11-24) is what the spec must be true
-of, and the first subsection holds everything measured there. **`eda19f32`** (`main` on 2026-11-16
+Three commits are measured here. **`eee6737d`** (the merge) holds what FR-003 owed after it,
+measured on `ubuntu-latest`, in the first subsection. **`d9f2f097`** (`main` on 2026-11-24) is
+what the spec must be true of, and the second subsection holds everything measured there. **`eda19f32`** (`main` on 2026-11-16
 and 2026-11-17, when the spec was written) is history; FR-001's Shape B and boundary records, one
 of FR-002's two late-write rates, the `-n 4` cost and every prototype result rest on it, and none
 of that was re-run at `d9f2f097`.
+
+### After the merge, at `eee6737d`, measured 2026-11-25 and 2026-11-26
+
+What FR-003 owed after the merge, all on `main` at `eee6737d` on `ubuntu-latest`:
+
+- `scripts/pr-queue/install.sh` re-run once the merge had put `model-soak.yml` on `main`. It kept
+  `enforce-branches`, and the installed `queue.sh` is identical to `main`'s. `queue.sh
+  soak-verdict` printed `0 none` with exit 0, the pinned form, and `main-state` printed 0.
+- A no-input `workflow_dispatch` the day of the merge, run 45625671047.
+- The first scheduled night, run 45793914793 (run number 4), created 09:38:53 UTC on 2026-11-26,
+  inside the 26 hours.
+
+| Run | Seeds | Items | Clean | Known (orphan late write) | New | Wiring | pytest session | Soak step |
+|---|---|---|---|---|---|---|---|---|
+| dispatch 45625671047 | 15000 to 19999 | 15000 of 15000 | 14,697 | 303 | 0 | 8 of 8 | 749.9 s | 752 s (12 min 32 s) |
+| night 45793914793 | 20000 to 24999 | 15000 of 15000 | 14,938 | 62 | 0 | 8 of 8 | 415.1 s | 418 s (6 min 58 s) |
+
+The per-seed costs below divide pytest's session time by 5,000; the step's own duration, from
+the job's step timestamps, is about 3 s longer.
+
+Both were green. The late-write rate was 2.0% on the dispatch and 0.4% on the night; 303, the
+higher, is under the 350 a night the ceiling of 800 is derived from (FR-002), so neither run
+moves the ceiling. The window cost 150 and 83 ms a seed, 1.8 times apart on the same commit and
+runner image, against the stand-in's 61.5. The dispatch broke the criterion's "at most 10 minutes",
+the night met it, and `MAX_SEEDS`'s 10,000 seeds would have taken 1,500 s at the dispatch's cost,
+past the 1,020 s it was derived against; FR-003's *Budget* and *dispatch bound* carry the
+re-derivation.
 
 ### At `d9f2f097`, measured 2026-11-24
 
@@ -1158,7 +1204,8 @@ About 1.8% of items: roughly 270 a night of 15,000, and 350 at the most measured
 stand-in below measured about 0.5. The Docker stand-in under-measured this shape by about two
 orders of magnitude, so it is no longer what the late-write ceiling rests on (FR-002). These small
 runs cost about 33 to 55 ms an item with the job's startup included, above the stand-in's 18.7 ms,
-so the first night's pytest step duration re-checks `WINDOW` and `MAX_SEEDS` (FR-003, owed).
+so the first night's pytest step duration re-checks `WINDOW` and `MAX_SEEDS` (FR-003; settled in
+*After the merge*, below).
 
 **On the Linux stand-in.** Docker `python:3.12-slim`, `--cpus=4 --memory=16g`, the pinned
 `pytest` 9.2.0, `pytest-xdist` 3.8.0, `pytest-asyncio` 1.4.1.post1 and `opentelemetry-proto`
@@ -1330,7 +1377,8 @@ under load", read as known. Both now break the floor.
 
 The first prototype wrote `"1,\n2"` raw into `$GITHUB_OUTPUT`. Run numbers 1, 2, 29, 30 and 31 give
 the windows `5000-9999`, `10000-14999`, `145000-149999`, `0-4999` and `5000-9999`. A dispatch of
-`0-9999` is accepted and `0-10000` refused.
+`0-9999` is accepted and `0-10000` refused (the bound was 10,000 then; 5,000 since 2026-11-26,
+FR-003's *dispatch bound*).
 
 **What gh reports, measured 2026-11-17 with gh 2.93.0 against this repository.**
 - `gh run list` reports a run's latest attempt only. Run 43801629163 read `attempt=2 completed
@@ -1438,6 +1486,17 @@ time, and `queue.sh` reads every run on the head sha.
 nothing.
 
 ## Revision history
+
+- **2026-11-26, the owed post-merge criteria recorded, and the dispatch bound re-derived** from the
+  first dispatch and the first scheduled night on `ubuntu-latest` (*Evidence*, *After the merge*).
+  Both were green with 0 new. The dispatch's pytest step took 12.5 minutes and the night's 7, so a
+  window costs 83 to 150 ms a seed on the real runner. `MAX_SEEDS` falls from 10,000 to 5,000,
+  derived from the slower run with a third as margin, the margin that keeps one window inside the
+  bound (FR-003 says what it leaves uncovered), and `WINDOW` stays 5,000, held to the same
+  bound by a new default-suite test. The owed criterion's "at most 10 minutes" becomes "fits the
+  1,020 s the dispatch bound is derived against", since the real runner varies by 1.8 times and a
+  10-minute line would sit inside that spread. This was to be a docs-only follow-up; changing the
+  bound made it touch `scripts/model-soak-report.py`, its test and the workflow's input text too.
 
 - **2026-11-25, the late-write ceiling re-derived from the real runner** on Andrew's decision. The
   pull request's own `Model soak` job on `ubuntu-latest` met the orphan late write in 6, 3 and 7

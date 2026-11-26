@@ -16,6 +16,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import tomllib
 import tracemalloc
 from typing import TYPE_CHECKING
 
@@ -505,6 +506,40 @@ def test_the_seeds_are_the_run_numbers_window(run_number: int, window: str) -> N
     assert report_mod.seeds("workflow_dispatch", "", run_number) == window
 
 
+def test_a_night_soaks_no_more_than_a_dispatch_may_ask_for() -> None:
+    """FR-003: ``WINDOW`` is held to the time bound ``MAX_SEEDS`` is derived against.
+
+    Both rest on one derivation: the slowest cost per seed measured on ``ubuntu-latest``, and a
+    third again, inside the 1,020 s the job leaves the soak. A window raised past the bound would
+    let a slow night with a hung item be killed by the job's timeout with no report, and a killed
+    night is a failed night, which stops the PR queue until it is filed.
+    """
+    assert report_mod.WINDOW <= report_mod.MAX_SEEDS, (report_mod.WINDOW, report_mod.MAX_SEEDS)
+
+
+def test_the_hang_guard_leaves_the_soak_the_budget_its_bound_rests_on() -> None:
+    """FR-003: the job's 1,800 s less the install and ``faulthandler_timeout`` leaves 1,020 s.
+
+    ``MAX_SEEDS`` is derived against 1,020 s: 1,800 s of ``timeout-minutes: 30``, less 180 s for the
+    install and the hung-item guard, which is ``faulthandler_timeout`` in ``pyproject.toml``. A
+    guard raised for a slow test elsewhere would shrink that budget with the suite still green, so
+    this reads the real value rather than the 600 s the derivation's prose names.
+    """
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    guard = int(config["tool"]["pytest"]["ini_options"]["faulthandler_timeout"])
+    assert 30 * 60 - 180 - guard >= 1020, guard
+
+
+def test_the_dispatch_input_names_the_bound_the_script_enforces() -> None:
+    """FR-003: the ``seeds`` input's description states ``MAX_SEEDS``, the bound ``seeds`` refuses past.
+
+    The description is a second copy of the number, written by hand; a re-derivation that moved only
+    the constant would leave the form a dispatcher reads promising seeds the script then refuses.
+    """
+    stated = f"at most {report_mod.MAX_SEEDS:,} seeds;"
+    assert stated in WORKFLOW.read_text(encoding="utf-8"), stated
+
+
 @pytest.mark.parametrize(
     ("event", "asked", "chosen"),
     [
@@ -512,7 +547,7 @@ def test_the_seeds_are_the_run_numbers_window(run_number: int, window: str) -> N
         ("workflow_dispatch", "1,\n2, 4", "1-2,4"),
         ("workflow_dispatch", " 5 ", "5"),
         ("workflow_dispatch", "4,4,3-4", "3-4"),
-        ("workflow_dispatch", "0-9999", "0-9999"),
+        ("workflow_dispatch", "0-4999", "0-4999"),
     ],
     ids=["pull-request", "a-newline-normalised", "spaces", "overlap", "exactly-the-bound"],
 )
@@ -546,12 +581,12 @@ def _cli(*args: str) -> subprocess.CompletedProcess[str]:
 @pytest.mark.parametrize(
     ("asked", "status", "stdout", "stderr"),
     [
-        ("0-10000", 1, "", "at most 10000"),
+        ("0-5000", 1, "", "at most 5000"),
         ("0-3\nfoo=bar", 1, "", "is refused"),
         ("1;id", 1, "", "is refused"),
         ("$(id)", 1, "", "is refused"),
         ("-1", 1, "", "is refused"),
-        ("0-9999", 0, "0-9999\n", ""),
+        ("0-4999", 0, "0-4999\n", ""),
     ],
     ids=[
         "one-over-the-bound",
