@@ -41,8 +41,8 @@ not closed. SPEC-107 supersedes that clause of SPEC-010 FR-006.
   own (FR-002).
 - The same outcome on every path by which the library closes the sink, and against a real broker
   (FR-003).
-- The record: the docstrings, the superseded clause of SPEC-010, the decision, the invariants
-  page, the README and the pending release notes (FR-004).
+- The record: the docstrings, the superseded clause of SPEC-010, the decision, the README and the
+  pending release notes (FR-004).
 
 **The twin paths** (invariant 6). Inside the sink, `_release` (at close) and `_reset` (after a
 failed publish) are two releases of one transport, and a borrowed and an owned connection are the
@@ -99,13 +99,33 @@ No test asserts today that an owned connection is closed at `close()`: the only 
 the sink over an injected connection. This FR adds that assertion, since without it a release that
 closed no connection at all would pass.
 
+**The derived guard.** A function in `tests/test_sinks_rabbitmq.py` takes a module's source text
+and returns the statements it collected and, of those, the offending ones, each with its enclosing
+method. It collects every statement that passes `self._connection` to `_safe_close`, calls
+`self._connection.close()`, or assigns `None` to `self._connection`. A collected statement is
+allowed only when it lies within the `body`, never the `orelse`, of an `if` whose test is exactly
+`self._owns_connection` or a `BoolOp` `and` with `self._owns_connection` as a direct operand. A
+negated test, an `or` and an `else` branch are therefore all offences. Taking source text is what
+lets the cases below feed it a source that must fail, so its failing case is a standing fixture
+and not a one-time observation of an old commit.
+
+The guard's bound is stated so that it is not read as more than it is. It does not police an
+alias of the connection, such as `c = self._connection; c.close()`. The behavioural criteria of
+FR-001 to FR-003 are what catch a wrong release; the guard catches a release site written without
+the ownership test. It gets the three standing cases below and no guard of its own.
+
 #### Acceptance Criteria:
 
-- [ ] For a sink built with `connection=conn`, after one `emit` and `close()`, `conn.closed` is
-      false and the channel the sink opened on it is closed, with `confirm=False` and with
-      `confirm=True`. At `35b2f55d` this fails on `conn.closed`.
-- [ ] After a second `close()` on that sink, the channel's `close` has been called once in all and
-      `conn.close` not at all.
+- [ ] For a sink built with `connection=conn` over the file's `FakeConnection`, after one `emit`
+      and `close()`, `conn.closed` is false and the channel the sink opened on it is closed. At
+      `35b2f55d` this fails on `conn.closed`.
+- [ ] With `confirm=True`, for a sink built over the `_Connection` double of
+      `tests/test_rabbitmq_confirm.py`, whose `_Channel` offers `confirm_delivery`, after one
+      `emit` and `close()` the double's log holds `confirm_delivery` and `channel.close` and no
+      `connection.close`, and `conn.is_open` is true. At `35b2f55d` the log holds
+      `connection.close`.
+- [ ] After a second `close()` on the first criterion's sink, the channel's `close` has been
+      called once in all and `conn.close` not at all.
 - [ ] `close()` on a borrowed sink that never emitted calls neither `conn.channel()` nor
       `conn.close()`.
 - [ ] When the channel's `close()` raises, the sink's `close()` returns normally, `conn.close` is
@@ -113,14 +133,18 @@ closed no connection at all would pass.
 - [ ] For a sink built with `url=` over the stub `pika` of `tests/test_sinks_rabbitmq.py`, after
       one `emit` and `close()`, the connection the stub built is closed, its channel is closed and
       `sink._connection` is `None`. A release that closes no connection fails this.
-- [ ] A test reads `src/log_foundry/sinks/rabbitmq.py` as an AST and collects every statement that
-      passes `self._connection` to `_safe_close`, calls `self._connection.close()`, or assigns
-      `None` to `self._connection`. It fails, naming the enclosing method, for any such statement
-      that is not inside an `if` whose test reads `self._owns_connection`, and it fails when it
-      collects none. Run over the module as it stands at `35b2f55d`, it fails naming `_release`.
+- [ ] Given a source in which a method closes `self._connection` under no ownership test, the
+      guard function returns that statement as an offence, and the case asserts the method it
+      names.
+- [ ] Given a source whose close of `self._connection` sits under `if not self._owns_connection:`,
+      the guard function returns that statement as an offence, and the case asserts the statement
+      and its method.
+- [ ] Over the live `src/log_foundry/sinks/rabbitmq.py` the guard function returns no offence, and
+      the same case asserts that it collected at least one statement there, so an empty collection
+      cannot read as silence.
 - [ ] `tests/test_sinks_rabbitmq.py::test_close_closes_channel_and_connection`, which asserts
-      `conn.closed is True` for an injected connection, is replaced by the tests of the first and
-      fifth criteria, and no test asserts that an injected connection is closed.
+      `conn.closed is True` for an injected connection, is replaced by this FR's borrowed-close
+      and owned-close tests, and `poetry run pytest` exits 0.
 - [ ] Serves invariants 5 and 6.
 
 ### FR-002: A closed sink keeps a borrowed connection's reference, refuses as an owned one does, and never opens a connection of its own
@@ -163,13 +187,16 @@ connection nothing closes.
       is closed`, `deliver([event])` returns every outcome `REJECTED`, `losses()` is unchanged, no
       channel is opened and `_connect` is not called. This passes at `35b2f55d` too; it is here to
       hold the refusal while the release changes under it.
-- [ ] With the closed refusal removed from `_round`,
+- [ ] With the closed refusal removed from `_round`, and the `rabbitmq` builder as FR-004 leaves
+      it,
       `tests/test_sink_concurrency.py::test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver`
       fails for its `rabbitmq` case because the post-close `emit` returned instead of raising; this
       guard is mutation-tested, because with the reference kept a missing refusal would publish on
       the caller's connection after close.
-- [ ] `tests/test_sink_post_close.py`, `tests/test_closed_guard.py`, `tests/test_rabbitmq_confirm.py`
-      and `tests/test_sinks_broker_engine.py` pass with no edit.
+- [ ] `tests/test_sink_post_close.py`, `tests/test_closed_guard.py` and
+      `tests/test_sinks_broker_engine.py` pass with no edit, and every test already in
+      `tests/test_rabbitmq_confirm.py` passes unchanged, that file gaining only FR-001's
+      `confirm=True` case.
 - [ ] Serves invariants 6 and 7.
 
 ### FR-003: Every path by which the library closes the sink leaves a borrowed connection open
@@ -207,7 +234,8 @@ is covered by the same criterion and not driven separately.
       real `pika.BlockingConnection` passed as `connection=` publishes a batch and is closed;
       afterwards the connection's `is_open` is true, the channel the sink used reads `is_closed`,
       and a channel the test then opens on the same connection reads every message of the batch
-      from the queue. It passes in a local run of the integration suite before the push.
+      from the queue. It passes in a local run of the integration suite before the push, so it is
+      settled there and is not owed against CI.
 - [ ] The diff changes no file under `src/log_foundry/` other than `sinks/rabbitmq.py`.
 - [ ] `inspect.signature(RabbitMQSink)` is unchanged, and `tests/test_public_surface.py` and
       `tests/typed_consumer/` pass with no edit.
@@ -224,10 +252,15 @@ is covered by the same criterion and not driven separately.
 
 #### Description:
 
-The docstrings in `sinks/rabbitmq.py` are the sink's prose, and two of them state the old
-behaviour or cite the superseded clause. The completion ritual
+The docstrings in `sinks/rabbitmq.py` are the sink's prose. `_release`'s states the old
+behaviour, `close`'s cites the superseded clause, and `_reset`'s describes only a mid-round reset,
+which stops being the whole truth once `_release` calls it. The completion ritual
 (`docs/process/completion-ritual.md`) records the rest. A caller can see this change, so step 6
 owes the pending release notes an entry; *Compatibility*, below, says what it tells a caller.
+
+The rule's one home in the register is the new decision file. No invariant's text changes:
+invariant 5 is about the library closing a sink, not about what a sink's own release does to a
+connection inside it.
 
 `README.md`'s *Ownership* sentence is already right and is not edited.
 
@@ -237,6 +270,9 @@ owes the pending release notes an entry; *Compatibility*, below, says what it te
       reference without condition. It says the release closes and drops the channel, closes and
       drops the connection only when the sink opened it, and leaves a borrowed connection open
       with its reference kept, and why the reference is kept.
+- [ ] `RabbitMQSink._reset`'s docstring no longer says only "so the next attempt reconnects",
+      which is untrue of a close. It says `_reset` is the sink's one release, run after a failed
+      publish or a failed probe and at close.
 - [ ] `RabbitMQSink.close`'s docstring cites SPEC-107 for the ownership rule in place of
       SPEC-010's "FR-006", and says a borrowed connection is left open.
 - [ ] The class docstring and the `connection` entry of `__init__`'s `Args:` each say that a
@@ -248,9 +284,12 @@ owes the pending release notes an entry; *Compatibility*, below, says what it te
       `confirm=False`, the default, a publish that returned is all this sink can know" and "A
       borrowed connection is not probed before a round, so a publish on one that died while idle
       reads as a lost confirm", are still in the file word for word.
-- [ ] The comment in `tests/test_sink_concurrency.py`'s `rabbitmq` builder that begins "close()
-      nulls the connection" is corrected: the builder's connection is borrowed, so a missing
-      refusal would open a channel on it, which the builder still counts.
+- [ ] In `tests/test_sink_concurrency.py`'s `rabbitmq` builder, the comment that begins "close()
+      nulls the connection" is corrected and the assignment `sink._connect = Connection` under it
+      is removed. The builder's connection is borrowed, so after FR-001 nothing can reach
+      `_connect` there, and a missing refusal opens a channel on the borrowed connection, which
+      the builder still counts. FR-002's refusal mutation still fails for the `rabbitmq` case
+      afterwards.
 - [ ] In `docs/specs/SPEC-010-queue-and-stream-sinks.md`, the clause "`close()` closes the channel
       and connection" of FR-006 is struck through in place and followed by a marker reading
       "superseded by SPEC-107 FR-001", saying an injected connection is left open.
@@ -260,10 +299,6 @@ owes the pending release notes an entry; *Compatibility*, below, says what it te
       when owned, a borrowed reference is kept so the sink never connects on its own, the
       ownership test is written once, and it speaks for `RabbitMQSink` alone. Its History opens on
       the completion date, and `sh scripts/gen-index.sh` is run.
-- [ ] In `docs/invariants.md`, the fifth entry gains one sentence saying that `RabbitMQSink`'s
-      release closes the channel it opened and leaves open a connection the caller handed it,
-      citing SPEC-107, and its *Guarded* list names `tests/test_sinks_rabbitmq.py` for it. The
-      sentence names no other sink.
 - [ ] `README.md`'s *Queue & stream* section says that a `RabbitMQSink` given a connection opens
       its own channel on it and closes only that channel at `shutdown()`. The *Ownership* sentence
       is unchanged.
@@ -292,8 +327,8 @@ publish, and Andrew chose it on 2026-11-27.
   that relied on the sink closing the connection must close it itself after `shutdown()`. A
   connection the sink opened from `url=` is closed as before.
 - **What does not change.** The constructor's signature, every public name and the typed
-  consumer (invariant 10): no call that 1.x accepted is refused, so the invariants page's tenth
-  entry gains no approved exception. The refusal after close and its error text are unchanged.
+  consumer (invariant 10): no call that 1.x accepted is refused, so this is not one of that
+  invariant's approved exceptions. The refusal after close and its error text are unchanged.
 - **What the register says a release may change.** `docs/decisions/public-api/` freezes names,
   import paths and signatures, and `docs/decisions/release-supply-chain/` settles how a version
   is cut; neither holds a rule on what a patch release may change in behaviour. The pending notes
@@ -324,8 +359,15 @@ def _release(self) -> None: ...
 #   what ClosedGuard.close runs once: calls self._reset(), so the ownership test has one home
 
 def _reset(self) -> None: ...
-#   unchanged: closes and drops the channel; closes and drops the connection only when
-#   self._owns_connection
+#   code unchanged, docstring rewritten (FR-004): closes and drops the channel; closes and drops
+#   the connection only when self._owns_connection
+```
+
+The guard's shape in `tests/test_sinks_rabbitmq.py` (FR-001):
+
+```python
+def connection_release_sites(source: str) -> tuple[list[Site], list[Site]]: ...
+#   (collected, offending); a Site carries the statement's line and its enclosing method's name
 ```
 
 ## File & Folder Structure
@@ -333,29 +375,32 @@ def _reset(self) -> None: ...
 ```
 src/log_foundry/sinks/rabbitmq.py          # FR-001, FR-002; docstrings for FR-004
 tests/test_sinks_rabbitmq.py               # FR-001, FR-002, FR-003 (close, reference, library paths, AST guard)
+tests/test_rabbitmq_confirm.py             # FR-001 (the confirm=True case, beside its doubles)
 tests/integration/test_rabbitmq.py         # FR-003 (a real pika connection, borrowed)
-tests/test_sink_concurrency.py             # FR-004 (one comment)
+tests/test_sink_concurrency.py             # FR-004 (one comment, one dead assignment)
 docs/specs/SPEC-010-queue-and-stream-sinks.md                                              # FR-004
 docs/decisions/sink-lifecycle/rabbitmqsink-closes-the-channel-it-opened-and-never-a-connection-it-was-handed.md   # FR-004
-docs/invariants.md, README.md, docs/release-notes/v1.2.1.md                                # FR-004
+README.md, docs/release-notes/v1.2.1.md                                                    # FR-004
 ```
 
 ## Implementation Phases
 
 ### Phase 1: The release and its tests (FR-001, FR-002, FR-003)
 
-- Write the borrowed and owned close tests, the reference and reconnect tests, the library-path
-  cases and the AST guard, and watch each one that names `35b2f55d` fail there.
+- Write the borrowed and owned close tests, the `confirm=True` case, the reference and reconnect
+  tests and the library-path cases, and watch each one that names `35b2f55d` fail there.
+- Write the guard function and its three standing cases.
 - Make `_release` call `_reset`.
-- Mutation-test the closed refusal against the `rabbitmq` post-close case.
+- Correct the comment in the `rabbitmq` post-close builder and remove its dead assignment, then
+  mutation-test the closed refusal against that case.
 - Add the borrowed-connection test to the integration module and run the integration suite
   locally.
 
 ### Phase 2: The record (FR-004)
 
-- Rewrite the docstrings and the test comment.
-- Mark the superseded clause of SPEC-010, write the decision, add the invariants sentence, the
-  README sentence and the release-notes entry, and regenerate the indexes.
+- Rewrite the docstrings.
+- Mark the superseded clause of SPEC-010, write the decision, add the README sentence and the
+  release-notes entry, and regenerate the indexes.
 
 ## Evidence
 
@@ -397,4 +442,33 @@ Every line below was read at `35b2f55d`.
   that starts a child interpreter may import the installed tree and not the export. With the
   closed refusal also removed from `_round` in that export,
   `test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver[rabbitmq]` failed with
-  `DID NOT RAISE SinkDeliveryError`.
+  `DID NOT RAISE SinkDeliveryError`. That run still carried the builder's `sink._connect`
+  assignment, which FR-004 removes; the assignment is never reached once the reference is kept.
+- **Against a real broker, measured by the spec reviewer and not by the author.** The draft could
+  not run `pika`. The reviewer's run, at `083346d6` with `_release` planted to call `_reset`,
+  against the compose broker image with real `pika` 1.4.4: after `close()` a borrowed connection's
+  `is_open` is true, the channel the sink used reads `is_closed`, and the batch reads back on the
+  same connection, for both values of `confirm`. On `35b2f55d` the same run reads `is_open` false.
+  FR-003's integration criterion is therefore one that can settle in a local run.
+
+## Revision history
+
+- **2026-11-27, drafted.**
+- **Spec review, 2026-11-27.** Six findings, each answered in place.
+  - FR-001's guard criterion left polarity open: as first worded it passed a close under
+    `if not self._owns_connection:` and one in an `else` branch, and its failing case was a
+    one-time observation of `35b2f55d`. The guard is now a function over source text with a
+    stated rule for `body`, `orelse` and the test's shape, three standing cases that assert the
+    reason, and a stated bound (it does not police an alias).
+  - FR-004 gains `_reset`'s docstring, which described only a mid-round reset.
+  - FR-001's `confirm=True` leg ran over a channel with no `confirm_delivery`, so it repeated the
+    default leg. It now names the `_Connection` and `_Channel` doubles of
+    `tests/test_rabbitmq_confirm.py`.
+  - FR-001's "no test asserts that an injected connection is closed" was an unbounded negative.
+    It is now the named replacement and a green suite.
+  - FR-004's comment criterion also removes the `sink._connect = Connection` assignment in the
+    `rabbitmq` post-close builder, which nothing reaches once a borrowed reference is kept.
+  - ~~FR-004 added a sentence to invariant 5 on `docs/invariants.md`.~~ Cut: that invariant is
+    about the library closing a sink, and the decision file is the rule's home. The FRs'
+    invariant citations stand, since FR-001 and FR-003 each hold the once-only close that
+    invariant 5 states.
