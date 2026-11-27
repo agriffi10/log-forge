@@ -112,7 +112,18 @@ and not a one-time observation of an old commit.
 The guard's bound is stated so that it is not read as more than it is. It does not police an
 alias of the connection, such as `c = self._connection; c.close()`. The behavioural criteria of
 FR-001 to FR-003 are what catch a wrong release; the guard catches a release site written without
-the ownership test. It gets the three standing cases below and no guard of its own.
+the ownership test. It gets six standing cases and no guard of its own.
+
+Three of the six are the criteria below: a release under no ownership test, a release under a
+negated test, and the live module. The other three exist because each is the only case that fails
+when one clause of the rule above is dropped. A release in an `else` branch is the only case that
+fails when an `orelse` is treated as covered by its `if`'s test. A release under an `or` is the
+only one that fails when `or` is accepted beside `and`. A release under the bare
+`self._owns_connection` test, which asserts silence over statements the guard did collect, is the
+only one that fails when the bare test stops being accepted, since the live module uses only the
+`and` form. The cases were proven to bite by a sweep run once during the build: nine mutants, each
+dropping or loosening one clause of the function, each planted, seen to fail a named case and
+restored. The sweep leaves nothing in the repo.
 
 #### Acceptance Criteria:
 
@@ -389,7 +400,8 @@ README.md, docs/release-notes/v1.2.1.md                                         
 
 - Write the borrowed and owned close tests, the `confirm=True` case, the reference and reconnect
   tests and the library-path cases, and watch each one that names `35b2f55d` fail there.
-- Write the guard function and its three standing cases.
+- Write the guard function and its six standing cases: the three FR-001's criteria name, and the
+  `else`, `or` and bare-test rows that each alone fail one clause mutant.
 - Make `_release` call `_reset`.
 - Correct the comment in the `rabbitmq` post-close builder and remove its dead assignment, then
   mutation-test the closed refusal against that case.
@@ -472,3 +484,8 @@ Every line below was read at `35b2f55d`.
     about the library closing a sink, and the decision file is the rule's home. The FRs'
     invariant citations stand, since FR-001 and FR-003 each hold the once-only close that
     invariant 5 states.
+- **Build, 2026-11-27.** The guard's "three standing cases" became six, in FR-001's description
+  and in Phase 1. The plan review kept three rows beyond the criteria's three, an `else` branch,
+  an `or` and the bare ownership test, because under the three alone the clause mutants for
+  `orelse`, `or` and the bare test each survived. A one-time sweep of nine clause mutants is how
+  the six were proven to bite; the guard still has no guard of its own, and no criterion changed.
