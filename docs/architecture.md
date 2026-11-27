@@ -2186,6 +2186,84 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `cancelled`, a queue change, decided for the queue, that treats a cancelled scheduled night of
   `model-soak.yml` as failed, with a plant in `scripts/pr-queue-soak-test.sh`.
 
+- **`AzureEventHubsSink` and `NATSSink` each close a client the caller passed in, against the
+  README's *Ownership* sentence** (found while SPEC-107 was authored and built, 2026-11-27; present
+  on `71fb3b9c`, before SPEC-107, which changed neither sink; recorded and not fixed; no invariant:
+  invariant 5 is about the library closing a sink, not about what a sink's own release does to a
+  client inside it). `README.md:645` says of every sink that "an injected one is left open for you
+  to manage". Line numbers are at `a00162ea`. `AzureEventHubsSink._release`
+  (`sinks/eventhubs.py:439`) calls `self.producer.close()` (`:454`) under no ownership test, the
+  class keeps no ownership flag, and `tests/test_sinks_eventhubs.py::test_close_closes_producer`
+  builds the sink with `producer=` and asserts the producer closed, as SPEC-010 FR-009's "`close()`
+  closes the producer" has it. `NATSSink` closes an injected client by design:
+  `_close_on_loop` reads the client's `close` (`sinks/nats.py:1735`) whoever built the client,
+  `_owns_client` being read only for the probe (`:1370`); `close`'s docstring says an injected
+  client's "subscriptions are closed rather than drained"; SPEC-061 FR-004 AC-10 asks for it; and
+  `tests/test_sinks_nats_liveness.py::test_an_injected_client_is_closed_under_the_deadline_and_never_flushed_or_drained`
+  pins it. The Redis pair, `ClickHouseSink`, `MongoDBSink`, `PostgresSink` and `SQLiteSink` leave
+  an injected client or connection open, and since SPEC-107 `RabbitMQSink` does
+  (`docs/decisions/sink-lifecycle/rabbitmqsink-closes-the-channel-it-opened-and-never-a-connection-it-was-handed.md`,
+  which speaks for that sink alone). The other sinks that take an injected `client=`, `producer=`,
+  `stream=` or `opener=` were not read for this item. Whether these two sinks change or the
+  README's universal wording does is a product call that has not been made. **Closed by** that
+  ruling, the sink or README change it asks for, and then a roster derived from the sinks that
+  asserts what the ruling says of every injected client, which SPEC-107 deliberately did not build
+  because it would have ruled on sinks that spec did not change.
+
+- **`RabbitMQSink.close()` in a forked child closes the channel and the owned connection it
+  inherited** (invariant 12; SPEC-107, Out of Scope, 2026-11-27; present before SPEC-107, which
+  left it as it was for the channel and an owned connection; read from the code at `a00162ea`, not
+  run). The library never closes an inherited sink in a child, because `_lifecycle.releasable`
+  refuses it, so this is the call a caller makes directly. `sinks/rabbitmq.py` reads no pid:
+  `close` (`:442`) hands `_release` to the guard (`:461`), and `ClosedGuard.close` in a child
+  adopts its state, turns an inherited `CLOSING` back to `OPEN` and runs the release unless the
+  parent had already closed the sink. The release then closes the channel and, when the sink
+  opened it, the connection, both over a socket the parent still uses. `NATSSink.close`
+  (`sinks/nats.py:1662`) and `SQLiteSink.close` (`sinks/sqlite.py:436`) compare the pid first and
+  return having touched nothing. Since SPEC-107 a borrowed connection is left open in a child as
+  in the parent. What the parent sees after such a close was not measured. **Closed by** a
+  decision on what a caller's `close()` of this sink does in a child, and if it is to touch
+  nothing, a pid comparison before the guard as the two siblings have, held by a test under a
+  real `os.fork`.
+
+- **The integration harness probes RabbitMQ with a bare TCP connect, which a broker that has not
+  begun serving answers** (no invariant: it concerns the integration harness; seen once, by
+  SPEC-107's implementer on 2026-11-27). `tests/integration/conftest.py`
+  gives only Kafka and Logstash a probe that asks a real question (`_PROBES`, `:228` at
+  `a00162ea`); every other service, RabbitMQ among them, gets `_tcp_ready` (`:123`, chosen at
+  `:311`), and `_PROBES`' docstring says "Everything else answers a connect honestly enough"
+  (`:234`). In that one run, started right after `docker compose up`, every RabbitMQ test failed
+  with `ConnectionResetError`; they passed unchanged once
+  `rabbitmq-diagnostics check_port_connectivity` succeeded.
+  `docs/process/operational-traps.md` states the rule ("A service that has bound its port has not
+  necessarily begun serving") and records it for Logstash; it does not name RabbitMQ. **Closed by**
+  a RabbitMQ probe that opens an AMQP connection, the question the client asks, in place of the
+  connect, and a correction to that docstring sentence.
+
+- **`MODULE_FLOORS`' docstring says its numbers are what each module ships, and four are below
+  that** (no invariant: it concerns the integration harness; found during SPEC-107, 2026-11-27;
+  present on `71fb3b9c`). `tests/integration/conftest.py:375` at `a00162ea` reads "The numbers are
+  what each module ships today, not a target." Counting `def test_` lines at that commit, which is
+  a lower bound on what the runner collects from a module: `test_rabbitmq` is floored at 1 and
+  defines four test functions (three before SPEC-107), `test_postgres` at 4 and defines nine,
+  `test_kafka` at 2 and defines four, and `test_mongo` at 1 and defines three. The runner's own
+  count was not taken, since the checkout this was read in lacks the extras those modules import.
+  A floor below what a module ships lets that module lose tests, or have them stop being
+  collected, without the floor firing. **Closed by** raising each floor to what a full run of its
+  module passes, read from the runner, or rewording the sentence to say a floor may sit below it.
+
+- **Two `NATSSink` tests each failed once under a loaded parallel run and were not reproduced**
+  (no invariant is claimed, since neither failure was examined; reported to SPEC-107's
+  orchestrating session on 2026-11-27, each by a reviewer or a peer session, and measured by
+  neither that session nor the one that wrote this item). `tests/test_sinks_nats.py::test_a_transient_stall_at_the_stop_loses_no_batch` failed with
+  its ledger reading 198 of 200 delivered, at `77191f5b`, a commit that differs from its `main`
+  base only in documents. `tests/test_sinks_nats_matrix.py::test_matrix_cell[injected-js-emit3-ack-starved]`
+  failed with 2 where it expects 3, on a branch that changed only documents. Neither was
+  reproduced when run alone. Neither is in `tests/soak_known.py`, which holds close-record signatures and not these
+  tests. These are observations, not findings: nothing here says whether either is a test that
+  cannot hold under load or a defect in the sink. **Closed by** reproducing either under a
+  recorded load, and then by a change to the test or the sink as that shows.
+
 ### Resolved
 
 - ~~**The exit drain sizes a batch from a rate it measured earlier…: a sink that recovers by exit**~~
