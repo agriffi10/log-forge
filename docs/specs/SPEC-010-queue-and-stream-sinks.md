@@ -140,7 +140,11 @@ Publish events to a RabbitMQ exchange.
 - [ ] `emit(batch)` publishes one persistent message per event (delivery mode = persistent) to the
       configured `exchange`/`routing_key`, body = `json.dumps(event)`.
 - [ ] A dropped/closed connection is re-established (bounded retry) before the batch is abandoned and
-      counted/logged; `close()` closes the channel and connection.
+      counted/logged; ~~`close()` closes the channel and connection.~~ — **superseded by
+      SPEC-107 FR-001:** `close()` closes the channel the sink opened, and the connection only
+      when the sink opened it; an injected connection is left open, as FR-005 says of the Redis
+      sinks' injected client. The decision is
+      `docs/decisions/sink-lifecycle/rabbitmqsink-closes-the-channel-it-opened-and-never-a-connection-it-was-handed.md`.
 
 ### FR-007: NATSSink
 

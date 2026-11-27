@@ -1092,6 +1092,11 @@ than `flush()`'s 5 s default. A confirm wait ends only with the confirm or when 
 closes. The default, `confirm=False`, publishes as before, and a publish that returned is all it
 knows.
 
+**A `RabbitMQSink` given a connection closes only its own channel.** Pass `connection=` to share a
+`pika` connection you already hold: the sink opens its own channel on it and, at `shutdown()`,
+closes only that channel. The connection stays open for the rest of your application to use, and
+it is yours to close. A connection the sink opened itself from `url=` is closed with the sink.
+
 `KafkaSink` and `GooglePubSubSink` hand each message to a client that sends it later, and **each
 batch waits for the client's report on every message it handed over** before it returns, within
 `flush_timeout` (10 s by default) or `overflow_timeout` (30 s by default), and only one 50 ms slice
