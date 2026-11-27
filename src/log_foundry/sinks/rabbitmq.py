@@ -56,11 +56,12 @@ class RabbitMQSink:
 
     This is a durable-buffer sink on ``pika``, the optional ``amqp`` extra, imported lazily. Each
     event is published as a persistent message to the configured exchange and routing key, and a
-    dropped or closed connection is re-established within a bounded retry. It delivers through
-    SPEC-072's engine (SPEC-074 FR-004): each round publishes every remaining message once, in
-    order, under the lock for that round only, and the engine resends only the messages that may
-    land. The worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run,
-    0.7 s at the defaults, taken with no lock held, so a ``close()`` during one returns at once.
+    dropped or closed connection the sink opened is re-established within a bounded retry; on a
+    borrowed connection only the channel is reopened. It delivers through SPEC-072's engine
+    (SPEC-074 FR-004): each round publishes every remaining message once, in order, under the lock
+    for that round only, and the engine resends only the messages that may land. The worst-case
+    delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run, 0.7 s at the defaults,
+    taken with no lock held, so a ``close()`` during one returns at once.
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``basic_publish`` writes the frame
     before it returns, so nothing is queued locally between emits.
@@ -115,11 +116,11 @@ class RabbitMQSink:
             connection passed in is never closed by the sink (SPEC-107); the channel the sink
             opens on it is, at ``close()``.
           url: The AMQP URL used when opening a connection.
-          max_retries: Reconnect retries per message, floored at zero as ``Worker._emit`` floors
-            its own (SPEC-021) — a negative value abandoned each message with no attempt made and
-            no counter moved. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
-            FR-001), before any connection is opened; a ``bool`` or ``int`` subclass is read as
-            the ``int`` it holds.
+          max_retries: Retries per message after a failed publish, each on a reopened channel,
+            floored at zero as ``Worker._emit`` floors its own (SPEC-021) — a negative value
+            abandoned each message with no attempt made and no counter moved. Anything but an
+            ``int`` is refused with ``TypeError`` (SPEC-066 FR-001), before any connection is
+            opened; a ``bool`` or ``int`` subclass is read as the ``int`` it holds.
           blocked_connection_timeout: Seconds a blocked broker may hold the connection, or
             ``None`` for :data:`DEFAULT_BLOCKED_CONNECTION_TIMEOUT` unless the URL's query names
             ``blocked_connection_timeout`` itself (SPEC-049 FR-005) — the library's default never
@@ -351,10 +352,11 @@ class RabbitMQSink:
 
         The driver requirement satisfied (SPEC-028 FR-002): ``pika`` states that one connection
         must not be shared across threads, and this sink shares one connection, one channel, and
-        *rebinds* both — ``_reset`` closes and nulls the channel another thread may be
-        mid-publish on — so the round takes the transport lock, as ``SocketTransport``'s does. A
-        closed sink's round is a refusal carrying 1.x's closed error. Every event is encoded once
-        per run (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one ``DROPPED``
+        *rebinds* the channel, and with it a connection it opened — ``_reset`` closes and nulls
+        the channel another thread may be mid-publish on — so the round takes the transport
+        lock, as ``SocketTransport``'s does. A closed sink's round is a refusal carrying 1.x's
+        closed error. Every event is encoded once per run
+        (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one ``DROPPED``
         with SPEC-069's line. A publish that raises runs :meth:`_reset`; a retryable one makes
         that message ``RETRYABLE``, any other ``REJECTED``, and the round goes on to the next.
 
@@ -498,7 +500,7 @@ class RabbitMQSink:
         the same answer. ``StreamLostError``, ``ConnectionClosedByBroker``,
         ``AMQPHeartbeatTimeout`` and ``ConnectionBlockedTimeout`` raised while confirming mean
         the connection went before the confirm, so the frame may have landed: the call is marked
-        ``"unknown"`` and the connection reset. Anything else goes to the predicate.
+        ``"unknown"`` and :meth:`_reset` run. Anything else goes to the predicate.
 
         Any other raise says whether the message may have landed (SPEC-095 FR-002), by class,
         since pika does not retry inside a publish: one of the errors that leave a publish
@@ -591,7 +593,8 @@ class RabbitMQSink:
         ``IncompatibleProtocolError``, ``ConnectionClosedByClient`` and
         ``ConnectionOpenAborted`` — and so is ``ChannelWrongStateError``, what a publish on the
         channel a dropped connection left behind raises; :meth:`_reset` has already dropped it, so
-        the next attempt reconnects (``pika/exceptions.py``). ``ChannelClosedByBroker`` and
+        the next attempt opens a new channel, on a new connection when the sink opened its own
+        (``pika/exceptions.py``). ``ChannelClosedByBroker`` and
         ``ProtocolSyntaxError`` fail at once. ``NackError`` and ``UnroutableError`` never reach
         this predicate: pika raises them only on a confirming channel (``confirm=True``), and
         :meth:`_publish` reads each as a broker refusal, ``REJECTED``, before asking it.
