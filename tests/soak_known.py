@@ -109,7 +109,9 @@ ORPHAN_LATE_WRITE = Known(
 KNOWN: tuple[Known, ...] = (ORPHAN_LATE_WRITE,)
 """Every known shape. A row whose item has left ``### Open`` fails the default suite."""
 
-FILED_NIGHTS: dict[str, str] = {}
+FILED_NIGHTS: dict[str, str] = {
+    "45975518690-1": "Two timing tests fail `test (py3.12)` on a loaded 4-CPU runner",
+}
 """Each scheduled night a clearing pull request filed: ``"<run id>-<attempt>"`` to its §12 lead.
 
 One entry a line, four spaces in, the quoted key, a colon, the quoted lead and a comma: the PR
