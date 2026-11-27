@@ -565,10 +565,10 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
 ## One home per repeated shape
 
 - **One home per repeated shape:** a read-only sweep of the code base at `35b2f55d` looked for
-  logic still written more than once. It found very little repeated text. What is left is
-  repetition of shape: the same few statements written at several sites, each in its own order
-  and spelling, so a change to the rule has to be made at every site and nothing says when one
-  was missed. The proposal was an arc of small refactoring specs, drafted one at a time, that
+  logic still written more than once. The repetition this arc is about is of shape, not of
+  text: the same few statements written at several sites, each in its own order and spelling,
+  so a change to the rule has to be made at every site and nothing says when one was missed.
+  The proposal was an arc of small refactoring specs, drafted one at a time, that
   gives those shapes one home each; on 2026-11-27 Andrew approved drafting its first spec ("Yes,
   draft it"), and each later one needs his yes in turn.
 
