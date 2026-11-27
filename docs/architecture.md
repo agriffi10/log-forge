@@ -2191,7 +2191,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   on `71fb3b9c`, before SPEC-107, which changed neither sink; recorded and not fixed; no invariant:
   invariant 5 is about the library closing a sink, not about what a sink's own release does to a
   client inside it). `README.md:645` says of every sink that "an injected one is left open for you
-  to manage". Line numbers are at `a00162ea`. `AzureEventHubsSink._release`
+  to manage". Line numbers are at `71fb3b9c`. `AzureEventHubsSink._release`
   (`sinks/eventhubs.py:439`) calls `self.producer.close()` (`:454`) under no ownership test, the
   class keeps no ownership flag, and `tests/test_sinks_eventhubs.py::test_close_closes_producer`
   builds the sink with `producer=` and asserts the producer closed, as SPEC-010 FR-009's "`close()`
@@ -2212,10 +2212,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
 
 - **`RabbitMQSink.close()` in a forked child closes the channel and the owned connection it
   inherited** (invariant 12; SPEC-107, Out of Scope, 2026-11-27; present before SPEC-107, which
-  left it as it was for the channel and an owned connection; read from the code at `a00162ea`, not
-  run). The library never closes an inherited sink in a child, because `_lifecycle.releasable`
+  left it as it was for the channel and an owned connection; read from the code as SPEC-107's merge left it,
+  not run). The library never closes an inherited sink in a child, because `_lifecycle.releasable`
   refuses it, so this is the call a caller makes directly. `sinks/rabbitmq.py` reads no pid:
-  `close` (`:442`) hands `_release` to the guard (`:461`), and `ClosedGuard.close` in a child
+  `close` (`:444`) hands `_release` to the guard (`:463`), and `ClosedGuard.close` in a child
   adopts its state, turns an inherited `CLOSING` back to `OPEN` and runs the release unless the
   parent had already closed the sink. The release then closes the channel and, when the sink
   opened it, the connection, both over a socket the parent still uses. `NATSSink.close`
@@ -2230,7 +2230,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   begun serving answers** (no invariant: it concerns the integration harness; seen once, by
   SPEC-107's implementer on 2026-11-27). `tests/integration/conftest.py`
   gives only Kafka and Logstash a probe that asks a real question (`_PROBES`, `:228` at
-  `a00162ea`); every other service, RabbitMQ among them, gets `_tcp_ready` (`:123`, chosen at
+  `71fb3b9c`); every other service, RabbitMQ among them, gets `_tcp_ready` (`:123`, chosen at
   `:311`), and `_PROBES`' docstring says "Everything else answers a connect honestly enough"
   (`:234`). In that one run, started right after `docker compose up`, every RabbitMQ test failed
   with `ConnectionResetError`; they passed unchanged once
@@ -2242,8 +2242,8 @@ an item leaves this list when a spec closes it, not because the arc names it.
 
 - **`MODULE_FLOORS`' docstring says its numbers are what each module ships, and four are below
   that** (no invariant: it concerns the integration harness; found during SPEC-107, 2026-11-27;
-  present on `71fb3b9c`). `tests/integration/conftest.py:375` at `a00162ea` reads "The numbers are
-  what each module ships today, not a target." Counting `def test_` lines at that commit, which is
+  present on `71fb3b9c`). `tests/integration/conftest.py:375` at `71fb3b9c` reads "The numbers are
+  what each module ships today, not a target." Counting `def test_` lines as SPEC-107's merge left the modules, which is
   a lower bound on what the runner collects from a module: `test_rabbitmq` is floored at 1 and
   defines four test functions (three before SPEC-107), `test_postgres` at 4 and defines nine,
   `test_kafka` at 2 and defines four, and `test_mongo` at 1 and defines three. The runner's own
@@ -2252,18 +2252,26 @@ an item leaves this list when a spec closes it, not because the arc names it.
   collected, without the floor firing. **Closed by** raising each floor to what a full run of its
   module passes, read from the runner, or rewording the sentence to say a floor may sit below it.
 
-- **Two `NATSSink` tests each failed once under a loaded parallel run and were not reproduced**
-  (no invariant is claimed, since neither failure was examined; reported to SPEC-107's
+- **Four tests each failed once under a loaded parallel run and were not reproduced, two of them `NATSSink`'s**
+  (no invariant is claimed, since no failure was examined; reported to SPEC-107's
   orchestrating session on 2026-11-27, the first by SPEC-107's plan reviewer and the second by
   the session that landed SPEC-106's Draft, and measured by neither SPEC-107's session nor the
   one that wrote this item). `tests/test_sinks_nats.py::test_a_transient_stall_at_the_stop_loses_no_batch` failed with
-  its ledger reading 198 of 200 delivered, at `77191f5b`, a commit that differs from its `main`
-  base only in documents. `tests/test_sinks_nats_matrix.py::test_matrix_cell[injected-js-emit3-ack-starved]`
+  its ledger reading 198 of 200 delivered, on SPEC-107's branch while it differed from its
+  `main` base only in documents. `tests/test_sinks_nats_matrix.py::test_matrix_cell[injected-js-emit3-ack-starved]`
   failed with 2 where it expects 3, on a branch that changed only documents. Neither was
-  reproduced when run alone. Neither is in `tests/soak_known.py`, which holds close-record signatures and not these
-  tests. These are observations, not findings: nothing here says whether either is a test that
-  cannot hold under load or a defect in the sink. **Closed by** reproducing either under a
-  recorded load, and then by a change to the test or the sink as that shows.
+  reproduced when run alone. Two more were seen by SPEC-107's implementer in consecutive runs of
+  the whole suite on that branch before its merge, with the machine's load average between 17
+  and 34:
+  `tests/test_reentrant_flush.py::test_a_child_forked_on_the_drain_thread_is_not_refused_for_the_threads_name`
+  failed with "never forked", and
+  `tests/test_lock_reentry.py::test_the_recording_run_sees_a_re_entry_only_where_one_is_made[clean]`
+  failed because its child pytest run failed `test_the_fast_return_reports_an_abandoned_drain_as_failure`;
+  each file passed alone, and a third run of the suite passed. None is in
+  `tests/soak_known.py`, which holds close-record signatures and not these tests. These are
+  observations, not findings: nothing here says whether any is a test that cannot hold under
+  load or a defect in the library. **Closed by** reproducing any of them under a recorded load,
+  and then by a change to the test or the library as that shows.
 
 ### Resolved
 
