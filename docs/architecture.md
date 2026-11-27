@@ -2186,6 +2186,129 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `cancelled`, a queue change, decided for the queue, that treats a cancelled scheduled night of
   `model-soak.yml` as failed, with a plant in `scripts/pr-queue-soak-test.sh`.
 
+- **`AzureEventHubsSink` and `NATSSink` each close a client the caller passed in, against the
+  README's *Ownership* sentence** (found while SPEC-107 was authored and built, 2026-11-27; present
+  on `71fb3b9c`, before SPEC-107, which changed neither sink; recorded and not fixed; no invariant:
+  invariant 5 is about the library closing a sink, not about what a sink's own release does to a
+  client inside it). `README.md:645` says of every sink that "an injected one is left open for you
+  to manage". Line numbers are at `71fb3b9c`. `AzureEventHubsSink._release`
+  (`sinks/eventhubs.py:439`) calls `self.producer.close()` (`:454`) under no ownership test, the
+  class keeps no ownership flag, and `tests/test_sinks_eventhubs.py::test_close_closes_producer`
+  builds the sink with `producer=` and asserts the producer closed, as SPEC-010 FR-009's "`close()`
+  closes the producer" has it. `NATSSink` closes an injected client by design:
+  `_close_on_loop` reads the client's `close` (`sinks/nats.py:1735`) whoever built the client,
+  `_owns_client` being read only for the probe (`:1370`); `close`'s docstring says an injected
+  client's "subscriptions are closed rather than drained"; SPEC-061 FR-004 AC-10 asks for it; and
+  `tests/test_sinks_nats_liveness.py::test_an_injected_client_is_closed_under_the_deadline_and_never_flushed_or_drained`
+  pins it. The Redis pair, `ClickHouseSink`, `MongoDBSink`, `PostgresSink` and `SQLiteSink` leave
+  an injected client or connection open, and since SPEC-107 `RabbitMQSink` does
+  (`docs/decisions/sink-lifecycle/rabbitmqsink-closes-the-channel-it-opened-and-never-a-connection-it-was-handed.md`,
+  which speaks for that sink alone). The other sinks that take an injected `client=`, `producer=`,
+  `stream=` or `opener=` were not read for this item. Whether these two sinks change or the
+  README's universal wording does is a product call that has not been made. **Closed by** that
+  ruling, the sink or README change it asks for, and then a roster derived from the sinks that
+  asserts what the ruling says of every injected client, which SPEC-107 deliberately did not build
+  because it would have ruled on sinks that spec did not change.
+
+- **`RabbitMQSink.close()` in a forked child closes the channel and the owned connection it
+  inherited** (invariant 12; SPEC-107, Out of Scope, 2026-11-27; present before SPEC-107, which
+  left it as it was for the channel and an owned connection; read from the code as SPEC-107's merge left it,
+  not run). The library never closes an inherited sink in a child, because `_lifecycle.releasable`
+  refuses it, so this is the call a caller makes directly. `sinks/rabbitmq.py` reads no pid:
+  `close` (`:444`) hands `_release` to the guard (`:463`), and `ClosedGuard.close` in a child
+  adopts its state, turns an inherited `CLOSING` back to `OPEN` and runs the release unless the
+  parent had already closed the sink. The release then closes the channel and, when the sink
+  opened it, the connection, both over a socket the parent still uses. `NATSSink.close`
+  (`sinks/nats.py:1662`) and `SQLiteSink.close` (`sinks/sqlite.py:436`) compare the pid first and
+  return having touched nothing. Since SPEC-107 a borrowed connection is left open in a child as
+  in the parent. SPEC-107's second diff reviewer ran it once on macOS against a real broker with
+  `pika` 1.4.4, on a borrowed connection with `confirm` off and on, and after a child's direct
+  `close()` the parent kept publishing and reading, before SPEC-107 and after it; an owned
+  connection and Linux were not measured. **Closed by** a
+  decision on what a caller's `close()` of this sink does in a child, and if it is to touch
+  nothing, a pid comparison before the guard as the two siblings have, held by a test under a
+  real `os.fork`.
+
+- **The integration harness probes RabbitMQ with a bare TCP connect, which a broker that has not
+  begun serving answers** (no invariant: it concerns the integration harness; seen once, by
+  SPEC-107's implementer on 2026-11-27). `tests/integration/conftest.py`
+  gives only Kafka and Logstash a probe that asks a real question (`_PROBES`, `:228` at
+  `71fb3b9c`); every other service, RabbitMQ among them, gets `_tcp_ready` (`:123`, chosen at
+  `:311`), and `_PROBES`' docstring says "Everything else answers a connect honestly enough"
+  (`:234`). In that one run, started right after `docker compose up`, every RabbitMQ test failed
+  with `ConnectionResetError`; they passed unchanged once
+  `rabbitmq-diagnostics check_port_connectivity` succeeded.
+  `docs/process/operational-traps.md` states the rule ("A service that has bound its port has not
+  necessarily begun serving") and records it for Logstash; it does not name RabbitMQ. **Closed by**
+  a RabbitMQ probe that opens an AMQP connection, the question the client asks, in place of the
+  connect, and a correction to that docstring sentence.
+
+- **`MODULE_FLOORS`' docstring says its numbers are what each module ships, and four are below
+  that** (no invariant: it concerns the integration harness; found during SPEC-107, 2026-11-27;
+  present on `71fb3b9c`). `tests/integration/conftest.py:375` at `71fb3b9c` reads "The numbers are
+  what each module ships today, not a target." Counting `def test_` lines as SPEC-107's merge left the modules, which is
+  a lower bound on what the runner collects from a module: `test_rabbitmq` is floored at 1 and
+  defines four test functions (three before SPEC-107), `test_postgres` at 4 and defines nine,
+  `test_kafka` at 2 and defines four, and `test_mongo` at 1 and defines three. The runner's own
+  count was not taken, since the checkout this was read in lacks the extras those modules import.
+  A floor below what a module ships lets that module lose tests, or have them stop being
+  collected, without the floor firing. **Closed by** raising each floor to what a full run of its
+  module passes, read from the runner, or rewording the sentence to say a floor may sit below it.
+
+- **Four tests each failed once under a loaded parallel run and were not reproduced, two of them `NATSSink`'s**
+  (no invariant is claimed, since no failure was examined; reported to SPEC-107's
+  orchestrating session on 2026-11-27, the first by SPEC-107's plan reviewer and the second by
+  the session that landed SPEC-106's Draft, and measured by neither SPEC-107's session nor the
+  one that wrote this item). `tests/test_sinks_nats.py::test_a_transient_stall_at_the_stop_loses_no_batch` failed with
+  its ledger reading 198 of 200 delivered, on SPEC-107's branch while it differed from its
+  `main` base only in documents. `tests/test_sinks_nats_matrix.py::test_matrix_cell[injected-js-emit3-ack-starved]`
+  failed with 2 where it expects 3, on a branch that changed only documents. Neither was
+  reproduced when run alone. Two more were seen by SPEC-107's implementer in consecutive runs of
+  the whole suite on that branch before its merge, with the machine's load average between 17
+  and 34:
+  `tests/test_reentrant_flush.py::test_a_child_forked_on_the_drain_thread_is_not_refused_for_the_threads_name`
+  failed with "never forked", and
+  `tests/test_lock_reentry.py::test_the_recording_run_sees_a_re_entry_only_where_one_is_made[clean]`
+  failed because its child pytest run failed `test_the_fast_return_reports_an_abandoned_drain_as_failure`;
+  each file passed alone, and a third run of the suite passed. None is in
+  `tests/soak_known.py`, which holds close-record signatures and not these tests. These are
+  observations, not findings: nothing here says whether any is a test that cannot hold under
+  load or a defect in the library. **Closed by** reproducing any of them under a recorded load,
+  and then by a change to the test or the library as that shows. The item below gives a
+  mechanism for the `test_reentrant_flush` sighting.
+
+- **A fork test that runs in the test worker that ran the OTel mapping tests takes about a hundred
+  times longer, and two such tests then miss their 5 s windows on CI** (no invariant: it concerns
+  the test suite; found by SPEC-107's session on 2026-11-27 while its pull request's CI was red;
+  recorded and not fixed; present on `71fb3b9c`, whose copies of every test file named here are
+  the ones measured). Five tests leave their objects alive in the process that ran them:
+  `tests/test_otel_envelope.py::test_every_record_the_mapping_criteria_build_round_trips` and, in
+  `tests/test_otel_mapping.py`, `test_the_node_budget_and_placeholder_equal_sanitizes`,
+  `test_a_shared_subtree_spends_the_node_budget_exactly_once`,
+  `test_the_walk_charges_library_attributes_before_the_body` and
+  `test_the_mark_is_exactly_the_listed_set`. Reading `len(gc.get_objects())` after every test of a
+  whole parallel run, these five were the only tests that moved a worker's count by more than
+  150,000, and the worker that ran them ended the run holding about 2.5 million objects where the
+  other eleven held between 0.32 and 0.36 million. What keeps those objects alive was not examined.
+  Two tests fork from, or collect inside, whichever process they land in:
+  `tests/test_http_rounds.py::test_a_forked_child_commits_a_family_round_past_a_held_lock`, whose
+  parent holds a lock for 5 s across a `gc.collect()` and the fork, and
+  `tests/test_reentrant_flush.py::test_a_child_forked_on_the_drain_thread_is_not_refused_for_the_threads_name`,
+  whose child must collect and fork inside a `flush(timeout=5.0)`. On `71fb3b9c` in a Linux
+  container held to one core that three busy loops also wanted, the three test ids took 0.03 s to
+  0.07 s run alone, and 3.5 s, 3.9 s and 9.0 s run in one process after the two OTel files; all
+  passed. On CI, at the head of SPEC-107's pull request, four of six job runs failed on one of
+  these two tests ("the parent's hold lapsed before the child returned" twice, "never forked"
+  twice), and a re-run in the same hour of the last CI run of `main`'s own tests passed both of
+  its jobs. That difference is not explained: four whole-suite runs of each tree in a container
+  pinned to four cores all passed, and under `src/` SPEC-107 changes only `sinks/rabbitmq.py`,
+  which neither test uses. Which worker a
+  test lands in is decided by `--dist worksteal` as the run goes, so a change in the number of
+  tests can move a fork test into the worker that holds the heap; that is a reading, not a
+  measurement. **Closed by** finding what holds the five tests' objects and releasing it, or by
+  running those tests where what they leave cannot reach a later fork, held by a check that fails
+  when a worker's live objects grow past a stated bound across those files.
+
 ### Resolved
 
 - ~~**The exit drain sizes a batch from a rate it measured earlier…: a sink that recovers by exit**~~

@@ -56,14 +56,22 @@ class RabbitMQSink:
 
     This is a durable-buffer sink on ``pika``, the optional ``amqp`` extra, imported lazily. Each
     event is published as a persistent message to the configured exchange and routing key, and a
-    dropped or closed connection is re-established within a bounded retry. It delivers through
-    SPEC-072's engine (SPEC-074 FR-004): each round publishes every remaining message once, in
-    order, under the lock for that round only, and the engine resends only the messages that may
-    land. The worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run,
-    0.7 s at the defaults, taken with no lock held, so a ``close()`` during one returns at once.
+    dropped or closed connection the sink opened is re-established within a bounded retry; on a
+    borrowed connection only the channel is reopened, and one that is itself gone is never
+    replaced, so every publish on it fails from then on. It delivers through SPEC-072's engine
+    (SPEC-074 FR-004): each round publishes every remaining message once, in order, under the lock
+    for that round only, and the engine resends only the messages that may land. The worst-case
+    delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run, 0.7 s at the defaults,
+    taken with no lock held, so a ``close()`` during one returns at once.
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``basic_publish`` writes the frame
     before it returns, so nothing is queued locally between emits.
+
+    A connection passed as ``connection=`` is borrowed and stays the caller's (SPEC-107): it is
+    never closed by the sink, at ``close()`` or after a failed publish, and the sink keeps its
+    reference to it, so it never opens a connection of its own in its place. The channel is the
+    sink's own in both modes, opened on whichever connection it holds, and ``close()`` closes it.
+    A connection the sink opened from ``url=`` is closed with the sink.
 
     Publisher confirms are opt-in, ``confirm=True``, as Andrew chose on 2026-11-15 ("Off, opt
     in"; SPEC-093 FR-004). With `confirm=False`, the default, a publish that returned is all this
@@ -105,13 +113,15 @@ class RabbitMQSink:
         Args:
           exchange: The exchange to publish to.
           routing_key: The routing key every message carries.
-          connection: A ``pika``-shaped connection to borrow, or ``None`` to open one.
+          connection: A ``pika``-shaped connection to borrow, or ``None`` to open one. A
+            connection passed in is never closed by the sink (SPEC-107); the channel the sink
+            opens on it is, at ``close()``.
           url: The AMQP URL used when opening a connection.
-          max_retries: Reconnect retries per message, floored at zero as ``Worker._emit`` floors
-            its own (SPEC-021) — a negative value abandoned each message with no attempt made and
-            no counter moved. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
-            FR-001), before any connection is opened; a ``bool`` or ``int`` subclass is read as
-            the ``int`` it holds.
+          max_retries: Retries per message after a failed publish, each on a reopened channel,
+            floored at zero as ``Worker._emit`` floors its own (SPEC-021) — a negative value
+            abandoned each message with no attempt made and no counter moved. Anything but an
+            ``int`` is refused with ``TypeError`` (SPEC-066 FR-001), before any connection is
+            opened; a ``bool`` or ``int`` subclass is read as the ``int`` it holds.
           blocked_connection_timeout: Seconds a blocked broker may hold the connection, or
             ``None`` for :data:`DEFAULT_BLOCKED_CONNECTION_TIMEOUT` unless the URL's query names
             ``blocked_connection_timeout`` itself (SPEC-049 FR-005) — the library's default never
@@ -316,8 +326,11 @@ class RabbitMQSink:
         Raises:
           SinkDeliveryError: When the run failed — no message reached the broker (SPEC-026
             FR-001) — with the engine's message. Also when the sink is already closed, by
-            identity, with nothing counted: ``_active_channel`` reopens a connection whenever
-            it finds none, so a publish after ``shutdown()`` would open one nothing would reap.
+            identity, with nothing counted. The reconnect in ``_active_channel`` is reached only
+            by a sink that opened its own connection, so for one a publish after ``shutdown()``
+            would open a connection nothing would reap; on a borrowed connection, whose
+            reference is kept (SPEC-107), it would publish on the caller's connection after
+            the close.
         """
         emit_via_deliver(self, batch)
 
@@ -340,10 +353,11 @@ class RabbitMQSink:
 
         The driver requirement satisfied (SPEC-028 FR-002): ``pika`` states that one connection
         must not be shared across threads, and this sink shares one connection, one channel, and
-        *rebinds* both — ``_reset`` closes and nulls the channel another thread may be
-        mid-publish on — so the round takes the transport lock, as ``SocketTransport``'s does. A
-        closed sink's round is a refusal carrying 1.x's closed error. Every event is encoded once
-        per run (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one ``DROPPED``
+        *rebinds* the channel, and with it a connection it opened — ``_reset`` closes and nulls
+        the channel another thread may be mid-publish on — so the round takes the transport
+        lock, as ``SocketTransport``'s does. A closed sink's round is a refusal carrying 1.x's
+        closed error. Every event is encoded once per run
+        (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one ``DROPPED``
         with SPEC-069's line. A publish that raises runs :meth:`_reset`; a retryable one makes
         that message ``RETRYABLE``, any other ``REJECTED``, and the round goes on to the next.
 
@@ -429,7 +443,10 @@ class RabbitMQSink:
         return json.dumps(event).encode("utf-8")
 
     def close(self) -> None:
-        """Closes the channel and, when owned, the connection (FR-006).
+        """Closes the channel and, only when the sink opened it, the connection (SPEC-107 FR-001).
+
+        A connection passed as ``connection=`` is the caller's: it is left open, and the sink's
+        reference to it is kept. The channel is the sink's own in both modes and is closed.
 
         Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
         refused at once, the one round inside, if any, is waited for and never released under,
@@ -447,7 +464,17 @@ class RabbitMQSink:
         self._guard.close(self._release)
 
     def _release(self) -> None:
-        """Closes the channel, then the connection, dropping each reference.
+        """Runs the sink's one release, :meth:`_reset`, as the close the guard makes once.
+
+        The channel is closed and its reference dropped in both modes. The connection is closed
+        and its reference dropped only when the sink opened it; a borrowed connection is left
+        open and its reference kept (SPEC-107). The reference is kept because
+        :meth:`_active_channel` connects whenever it finds none, and a borrowed sink has no URL
+        to connect with, ``url=`` being refused beside ``connection=``: it would open a
+        connection to ``pika``'s default broker that nothing would ever close, since the sink
+        does not own it and this release has already run. Calling :meth:`_reset` rather than
+        restating it keeps the ownership test in one place, so the two release sites cannot
+        drift apart.
 
         :meth:`close` hands this to the guard, which runs it once, with the lock held and
         the state already ``CLOSED``.
@@ -461,12 +488,7 @@ class RabbitMQSink:
         Raises:
           None. ``_safe_close`` absorbs what either close raises.
         """
-        if self._channel is not None:
-            _safe_close(self._channel)
-            self._channel = None
-        if self._connection is not None:
-            _safe_close(self._connection)
-            self._connection = None
+        self._reset()
 
     def _publish(self, body: bytes) -> Called[str]:
         """Publishes one message once (SPEC-074 FR-004); the engine resends it in a later round.
@@ -479,7 +501,7 @@ class RabbitMQSink:
         the same answer. ``StreamLostError``, ``ConnectionClosedByBroker``,
         ``AMQPHeartbeatTimeout`` and ``ConnectionBlockedTimeout`` raised while confirming mean
         the connection went before the confirm, so the frame may have landed: the call is marked
-        ``"unknown"`` and the connection reset. Anything else goes to the predicate.
+        ``"unknown"`` and :meth:`_reset` run. Anything else goes to the predicate.
 
         Any other raise says whether the message may have landed (SPEC-095 FR-002), by class,
         since pika does not retry inside a publish: one of the errors that leave a publish
@@ -572,10 +594,15 @@ class RabbitMQSink:
         ``IncompatibleProtocolError``, ``ConnectionClosedByClient`` and
         ``ConnectionOpenAborted`` — and so is ``ChannelWrongStateError``, what a publish on the
         channel a dropped connection left behind raises; :meth:`_reset` has already dropped it, so
-        the next attempt reconnects (``pika/exceptions.py``). ``ChannelClosedByBroker`` and
-        ``ProtocolSyntaxError`` fail at once. ``NackError`` and ``UnroutableError`` never reach
-        this predicate: pika raises them only on a confirming channel (``confirm=True``), and
-        :meth:`_publish` reads each as a broker refusal, ``REJECTED``, before asking it.
+        the next attempt opens a new channel, on a new connection when the sink opened its own
+        (``pika/exceptions.py``). On a borrowed connection that is itself gone, opening the
+        channel fails as well, with ``ConnectionWrongStateError``, an ``AMQPConnectionError`` this
+        predicate retries: each retry fails the same way and the message is counted lost once
+        the retries are spent, since the sink never replaces a connection it was handed.
+        ``ChannelClosedByBroker`` and ``ProtocolSyntaxError`` fail at once. ``NackError`` and
+        ``UnroutableError`` never reach this predicate: pika raises them only on a confirming
+        channel (``confirm=True``), and :meth:`_publish` reads each as a broker refusal,
+        ``REJECTED``, before asking it.
 
         Args:
           err: The exception the attempt raised.
@@ -639,6 +666,10 @@ class RabbitMQSink:
     def _active_channel(self) -> Any:
         """Returns the open channel, reconnecting and reopening as needed.
 
+        The reconnect is reached only by a sink that opened its own connection: no release drops
+        a borrowed connection's reference (SPEC-107 FR-002), so on one only the channel is ever
+        reopened, and when the borrowed connection is itself gone, opening the channel raises.
+
         With ``confirm=True`` each channel it opens is put in confirm mode before its first
         publish (SPEC-093 FR-004). ``confirm_delivery`` is probed by name, as ``SentrySink`` probes
         ``flush``, so a stand-in channel without it publishes unconfirmed, as in 1.x; one that
@@ -669,7 +700,13 @@ class RabbitMQSink:
         return self._channel
 
     def _reset(self) -> None:
-        """Drops the channel, and an owned connection, so the next attempt reconnects.
+        """Releases the transport: the channel always, the connection only when the sink opened it.
+
+        The sink's one release (SPEC-107 FR-001), and the one place the ownership test is
+        written. It runs after a failed publish or a failed probe, so that the next attempt
+        reopens what was dropped, and at close, through :meth:`_release`. A borrowed connection
+        is never closed here and its reference is never dropped, so only its channel is ever
+        reopened.
 
         Args:
           None.

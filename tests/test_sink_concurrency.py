@@ -1715,11 +1715,9 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         sink = rabbit.RabbitMQSink(
             exchange="logs", routing_key="events", connection=Connection()
         )
-        # close() nulls the connection and _active_channel reopens whenever it finds none, so
-        # _connect must succeed for this test to mean anything: without it the post-close emit
-        # would fail on a missing `pika` rather than on the guard, and deleting the guard would
-        # still look correct. With it, a missing guard opens a real connection — the leak.
-        sink._connect = Connection  # type: ignore[method-assign]
+        # The connection is borrowed, so close() keeps the sink's reference to it (SPEC-107) and
+        # nothing here can reach _connect. A missing guard opens a channel on the borrowed
+        # connection and publishes on it after close, which `opened` counts.
         sink._properties = object()
         return sink, lambda: len(opened)
     if name == "mongodb":
