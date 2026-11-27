@@ -292,8 +292,7 @@ def _releases_the_connection(node: ast.AST) -> bool:
     """Whether ``node`` closes ``self._connection`` or assigns ``None`` to it."""
     if isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id == "_safe_close":
-            passed = [*node.args, *(keyword.value for keyword in node.keywords)]
-            return any(_is_self_attribute(value, "_connection") for value in passed)
+            return any(_is_self_attribute(value, "_connection") for value in node.args)
         return (
             isinstance(node.func, ast.Attribute)
             and node.func.attr == "close"
@@ -332,42 +331,42 @@ def connection_release_sites(source: str) -> tuple[list[Site], list[Site]]:
     ``self._owns_connection`` or an ``and`` with that as a direct operand; a negated test, an
     ``or`` and an ``else`` branch are therefore offences.
 
-    Its bound: it does not police an alias (``c = self._connection; c.close()``), and it is not
-    the proof that a release is right, which is the behavioural tests above. It catches a release
-    site written without the ownership test.
+    Its bound: it reads those three shapes and no other. It does not police an alias
+    (``c = self._connection; c.close()``), a keyword argument (``_safe_close(resource=...)``), a
+    tuple assignment (``self._channel, self._connection = None, None``), ``del self._connection``,
+    a bound ``self._connection.close`` handed to another call, or a ``with`` statement that closes
+    the connection. It also reports a correct release that follows an early ``return`` on
+    ``not self._owns_connection``, since it reads only the enclosing ``if``. It is not the proof
+    that a release is right, which is the behavioural tests above. It catches a release site
+    written without the ownership test.
+
+    Every clause has a case below that fails without it; a clause with no such case was removed
+    rather than left unproven, which is why a keyword argument is in the bound and not the rule.
 
     Args:
       source: A module's source text.
 
     Returns:
-      ``(collected, offending)``, each in source order.
+      ``(collected, offending)``, each in source order; a site is its statement's first line and
+      its enclosing ``def``'s name.
     """
     collected: list[Site] = []
     offending: list[Site] = []
-    seen: set[int] = set()
 
-    def visit(node: ast.AST, method: str, statement: ast.stmt | None, owned: bool) -> None:
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+    def visit(node: ast.AST, method: str, line: int, owned: bool) -> None:
+        if isinstance(node, ast.FunctionDef):
             method = node.name
         if isinstance(node, ast.stmt):
-            statement = node
-        if statement is not None and id(statement) not in seen and _releases_the_connection(node):
-            seen.add(id(statement))
-            site = Site(statement.lineno, method)
-            collected.append(site)
+            line = node.lineno
+        if _releases_the_connection(node):
+            collected.append(Site(line, method))
             if not owned:
-                offending.append(site)
-        if isinstance(node, ast.If):
-            visit(node.test, method, statement, owned)
-            for child in node.body:
-                visit(child, method, statement, owned or _tests_ownership(node.test))
-            for child in node.orelse:
-                visit(child, method, statement, owned)
-            return
+                offending.append(Site(line, method))
+        covered = node.body if isinstance(node, ast.If) and _tests_ownership(node.test) else []
         for child in ast.iter_child_nodes(node):
-            visit(child, method, statement, owned)
+            visit(child, method, line, owned or any(child is held for held in covered))
 
-    visit(ast.parse(source), "<module>", None, False)
+    visit(ast.parse(source), "<module>", 0, False)
     return collected, offending
 
 
@@ -388,6 +387,13 @@ class Sink:
             self._connection = None
 """
 """The release as it stood before SPEC-107: the connection closed under no ownership test."""
+
+_ANNOTATED = """
+class Sink:
+    def _forget(self):
+        self._connection: object = None
+"""
+"""``None`` assigned under an annotation, the form ``__init__`` uses for its other attributes."""
 
 _WRONG_POLARITY = {
     "negated": (
@@ -419,6 +425,24 @@ class Sink:
 """,
         ("_drop", "_safe_close(self._connection)"),
     ),
+    "nested-operand": (
+        """
+class Sink:
+    def _drop(self):
+        if self._closing and not self._owns_connection:
+            self._connection.close()
+""",
+        ("_drop", "self._connection.close()"),
+    ),
+    "other-receiver": (
+        """
+class Sink:
+    def _drop(self, other):
+        if other._owns_connection:
+            self._connection.close()
+""",
+        ("_drop", "self._connection.close()"),
+    ),
 }
 """A release under an ownership test that does not establish ownership, and its one offence."""
 
@@ -432,6 +456,15 @@ class Sink:
 """
 """Each release shape under the bare ownership test, a form the live module does not use."""
 
+_NESTED_IF = """
+class Sink:
+    def _drop(self):
+        if self._owns_connection:
+            if self._connection is not None:
+                _safe_close(self._connection)
+"""
+"""A release under an ``if`` that is itself inside the ownership test's body."""
+
 
 def test_the_guard_reports_a_connection_closed_under_no_ownership_test() -> None:
     """FR-001: a release site written without the ownership test is an offence, by name."""
@@ -443,9 +476,19 @@ def test_the_guard_reports_a_connection_closed_under_no_ownership_test() -> None
     ]
 
 
+def test_the_guard_reports_an_annotated_assignment_of_none() -> None:
+    """FR-001: ``None`` assigned under an annotation is a release like the plain assignment."""
+    _, offending = connection_release_sites(_ANNOTATED)
+    assert _named(_ANNOTATED, offending) == [("_forget", "self._connection: object = None")]
+
+
 @pytest.mark.parametrize("shape", sorted(_WRONG_POLARITY))
 def test_the_guard_reports_a_close_under_the_wrong_polarity(shape: str) -> None:
-    """FR-001: a negated test, an ``else`` branch and an ``or`` do not establish ownership."""
+    """FR-001: only ``self._owns_connection``, bare or a direct ``and`` operand, is ownership.
+
+    A negated test, an ``else`` branch, an ``or``, the name nested inside an ``and`` operand and
+    another object's attribute of the same name each fail to establish it.
+    """
     source, expected = _WRONG_POLARITY[shape]
     _, offending = connection_release_sites(source)
     assert _named(source, offending) == [expected]
@@ -460,6 +503,13 @@ def test_the_guard_allows_a_close_under_the_bare_ownership_test() -> None:
         ("_drop", "self._connection.close()"),
         ("_drop", "self._connection = None"),
     ]
+
+
+def test_the_guard_allows_a_close_under_an_if_nested_in_the_ownership_test() -> None:
+    """FR-001: a release inside the ownership test's body stays inside it under a further ``if``."""
+    collected, offending = connection_release_sites(_NESTED_IF)
+    assert offending == []
+    assert _named(_NESTED_IF, collected) == [("_drop", "_safe_close(self._connection)")]
 
 
 def test_the_live_module_closes_its_connection_only_under_the_ownership_test() -> None:
