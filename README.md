@@ -1094,10 +1094,13 @@ knows.
 
 **A `RabbitMQSink` given a connection closes only its own channel.** Pass `connection=` to have the
 sink publish on a `pika` connection you built: the sink opens its own channel on it and, at
-`shutdown()`, closes only that channel. The connection is left open, and it is yours to close.
-`pika` does not allow one connection to be used from several threads at once, and the sink
-publishes from the library's worker thread, so leave a connection you pass in to the sink until
-`shutdown()` returns. A connection the sink opened itself from `url=` is closed with the sink.
+`shutdown()`, or whenever the sink is closed, closes only that channel. The connection is left
+open, and it is yours to close. `pika` does not allow one connection to be used from several
+threads at once, and the sink uses the connection from the library's worker thread, from your own
+thread for a log call made outside any span, and from the thread that closes the sink. So leave a
+connection you pass in to the sink until `shutdown()` has closed the sink; a `shutdown()` whose
+timeout expires first leaves the sink open and still publishing. A connection the sink opened
+itself from `url=` is closed with the sink.
 
 `KafkaSink` and `GooglePubSubSink` hand each message to a client that sends it later, and **each
 batch waits for the client's report on every message it handed over** before it returns, within

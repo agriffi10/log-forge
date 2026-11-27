@@ -54,11 +54,19 @@ it would publish on the caller's connection after the close. The `rabbitmq` case
 with `DID NOT RAISE SinkDeliveryError` when the refusal is removed from `_round` (run at
 `a00162ea` against a scratch copy of `src/`).
 
-**One trade is accepted.** A call that goes around the guard, such as a subclass calling
+**Three trades are accepted.** A call that goes around the guard, such as a subclass calling
 `_active_channel()` on a closed sink, opens a new channel on the caller's connection, where it
 used to open a connection of the sink's own. The connection is the caller's and is still open,
 and a channel on it ends when the caller closes it. The alternative was a connection nothing
 closes.
+
+A subclass that overrides `_reset` now has its override run at close, because the release is that
+method; at `71fb3b9c` the close did not call it. `_reset` is private, and an override that
+reconnects eagerly would leave a connection open after the close.
+
+After `shutdown()` the library still holds the closed sink, and the sink still holds the borrowed
+reference, so the caller's connection object stays reachable through the library until a later
+`configure()` replaces the sink; at `71fb3b9c` the reference was dropped at close.
 
 **What this does not settle.** It speaks for `RabbitMQSink` alone and rules on no other sink.
 `AzureEventHubsSink` and `NATSSink` each close an injected client at close today, against the same

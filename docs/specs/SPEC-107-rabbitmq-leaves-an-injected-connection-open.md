@@ -188,11 +188,19 @@ owns the client
 (`docs/decisions/sink-delivery/a-sink-that-released-its-transport-refuses-one-that-released-nothing-keeps-accepting.md`),
 so a closed borrowed sink refuses with the same error as a closed owned one and reaches no driver.
 
-**One trade is accepted.** With the reference kept, a call that goes around the guard, such as a
-subclass calling `_active_channel()` on a closed sink, opens a new channel on the caller's
+**Three trades are accepted.** With the reference kept, a call that goes around the guard, such
+as a subclass calling `_active_channel()` on a closed sink, opens a new channel on the caller's
 connection where it used to open a connection of the sink's own. The connection is the caller's
 and is still open, and a channel on it ends when the caller closes it; the alternative was a
 connection nothing closes.
+
+A subclass that overrides `_reset` now has its override run at close, because the release is that
+method; at `71fb3b9c` the close did not call it. `_reset` is private, and an override that
+reconnects eagerly would leave a connection open after the close.
+
+After `shutdown()` the library still holds the closed sink, and the sink still holds the borrowed
+reference, so the caller's connection object stays reachable through the library until a later
+`configure()` replaces the sink; at `71fb3b9c` the reference was dropped at close.
 
 #### Acceptance Criteria:
 
@@ -513,3 +521,7 @@ Every line below was read at `35b2f55d`.
   assignment, `del`, a bound `close` handed on, a `with` statement, and the early-`return` shape
   the guard reports although it is correct. A second and last sweep of twenty-seven clause
   mutants left no survivor. No criterion changed.
+- **Second diff review, 2026-11-27.** FR-002's one accepted trade became three, as the decision
+  file states them: an override of `_reset` now runs at close, and the caller's connection stays
+  reachable through the closed sink the library holds until a later `configure()` replaces it.
+  Both were run before they were written. No criterion and no behaviour changed.

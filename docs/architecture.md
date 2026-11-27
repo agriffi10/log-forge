@@ -2221,7 +2221,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
   opened it, the connection, both over a socket the parent still uses. `NATSSink.close`
   (`sinks/nats.py:1662`) and `SQLiteSink.close` (`sinks/sqlite.py:436`) compare the pid first and
   return having touched nothing. Since SPEC-107 a borrowed connection is left open in a child as
-  in the parent. What the parent sees after such a close was not measured. **Closed by** a
+  in the parent. SPEC-107's second diff reviewer ran it once on macOS against a real broker with
+  `pika` 1.4.4, and after a child's direct `close()` the parent kept publishing and reading,
+  before SPEC-107 and after it; Linux was not measured. **Closed by** a
   decision on what a caller's `close()` of this sink does in a child, and if it is to touch
   nothing, a pid comparison before the guard as the two siblings have, held by a test under a
   real `os.fork`.
