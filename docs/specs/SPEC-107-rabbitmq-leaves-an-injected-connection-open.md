@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-107
 title: "RabbitMQSink Leaves an Injected Connection Open at Close"
 description: "Makes RabbitMQSink.close() close only the channel the sink opened and leave open a pika connection the caller passed in, as the README and the method's own docstring already say, so an application that shares its connection with this sink keeps it after shutdown()."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-010, SPEC-032, SPEC-076]
 ---
 
