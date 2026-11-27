@@ -2254,8 +2254,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
 
 - **Two `NATSSink` tests each failed once under a loaded parallel run and were not reproduced**
   (no invariant is claimed, since neither failure was examined; reported to SPEC-107's
-  orchestrating session on 2026-11-27, each by a reviewer or a peer session, and measured by
-  neither that session nor the one that wrote this item). `tests/test_sinks_nats.py::test_a_transient_stall_at_the_stop_loses_no_batch` failed with
+  orchestrating session on 2026-11-27, the first by SPEC-107's plan reviewer and the second by
+  the session that landed SPEC-106's Draft, and measured by neither SPEC-107's session nor the
+  one that wrote this item). `tests/test_sinks_nats.py::test_a_transient_stall_at_the_stop_loses_no_batch` failed with
   its ledger reading 198 of 200 delivered, at `77191f5b`, a commit that differs from its `main`
   base only in documents. `tests/test_sinks_nats_matrix.py::test_matrix_cell[injected-js-emit3-ack-starved]`
   failed with 2 where it expects 3, on a branch that changed only documents. Neither was
