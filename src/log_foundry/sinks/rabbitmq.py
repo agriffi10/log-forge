@@ -461,12 +461,7 @@ class RabbitMQSink:
         Raises:
           None. ``_safe_close`` absorbs what either close raises.
         """
-        if self._channel is not None:
-            _safe_close(self._channel)
-            self._channel = None
-        if self._connection is not None:
-            _safe_close(self._connection)
-            self._connection = None
+        self._reset()
 
     def _publish(self, body: bytes) -> Called[str]:
         """Publishes one message once (SPEC-074 FR-004); the engine resends it in a later round.

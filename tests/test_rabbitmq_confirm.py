@@ -316,6 +316,19 @@ def test_a_confirming_borrowed_sink_confirms_and_publishes_mandatory_but_never_p
     ]
 
 
+def test_a_confirming_borrowed_sink_closes_its_channel_and_leaves_the_connection_open(
+    monkeypatch: pytest.MonkeyPatch, pika_errors: types.ModuleType
+) -> None:
+    """SPEC-107 FR-001: the close ends the confirming channel and never the caller's connection."""
+    log: list[str] = []
+    conn = _Connection(log, [])
+    sink = _borrowed(monkeypatch, conn, confirm=True)
+    sink.emit([{"i": 1}])
+    sink.close()
+    assert log == ["channel", "confirm_delivery", "publish mandatory=True", "channel.close"]
+    assert conn.is_open is True
+
+
 @pytest.mark.parametrize("build", ["owned", "borrowed"])
 def test_a_default_sink_makes_none_of_the_three_calls(
     build: str, monkeypatch: pytest.MonkeyPatch, pika_errors: types.ModuleType
