@@ -57,7 +57,8 @@ class RabbitMQSink:
     This is a durable-buffer sink on ``pika``, the optional ``amqp`` extra, imported lazily. Each
     event is published as a persistent message to the configured exchange and routing key, and a
     dropped or closed connection the sink opened is re-established within a bounded retry; on a
-    borrowed connection only the channel is reopened. It delivers through SPEC-072's engine
+    borrowed connection only the channel is reopened, and one that is itself gone is never
+    replaced, so every publish on it fails from then on. It delivers through SPEC-072's engine
     (SPEC-074 FR-004): each round publishes every remaining message once, in order, under the lock
     for that round only, and the engine resends only the messages that may land. The worst-case
     delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run, 0.7 s at the defaults,
@@ -594,10 +595,14 @@ class RabbitMQSink:
         ``ConnectionOpenAborted`` — and so is ``ChannelWrongStateError``, what a publish on the
         channel a dropped connection left behind raises; :meth:`_reset` has already dropped it, so
         the next attempt opens a new channel, on a new connection when the sink opened its own
-        (``pika/exceptions.py``). ``ChannelClosedByBroker`` and
-        ``ProtocolSyntaxError`` fail at once. ``NackError`` and ``UnroutableError`` never reach
-        this predicate: pika raises them only on a confirming channel (``confirm=True``), and
-        :meth:`_publish` reads each as a broker refusal, ``REJECTED``, before asking it.
+        (``pika/exceptions.py``). On a borrowed connection that is itself gone, opening the
+        channel fails as well, with ``ConnectionWrongStateError``, an ``AMQPConnectionError`` this
+        predicate retries: each retry fails the same way and the message is counted lost once
+        the retries are spent, since the sink never replaces a connection it was handed.
+        ``ChannelClosedByBroker`` and ``ProtocolSyntaxError`` fail at once. ``NackError`` and
+        ``UnroutableError`` never reach this predicate: pika raises them only on a confirming
+        channel (``confirm=True``), and :meth:`_publish` reads each as a broker refusal,
+        ``REJECTED``, before asking it.
 
         Args:
           err: The exception the attempt raised.
@@ -663,7 +668,7 @@ class RabbitMQSink:
 
         The reconnect is reached only by a sink that opened its own connection: no release drops
         a borrowed connection's reference (SPEC-107 FR-002), so on one only the channel is ever
-        reopened.
+        reopened, and when the borrowed connection is itself gone, opening the channel raises.
 
         With ``confirm=True`` each channel it opens is put in confirm mode before its first
         publish (SPEC-093 FR-004). ``confirm_delivery`` is probed by name, as ``SentrySink`` probes
