@@ -2102,7 +2102,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   attempt, with a different failure each time; `test (py3.13)` passed on every attempt, and the
   previous Release run, at `5d0e7f68`, passed first time. `main` also had a failed Release at
   `5170b023`, not examined here. Neither failure was reproduced locally. Line numbers are at
-  `96252937`, and none of the files cited has changed since.
+  `96252937`.
   The first attempt failed `tests/test_invariants_model.py::test_the_soak_is_wired[http]`
   (invariant 3) at `:985`: `invariant 3 (within its timeout plus 1.0 s): Stalled:info, info: own
   time 1.067 s against a budget of 0.000 s; load average 12.0 / 4.2 / 1.5 on 4 CPUs seed=2`. Its
@@ -2132,6 +2132,20 @@ an item leaves this list when a spec closes it, not because the arc names it.
   this bound, and a red scheduled night stops the PR queue until a pull request files it in
   `FILED_NIGHTS` (`scripts/pr-queue/PROTOCOL.md`). Filing such a night is the existing clearing
   path, and this item is what the filing names.
+  **The scheduled night of 2026-11-27 failed on this bound, and not in a wiring item** (run
+  45975518690, attempt 1, at `35b2f55d`; filed as `45975518690-1` in `FILED_NIGHTS` on Andrew's
+  answer of that day, as the orchestrating session relayed it). Its one new finding was
+  `test_soak_the_close_count_under_concurrency[emit-seed32163]`, which failed in `_bounded` with
+  `invariant 3 (within its timeout plus 1.0 s): Stalled:span, span: own time 1.029 s against a
+  budget of 0.000 s; load average 21.7 / 9.5 / 3.6 on 4 CPUs`. The report read 15,000 of 15,000
+  soak items run, 14,700 clean, 299 known and 1 new, with 8 of 8 wiring items passed, and pytest
+  took 768.50 s where the night before, run 45793914793 at `eee6737d`, took 415.05 s with 62
+  known and none new. Re-run alone at `35b2f55d` on an idle ten-core macOS machine, that item
+  passed 6 of 6 times in 0.43 to 0.45 s. So every soak item is exposed to this bound on a loaded
+  runner, 15,000 a night, and not only the eight wiring items the paragraph above counts. No
+  `KNOWN` row is added for it: a row explains a signature read from a sink's close record
+  (`tests/soak_known.py`), and this is the gating timing bound failing inside a soak item, which
+  no row may excuse, so a later loaded night is red again until the change below lands.
   **Closed by** two test changes. The soak's bound needs to hold on a loaded 4-CPU runner
   without letting a real stall through, for instance by subtracting the time the calling thread
   was not scheduled rather than widening `EPSILON`, which `_machine` rules out. The fast-return
