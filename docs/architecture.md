@@ -2274,7 +2274,40 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `tests/soak_known.py`, which holds close-record signatures and not these tests. These are
   observations, not findings: nothing here says whether any is a test that cannot hold under
   load or a defect in the library. **Closed by** reproducing any of them under a recorded load,
-  and then by a change to the test or the library as that shows.
+  and then by a change to the test or the library as that shows. The item below gives a
+  mechanism for the `test_reentrant_flush` sighting.
+
+- **A fork test that runs in the test worker that ran the OTel mapping tests takes about a hundred
+  times longer, and two such tests then miss their 5 s windows on CI** (no invariant: it concerns
+  the test suite; found by SPEC-107's session on 2026-11-27 while its pull request's CI was red;
+  recorded and not fixed; present on `71fb3b9c`, whose copies of every test file named here are
+  the ones measured). Five tests leave their objects alive in the process that ran them:
+  `tests/test_otel_envelope.py::test_every_record_the_mapping_criteria_build_round_trips` and, in
+  `tests/test_otel_mapping.py`, `test_the_node_budget_and_placeholder_equal_sanitizes`,
+  `test_a_shared_subtree_spends_the_node_budget_exactly_once`,
+  `test_the_walk_charges_library_attributes_before_the_body` and
+  `test_the_mark_is_exactly_the_listed_set`. Reading `len(gc.get_objects())` after every test of a
+  whole parallel run, these five were the only tests that moved a worker's count by more than
+  150,000, and the worker that ran them ended the run holding about 2.5 million objects where the
+  other eleven held between 0.32 and 0.36 million. What keeps those objects alive was not examined.
+  Two tests fork from, or collect inside, whichever process they land in:
+  `tests/test_http_rounds.py::test_a_forked_child_commits_a_family_round_past_a_held_lock`, whose
+  parent holds a lock for 5 s across a `gc.collect()` and the fork, and
+  `tests/test_reentrant_flush.py::test_a_child_forked_on_the_drain_thread_is_not_refused_for_the_threads_name`,
+  whose child must collect and fork inside a `flush(timeout=5.0)`. On `71fb3b9c` in a Linux
+  container held to one core that three busy loops also wanted, the three test ids took 0.03 s to
+  0.07 s run alone, and 3.5 s, 3.9 s and 9.0 s run in one process after the two OTel files; all
+  passed. On CI, at the head of SPEC-107's pull request, four of six job runs failed on one of
+  these two tests ("the parent's hold lapsed before the child returned" twice, "never forked"
+  twice), and a re-run in the same hour of the last CI run of `main`'s own tests passed both of
+  its jobs. That difference is not explained: four whole-suite runs of each tree in a container
+  pinned to four cores all passed, and under `src/` SPEC-107 changes only `sinks/rabbitmq.py`,
+  which neither test uses. Which worker a
+  test lands in is decided by `--dist worksteal` as the run goes, so a change in the number of
+  tests can move a fork test into the worker that holds the heap; that is a reading, not a
+  measurement. **Closed by** finding what holds the five tests' objects and releasing it, or by
+  running those tests where what they leave cannot reach a later fork, held by a check that fails
+  when a worker's live objects grow past a stated bound across those files.
 
 ### Resolved
 
