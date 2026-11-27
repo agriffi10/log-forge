@@ -7,8 +7,8 @@ description: "`RabbitMQSink`'s release closes and drops the channel in both mode
 **Andrew's choice, 2026-11-27: "Fix the behaviour".** The README's *Ownership* rule says an
 injected resource is left open for the caller to manage, and `RabbitMQSink.close`'s docstring said
 it closes "the channel and, when owned, the connection". The code did otherwise: `_release` closed
-the connection with no ownership test, so an application that shared its `pika` connection with
-the sink lost it at `shutdown()`, and its consumers with it. Shown the contradiction, he chose the
+the connection with no ownership test, so an application that passed the sink a `pika` connection
+it had built found that connection closed at `shutdown()`. Shown the contradiction, he chose the
 documentation: the code was the defect. The other way to end it, rewriting the documentation to
 say this sink closes what it is handed, was not taken.
 
@@ -36,9 +36,13 @@ disagree. `connection_release_sites` in `tests/test_sinks_rabbitmq.py` holds the
 it collects every statement that passes `self._connection` to `_safe_close`, calls
 `self._connection.close()` or assigns `None` to `self._connection`, and allows one only inside the
 `body`, never the `orelse`, of an `if` whose test is `self._owns_connection` or an `and` with that
-as a direct operand. Its bound: it does not follow an alias of the connection, and it is not the
-proof that a release is right, which is the behavioural tests beside it. It catches a release site
-written without the ownership test.
+as a direct operand. Its bound: it reads those three shapes and no other. It does not follow an
+alias of the connection, a keyword argument to `_safe_close`, a tuple assignment such as
+`self._channel, self._connection = None, None`, `del self._connection`, a bound
+`self._connection.close` handed to another call, or a `with` statement that closes the
+connection, and it reports a correct release that follows an early `return` on
+`not self._owns_connection`. It is not the proof that a release is right, which is the
+behavioural tests beside it. It catches a release site written without the ownership test.
 
 **The refusal after close is unchanged, and it now carries more.** The closed guard refuses a
 round from the moment a close begins, keyed on the sink being released and never on who owns the

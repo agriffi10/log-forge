@@ -13,10 +13,13 @@
   close is untouched and reads the same for a borrowed and an owned sink.
 - **The guard** (FR-001): `connection_release_sites(source)` in `tests/test_sinks_rabbitmq.py`, an
   AST function over a module's source text that returns the statements releasing
-  `self._connection` and, of those, the ones not under the ownership test. Six standing cases in
-  four tests: no test, a negated test, an `else` branch, an `or`, the bare test (asserting
-  silence) and the live module (asserting it collected `_reset`'s site). It is scoped to this
-  module and does not follow an alias.
+  `self._connection` and, of those, the ones not under the ownership test. Ten standing cases in
+  six tests. Seven are offences: no test, an annotated assignment, a negated test, an `else`
+  branch, an `or`, the name nested inside an `and` operand, and another object's attribute. Two
+  assert silence: the bare test, and an `if` nested in the ownership test's body. The last is the
+  live module, asserting it collected `_reset`'s site. Every clause of the rule has a case that
+  fails without it. The guard is scoped to this module and reads three shapes only; its docstring
+  lists what it does not follow, an alias among them.
 - **The tests**: in `tests/test_sinks_rabbitmq.py`, the borrowed and owned closes, the second
   close, the close with no channel, a channel close that raises, the kept reference, the recorder
   on `_connect`, the refusal for both modes, and four library paths (`shutdown()` after a traced
@@ -65,6 +68,11 @@
   mutants of the guard, each failing a named case, left nothing in the repo; with
   `sinks/rabbitmq.py` planted whole from `35b2f55d`, the integration test's two ids failed on
   `borrowed.is_open`; and the integration test passed against the compose broker.
+- **The guard after the first diff review.** The review's eighteen clause mutants left six alive
+  against the six cases of `8068e204`. Four clauses got a case each, and two the rule does not
+  need, keyword arguments to `_safe_close` and a per-statement dedupe, were removed. A last sweep
+  of twenty-seven clause mutants over the revised guard, each planted, run against the whole of
+  `tests/test_sinks_rabbitmq.py` and restored, left none alive. The file's ids went from 41 to 45.
 - **On the completed tree**, Python 3.13 on macOS: `poetry run pytest`, `spec-lint.sh`,
   `docs-lint.sh` and `docstring-lint.py` each exited 0. The completion changed no code, so it ran
   neither `ruff` nor `mypy`; those two gates and the integration suite are the branch's to run

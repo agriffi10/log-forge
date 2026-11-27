@@ -109,21 +109,29 @@ negated test, an `or` and an `else` branch are therefore all offences. Taking so
 lets the cases below feed it a source that must fail, so its failing case is a standing fixture
 and not a one-time observation of an old commit.
 
-The guard's bound is stated so that it is not read as more than it is. It does not police an
-alias of the connection, such as `c = self._connection; c.close()`. The behavioural criteria of
+The guard's bound is stated so that it is not read as more than it is. It reads the three shapes
+above and no other. It does not police an alias of the connection, such as
+`c = self._connection; c.close()`, a keyword argument to `_safe_close`, a tuple assignment such
+as `self._channel, self._connection = None, None`, `del self._connection`, a bound
+`self._connection.close` handed to another call, or a `with` statement that closes the
+connection; and it reports a correct release that follows an early `return` on
+`not self._owns_connection`, since it reads only the enclosing `if`. The behavioural criteria of
 FR-001 to FR-003 are what catch a wrong release; the guard catches a release site written without
-the ownership test. It gets six standing cases and no guard of its own.
+the ownership test. It gets ten standing cases and no guard of its own.
 
-Three of the six are the criteria below: a release under no ownership test, a release under a
-negated test, and the live module. The other three exist because each is the only case that fails
-when one clause of the rule above is dropped. A release in an `else` branch is the only case that
-fails when an `orelse` is treated as covered by its `if`'s test. A release under an `or` is the
-only one that fails when `or` is accepted beside `and`. A release under the bare
-`self._owns_connection` test, which asserts silence over statements the guard did collect, is the
-only one that fails when the bare test stops being accepted, since the live module uses only the
-`and` form. The cases were proven to bite by a sweep run once during the build: nine mutants, each
-dropping or loosening one clause of the function, each planted, seen to fail a named case and
-restored. The sweep leaves nothing in the repo.
+Three of the ten are the criteria below: a release under no ownership test, a release under a
+negated test, and the live module. The other seven exist because every clause of the rule needs a
+case that fails without it. Five are offences: `None` assigned under an annotation, a release in
+an `else` branch, one under an `or`, one under an `and` whose operand only contains the name
+(`self._closing and not self._owns_connection`), and one under another object's
+`_owns_connection`. Two assert silence over statements the guard did collect: a release under the
+bare `self._owns_connection` test, a form the live module does not use, and a release under an
+`if` nested in the ownership test's body. A clause the rule does not need was removed and not
+given a case: keyword arguments to `_safe_close`, which no call in the module uses, and a
+per-statement dedupe that only a statement holding two releases could show. The cases were proven
+to bite by two sweeps, one in the build and one after the first diff review, each planting one
+mutant per clause, seeing it fail a named case and restoring it. The second planted twenty-seven
+and none survived. The sweeps leave nothing in the repo, and the guard gets no further one.
 
 #### Acceptance Criteria:
 
@@ -400,8 +408,8 @@ README.md, docs/release-notes/v1.2.1.md                                         
 
 - Write the borrowed and owned close tests, the `confirm=True` case, the reference and reconnect
   tests and the library-path cases, and watch each one that names `35b2f55d` fail there.
-- Write the guard function and its six standing cases: the three FR-001's criteria name, and the
-  `else`, `or` and bare-test rows that each alone fail one clause mutant.
+- Write the guard function and its ten standing cases: the three FR-001's criteria name, and the
+  seven that each give one clause of the rule a case that fails without it.
 - Make `_release` call `_reset`.
 - Correct the comment in the `rabbitmq` post-close builder and remove its dead assignment, then
   mutation-test the closed refusal against that case.
@@ -496,3 +504,12 @@ Every line below was read at `35b2f55d`.
   the implementer's too. FR-002's refusal mutation was repeated at `a00162ea` against a scratch
   copy of `src/`, and failed the `rabbitmq` case alone with `DID NOT RAISE SinkDeliveryError`.
   The delivery doc carries the measurements.
+- **First diff review, 2026-11-27.** The guard's six cases became ten, in FR-001's description
+  and in Phase 1, and its stated bound grew. The review's clause mutants found four clauses of
+  the rule with no case that fails without them (the direct `and` operand, the annotated
+  assignment, a nested `if` inside the ownership test's body, and the `self` receiver), and each
+  got one. Two clauses the rule does not need were removed: keyword arguments to `_safe_close`,
+  and a per-statement dedupe. The bound now also names the keyword argument, the tuple
+  assignment, `del`, a bound `close` handed on, a `with` statement, and the early-`return` shape
+  the guard reports although it is correct. A second and last sweep of twenty-seven clause
+  mutants left no survivor. No criterion changed.
