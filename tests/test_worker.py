@@ -2324,13 +2324,27 @@ def test_the_fast_return_reports_an_abandoned_drain_as_failure(capsys) -> None:
     must therefore report `delivered`, not merely that the marker was answered: a review found
     that dropping the `and marker.delivered` conjunct survived all 1105 tests, because the
     sibling test pins only the True direction.
+
+    The sink holds span `a` inside `emit` until the marker is on the queue, which is after
+    `flush()` stamped it with `failed_batches`. Without that hold the worker's 0.01 s interval
+    could emit and abandon `a` before the stamp, and a marker stamped after the loss is answered
+    delivered while `failed_batches == 1` still holds: on a loaded runner this test failed that
+    way (`docs/architecture.md` §12, the two timing tests on a loaded 4-CPU runner).
     """
-    worker = Worker(AlwaysFailSink(), batch_size=10, flush_interval=0.01, max_retries=0)
+    stamped = threading.Event()
+
+    class FailsOnceStamped(AlwaysFailSink):
+        def emit(self, batch: list[dict]) -> None:
+            stamped.wait(timeout=5)
+            super().emit(batch)
+
+    worker = Worker(FailsOnceStamped(), batch_size=10, flush_interval=0.01, max_retries=0)
     worker.submit(_span("a"))
     real_put = worker._queue.put
 
     def put_then_die(item: object, timeout: float | None = None) -> None:
         real_put(item, timeout=timeout)
+        stamped.set()
         worker._stop.set()
         worker._thread.join(timeout=5)
 
@@ -2343,6 +2357,7 @@ def test_the_fast_return_reports_an_abandoned_drain_as_failure(capsys) -> None:
     assert [bool(r) for r in result] == [False], (
         "answered is not delivered — the batch it carried was abandoned"
     )
+    assert [r.reason for r in result] == ["abandoned"], "not the fast return's own verdict"
 
 
 # -- SPEC-050 FR-001: an expired shutdown releases the waiters it stranded ---------------
