@@ -30,6 +30,7 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
 - [OpenTelemetry-shaped output](#opentelemetry-shaped-output) — arc `opentelemetry-shaped-output`
 - [1.2.0 stability redesign](#120-stability-redesign) — arc `stability-redesign`
 - [The 2026-11-14 post-1.2.0 audit](#the-2026-11-14-post-120-audit) — arc `audit-2026-11-14`
+- [One home per repeated shape](#one-home-per-repeated-shape) — arc `one-home-per-shape`
 
 ## Core logging pipeline
 
@@ -560,3 +561,51 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   Every other open item in `docs/architecture.md` §12 waits for work Andrew chooses afterwards. The
   rule, with why SPEC-099 and SPEC-105 wait on SPEC-097, is *An arc closes at the specs it names,
   and only its orchestrator adds work* (`docs/decisions/working-rules/`).
+
+## One home per repeated shape
+
+- **One home per repeated shape:** a read-only sweep of the code base at `35b2f55d` looked for
+  logic still written more than once. The repetition this arc is about is of shape, not of
+  text: the same few statements written at several sites, each in its own order and spelling,
+  so a change to the rule has to be made at every site and nothing says when one was missed.
+  The proposal was an arc of small refactoring specs, drafted one at a time, that
+  gives those shapes one home each; on 2026-11-27 Andrew approved drafting its first spec ("Yes,
+  draft it"), and each later one needs his yes in turn.
+
+  Each spec in the arc takes one such shape and gives it a single home. It changes nothing a
+  caller can observe: no line, counter, verdict or public name. And it moves the structural
+  rosters that pinned the old shape in the same change, so no AST-derived guard shrinks silently.
+
+  The sweep named these slices. They are candidates, not commitments, and each becomes a spec
+  only when the orchestrator drafts it:
+
+  - the settlement helpers in `sinks/_rounds.py`: a batch call that raised, a reply nobody could
+    adjudicate, `HTTPSink._unadjudicated`'s among them, and an entry still failing (SPEC-106);
+  - the pairing of a count with the one line that announces it, on the deferral ledgers: the
+    HTTP family's drops, the wrappers and the encode step;
+  - the file and stream sinks' lose tail, which writes the raised-call settlement beside a
+    second group for a torn or handed line;
+  - the block of one-line members most engine sinks each define (`deliver`, `emit`,
+    `_counter_lock`, `failed`, `losses`, `_closed`, `_lock`, `close`);
+  - `FilteringSink` and `TransformSink`, which are twins;
+  - the Kinesis and Firehose positional round, and what SPEC-100 left written twice between
+    `SQSSink` and `SNSSink`;
+  - the worker's counter state, written in both `Worker.__init__` and
+    `Worker._reinit_after_fork`, and the three places `Worker._emit` counts a failed batch;
+  - the positional tuple `RunContext._mark` hands to `RunContext._rewind`;
+  - shared test support: one AST roster helper, one fixture for the retry-wait patch, and one
+    anchored reader of diagnostic lines.
+
+  The sweep also examined these and left them alone, because a docstring or a test fences each.
+  They are recorded so that nobody walks them again:
+
+  - the sync and async `@trace` wrappers. Their handling is inline because a shared wrapper
+    around `_begin` and `_end` "added a frame at which a `RecursionError` escaped their guards"
+    (`decorator.py`);
+  - the closed-guard refusal at the top of each round, which `tests/test_sink_concurrency.py`
+    holds to exactly one `run_context().refuse(...)` call followed by one `return`;
+  - `sanitize.py`'s arithmetic written inline in `_Coercer`, which runs once per integer, with a
+    test holding every copy equal;
+  - the copies in the `_otel` leaf, which imports nothing from the package and is pinned to
+    `sanitize` by tests;
+  - a split of `_lifecycle.py`, whose names the tests patch in place.

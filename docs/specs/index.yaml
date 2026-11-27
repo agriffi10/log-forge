@@ -706,6 +706,13 @@ specs:
     spec_status: "Completed"
     depends_on: ["SPEC-062", "SPEC-090"]
     path: "docs/specs/SPEC-105-exit-batch-fits-the-remaining-budget.md"
+  - id: "SPEC-106"
+    title: "One Home for the Round Settlement Shapes"
+    description: "Gives the three settlements the shipped sinks write by hand in their rounds (a batch call that raised, a reply nobody could adjudicate, and an entry still failing) one function each in the rounds module, for the library's maintainers, with no line, counter, verdict or resend mark a caller can observe changed."
+    spec_status: "Draft"
+    depends_on: ["SPEC-073", "SPEC-074", "SPEC-093", "SPEC-095"]
+    arc: "one-home-per-shape"
+    path: "docs/specs/SPEC-106-one-home-for-the-round-settlement-shapes.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
@@ -729,6 +736,8 @@ arcs:
     order: ["SPEC-042"]
   - name: "lifecycle-races"
     order: ["SPEC-044"]
+  - name: "one-home-per-shape"
+    order: ["SPEC-106"]
   - name: "one-lifecycle-owner"
     order: ["SPEC-054"]
   - name: "opentelemetry-shaped-output"
