@@ -1734,6 +1734,25 @@ an item leaves this list when a spec closes it, not because the arc names it.
   the stop's take, which must be owed again, from one it did not write to, which must not be; a
   withhold without that test leaves a sink written after its last close owed by nobody, which is
   why FR-001 keeps the arm.
+  **Met by the soak, unforced** (2026-11-27, by the session that narrowed the loaded-runner
+  timing item, in a Linux container, src at `35b2f55d`). Ten soak items carried an unexplained
+  `CloseBroken:repeat` in about 165,000 run: 3 in about 52,000 with `main`'s tests and 7 in about
+  113,000 with that session's rejected changes to the model test, so about as often either way.
+  Seven had an `arm(change:_swap_sink)` before the second take and the second close one to forty
+  seconds after the first, on starved runs, which is this item's shape. Three came with no load
+  at all: `[deliver-seed386]` and `[emit-seed386]`, a take by `_close_owed`, an
+  `arm(change:_swap_sink)` and the first close, then a second take by `_close_owed` and a second
+  close at the same count about 4 ms later, and `[emit-seed598]`, the same but with the second
+  take `_swap_sink`'s, on a closer thread. A diff review then met a 4 ms record once in 9,000
+  items with `main`'s tests, at `[emit-seed76]`. A first take by `_close_owed` with only
+  `_swap_sink` arms before the second is the record no known row may explain, and
+  `tests/soak_known.py` says it is either this item or a regression of the swap item SPEC-097
+  closed, which the record cannot tell apart; it was not diagnosed further, and 600 repeats of
+  seed 386 alone met it on neither tree. The runner's first two scheduled nights and one
+  dispatch, 45,000 items, did not meet it. A scheduled night that does goes red, as designed.
+  **What the no-load record is owed** is a diagnosis that tells the two apart: 4 ms between the
+  closes does not look like a stop's wait running out, so the closure above may not be the one
+  it needs.
 - **A signal handler that interrupts `_FactorySink`'s claim read inside `yielding()` and calls
   `shutdown()` still deadlocks** (SPEC-097's build; invariants 1 and 3; read from the code, not
   reproduced). `flush()`, `shutdown()` and a sink-changing `configure()` wrap their wait in
@@ -2097,7 +2116,8 @@ an item leaves this list when a spec closes it, not because the arc names it.
 
 - **Two timing tests fail `test (py3.12)` on a loaded 4-CPU runner** (invariants 3 and 2, as below;
   found by SPEC-100's session on 2026-11-24, watching `main` after Dependabot PR #419, whose diff
-  `git diff 5d0e7f68 96252937` touches only `poetry.lock`; unfixed under the audit scope freeze).
+  `git diff 5d0e7f68 96252937` touches only `poetry.lock`; unfixed under the audit scope freeze
+  until it was narrowed on 2026-11-27, as its last paragraphs say).
   Release run 45469796270 at `96252937` failed `test (py3.12)` twice and passed on the third
   attempt, with a different failure each time; `test (py3.13)` passed on every attempt, and the
   previous Release run, at `5d0e7f68`, passed first time. `main` also had a failed Release at
@@ -2145,13 +2165,89 @@ an item leaves this list when a spec closes it, not because the arc names it.
   runner, 15,000 a night, and not only the eight wiring items the paragraph above counts. No
   `KNOWN` row is added for it: a row explains a signature read from a sink's close record
   (`tests/soak_known.py`), and this is the gating timing bound failing inside a soak item, which
-  no row may excuse, so a later loaded night is red again until the change below lands.
-  **Closed by** two test changes. The soak's bound needs to hold on a loaded 4-CPU runner
+  no row may excuse, so a later loaded night is red again until this bound changes.
+  ~~**Closed by** two test changes. The soak's bound needs to hold on a loaded 4-CPU runner
   without letting a real stall through, for instance by subtracting the time the calling thread
   was not scheduled rather than widening `EPSILON`, which `_machine` rules out. The fast-return
   test needs to hold span `a` in the queue until the marker is stamped, for instance with a sink
   or a drain gated on an event the test sets after `flush()` has read `failed_batches`, in place
-  of the 0.01 s window.
+  of the 0.01 s window.~~
+  **Narrowed on 2026-11-27, no spec: the fast-return test is fixed; the timing bound is
+  unchanged, because every remedy measured for it either does not bind or lets a real stall
+  pass.**
+  *The fast-return test.* Its sink now holds span `a` inside `emit` until the marker is on the
+  queue, which is after the stamp. With the race forced by a 0.3 s pause before `flush()` the old
+  test fails with the message above and the new one passes, and it still fails when the fast
+  return drops `and marker.delivered`; both diff reviews of the rejected change below re-ran that.
+  *The timing bound.* Three ways of excusing starvation from the kernel's per-thread count of
+  time spent runnable and waiting for a CPU (`schedstat`) were measured by the session that
+  wrote this, with `src` and the tests at `35b2f55d`, in a Linux container (kernel 6.12.54,
+  Python 3.12.16) held to two CPUs with twelve workers and 48 busy-loops, 908 soak items a run,
+  each beside `main`'s tests on the same seeds. None landed.
+  (1) *The calling thread's own wait*, the remedy named above, was read around the calls of
+  `main`'s tests and not built, because it does not bind: a reproduced failure of 1.263 s spent
+  0.8 ms of it waiting for a CPU on its own thread, since under the interpreter lock a caller
+  waits blocked behind a thread that is runnable and not running.
+  (2) *The longest any one thread of the process waited*, which is the kept patch below with its
+  excuse reduced to that wait and no ceiling, binds, failing 1 item over nine runs where `main`
+  failed 26 over seven, and excuses a real stall: its diff review passed a call that only sleeps
+  1.2 to 1.8 s while two sibling threads shared one CPU.
+  (3) *The lesser of (2) and the caller's own wait plus one switch interval for each time it was
+  given a CPU, capped at one `EPSILON`*, failed 69 items over 17 runs where `main` failed 110
+  over 14, about half, and its diff review found the count itself cannot be trusted: on that
+  kernel a thread that only sleeps sometimes has its whole sleep counted as waiting for a CPU,
+  between 7 and 33 of 360 sleeps of 1.3 s in five runs of the review's standalone probe, by two
+  reviews and this session
+  (`docs/audits/2026-11-14-probes/verification/timing_bound_schedstat_sleep.py`). By the
+  review's measurements a plain stall was then excused the full second, 14 of 5,400 planted
+  1.5 s sleeps passing, and two of the change's own tests failed 3 to 8 times in 300 under load;
+  and stalls that wake often or burn CPU passed up to the ceiling wherever the workers starve
+  each other, a planted 1.5 s busy spin 300 times of 300 at twelve workers on four CPUs. The
+  change is kept beside the probe as `timing_bound_own_time_rejected.patch`.
+  *Fewer workers for the soak* was measured once by the same session and says nothing either
+  way: on four CPUs under
+  96 busy-loops `main`'s tests failed 1 item in four runs at twelve workers and none in four at
+  six or eight, which took 102 to 119 s against 76 to 90 s.
+  **Closed by** a decision about what this bound means on a loaded runner, which is a spec's to
+  make and Andrew asked for on 2026-11-27: no use of `schedstat`'s wait count measured here
+  separates a caller starved of a CPU from one that is stalled, and that count was not truthful
+  on the kernel measured. Until then a night that fails this bound on load is filed under this
+  item.
+
+- **Seventeen tests assert a falsy `flush()` over a drain nothing holds back, the race the
+  fast-return test had** (invariant 2, the announced loss; no spec; found on 2026-11-27 by the
+  second diff review of the change that fixed that test, and not fixed with it). Each submits to
+  a live worker whose batch completes on arrival and then asserts `not worker.flush(...)`. If the
+  drain emits and abandons the batch before `flush()` stamps its marker, `flush()` answers true,
+  correctly, and the assertion fails with `assert not FlushResult(ok=True, ...)`. With a 1 ms
+  pause before the stamp ten fail:
+  `test_a_total_failure_reaches_failed_batches_and_flush` and
+  `test_a_dead_syslog_destination_now_reports_loss` in `tests/test_sink_losses.py`,
+  `test_a_callable_failing_for_every_event_reraises_its_own_exception` (both parameters) in
+  `tests/test_wrapper_failures.py`,
+  `test_the_worker_and_the_orphan_path_each_make_one_call_per_attempt` in
+  `tests/test_classify.py`, `test_a_retried_unrenderable_event_is_counted_once_or_never[down]`
+  in `tests/test_sinks_http_render.py`, and four reached through `_through_the_worker` in
+  `tests/test_http_rounds.py`. Seven more fail at a 0.15 s pause, once their retry backoff has
+  run: in `tests/test_multi_absorbed.py`, `tests/test_wrapper_failures.py`,
+  `tests/test_http_rounds.py` and `tests/test_sink_losses.py`. Unforced, in a Linux container on
+  two CPUs with twelve workers, the review saw 1 failure in 6,000 runs of four of them under 8
+  busy-loops and 1 in 6,000 under 24, where the old fast-return test failed 21 to 49 times in
+  500. The first was re-planted by the session that recorded this: a 5 ms pause before the
+  `flush()` of `test_a_total_failure_reaches_failed_batches_and_flush` fails it. No other test
+  in `tests/test_worker.py` has the shape, because those hold the batch with a large
+  `batch_size` and `flush_interval`. **Closed by** giving each call site a held batch, as
+  `tests/test_worker.py` does, with a test that derives the sites rather than listing them.
+
+- **Nothing ties a `FILED_NIGHTS` value to a §12 lead** (no invariant: it concerns the queue's
+  record, not the library; found on 2026-11-27 by the second diff review of #425, the pull
+  request that filed that day's night). `tests/test_soak_known.py` holds a filing's one-line form
+  and the count of filings, and `scripts/pr-queue/queue.sh` reads only a filing's key, so a lead
+  reworded or misspelt leaves the filing naming nothing with every gate green and the night still
+  read as filed; the review ran both. **Closed by** a test that requires each value to be the
+  lead of a §12 bullet, open or struck under *Resolved*, because an item's closing change must
+  leave its filing in place: removing the line puts the night back to blocking while it is inside
+  the queue's window of 30 scheduled runs.
 
 - **zizmor's `self-repository` finding is open on five workflows** (no invariant: it concerns the
   workflows, not the library; recorded by SPEC-099's session on 2026-11-25, when the alert on its

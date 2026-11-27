@@ -5,9 +5,15 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Eighty-two files here are not the audit's.** Each was added after the audit was brought in
-(`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
-from `git log --diff-filter=A` per file; rederive it the same way when adding one.
+**The list below names eighty-four files that are not the audit's, and is twenty-one short.**
+Each was added after the audit was brought in (`5cb0f449`) and names in its first lines the spec
+it was written for, or that it had none. The list was derived from `git log --diff-filter=A` per
+file; rederive it the same way when adding one. Rederived when the two `timing_bound_*` files
+were added, that method finds 105, and the 21 the list does not name are
+`core-pipeline/spec103_*.py` (nine), `core-pipeline/spec105_exit_slowdown.py`,
+`core-pipeline/spec104_nats_flush_overrun.py`, `spec104_nats_queued_orphan.py`,
+`spec104_nats_swap_cost.py` and `spec104_nats_twin_paths.py`, and the seven
+`sinks/*_build_mutants.py` and `sinks/*_build_results*.txt` files.
 
 - `lifecycle/p8_second_close_after_a_rearm.py`, `p9_second_stop_in_fork_repair.py` and
   `p10_fork_with_stderr_lock_held.py`, written while authoring SPEC-086 against `5447d26a`. `p9`
@@ -124,6 +130,12 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   docs/audits/2026-11-14-probes`, and SPEC-101's *Evidence* says what it measured. It changes
   `src` and builds SPEC-101's model-test change in `tests`. It reads `SPEC101_OPTION` to build the
   alternatives the *Evidence* compares, which the spec itself does not carry.
+
+- `verification/timing_bound_schedstat_sleep.py` and `timing_bound_own_time_rejected.patch`,
+  written on 2026-11-27 with no spec, against `71fb3b9c`: the probe and the rejected change behind
+  §12's open item *Two timing tests fail `test (py3.12)` on a loaded 4-CPU runner*. The probe
+  imports nothing from the repository and needs Linux; the patch is three test files and applied
+  cleanly at `71fb3b9c`.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded

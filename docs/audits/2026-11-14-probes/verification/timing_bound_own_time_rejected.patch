@@ -1,0 +1,918 @@
+A rejected change to the model test's timing bound, kept so the next attempt starts from it.
+
+Written on 2026-11-27, with no spec, against 71fb3b9c, by the session that narrowed the open item
+*Two timing tests fail* in docs/architecture.md §12, which records why it was not landed. It put
+the bound on a call's "own time": elapsed, less an excuse read from each thread's schedstat around
+the call, the lesser of the longest any one thread waited for a CPU and what the calling thread
+itself could have lost, capped at one EPSILON. Its second diff review found that the kernel it was
+measured on counts a sleeping thread's sleep as waiting for a CPU often enough to excuse a plain
+stall and to fail two of this patch's own tests under load (timing_bound_schedstat_sleep.py beside
+this file). Only the three test files are here; its docs are not. `git apply` skips this note.
+
+diff --git a/tests/model_oracles.py b/tests/model_oracles.py
+index ebf730b9..5faed2af 100644
+--- a/tests/model_oracles.py
++++ b/tests/model_oracles.py
+@@ -189,6 +189,9 @@ class Call:
+       budget: Its timeout, or the default it spends; ``0.0`` for a call given no timeout.
+       began: The monotonic instant it began.
+       ended: The monotonic instant it returned, or the reading instant while it is in flight.
++      starved: Seconds between the two instants that starvation excuses, from
++        :func:`starved`; ``0.0`` for a call nobody read the kernel's count around, which is
++        every call of SPEC-085's cells.
+     """
+ 
+     name: str
+@@ -196,6 +199,7 @@ class Call:
+     budget: float
+     began: float
+     ended: float
++    starved: float = 0.0
+ 
+ 
+ @dataclass(frozen=True)
+@@ -283,14 +287,125 @@ class ChildReport:
+ Verdict = frozenset[str]
+ 
+ 
++EXCUSED_MOST = EPSILON
++"""The most starvation may excuse, so a call past its budget by twice ``EPSILON`` fails at any load.
++
++No count the kernel keeps says what a blocked thread was waiting for, so every estimate of
++starvation can be borrowed by a real stall that happens beside it. This ceiling is what bounds
++the loan.
++"""
++
++
++def sched_counts(schedstat: bytes) -> tuple[int, int] | None:
++    """Returns one thread's wait for a CPU and how often it was given one, from its ``schedstat``.
++
++    Linux writes three counters there: nanoseconds on a CPU, nanoseconds runnable and waiting for
++    one, and the number of times it was given one. Only the second is starvation; the first
++    grows with a call's own work, so reading it instead would excuse a call for being busy.
++
++    Args:
++      schedstat: What a read of ``/proc/<pid>/task/<tid>/schedstat`` returned.
++
++    Returns:
++      The second and third counters, or ``None`` for anything that is not three whole numbers,
++      such as the empty read of a thread that has ended.
++
++    Raises:
++      None.
++    """
++    fields = schedstat.split()
++    if len(fields) != 3 or not all(field.isdigit() for field in fields):
++        return None
++    return int(fields[1]), int(fields[2])
++
++
++@dataclass(frozen=True)
++class Waits:
++    """One reading of how long each thread of a process has waited runnable for a CPU.
++
++    Attributes:
++      began: The monotonic instant the reading began.
++      ended: The monotonic instant it ended.
++      reader: The native id of the thread that took the reading.
++      by_thread: For each thread, by native id, the nanoseconds the kernel has counted it
++        waiting and the number of times it has been given a CPU.
++    """
++
++    began: float
++    ended: float
++    reader: int
++    by_thread: Mapping[int, tuple[int, int]]
++
++
++def starved(
++    before: Waits | None, after: Waits | None, began: float, ended: float, switch_interval: float
++) -> float:
++    """Returns the seconds of a call that starvation may excuse, from two readings around it.
++
++    Two estimates, and the smaller is taken. The first is the **longest any one thread waited**
++    runnable for a CPU between the readings, which is a floor on how long the process was short
++    of one; never the sum over threads, which counts two threads waiting through the same second
++    twice and passed the call's own length on most slow calls measured. The second is what the
++    **calling thread itself** can have lost to the scheduler: its own wait for a CPU, plus
++    ``switch_interval`` for each time it was given one, since a thread waiting for the
++    interpreter lock sleeps at most that long before it wakes to ask again. The first alone
++    excuses a caller that is blocked for a real reason while an unrelated thread is starved,
++    which a review reproduced on an idle machine with two threads sharing a CPU. The second
++    alone is the remedy first proposed and does not bind: under the interpreter lock a caller
++    waits blocked, which the kernel does not count, behind a holder that is runnable and not
++    running, and a reproduced failure of 1.263 s had 0.8 ms of its own wait.
++
++    Neither is exact. A thread that wakes often has more credit than it waited, and a real stall
++    inside the same call can borrow it while another thread is starved, so the result is capped
++    at :data:`EXCUSED_MOST`. A caller blocked on a lock behind a starved holder wakes once and
++    is excused almost nothing, so some starvation still fails the bound.
++
++    The readings sit outside the call, the first before its clock starts and the second after it
++    stops, so that nothing a reading costs is charged to the call. A thread may then have waited
++    in the two gaps, so both are taken back off whole: from the instant the first reading began
++    to the call's start, and from its end to the instant the second reading ended. A thread in
++    one reading only is left out, since one first seen in ``after`` may have been waiting to
++    start before the first reading. The kernel credits a wait when it ends, so a wait already in
++    progress at the first reading is counted whole, time before the call included, and one in
++    progress at the second is not counted.
++
++    Args:
++      before: The reading taken before the call, or ``None`` where the kernel offers none.
++      after: The reading taken after it, or ``None``.
++      began: The monotonic instant the call began.
++      ended: The monotonic instant it returned.
++      switch_interval: The interpreter's switch interval in seconds.
++
++    Returns:
++      The seconds, from ``0.0`` to the call's elapsed time or :data:`EXCUSED_MOST`, whichever is
++      less; ``0.0`` when a reading is missing.
++
++    Raises:
++      None.
++    """
++    if before is None or after is None:
++        return 0.0
++    changes = {
++        thread: (after.by_thread[thread][0] - waited, after.by_thread[thread][1] - runs)
++        for thread, (waited, runs) in before.by_thread.items()
++        if thread in after.by_thread
++    }
++    longest = max((waited for waited, _ in changes.values()), default=0) / 1e9
++    waited, runs = changes.get(after.reader, (0, 0)) if before.reader == after.reader else (0, 0)
++    own = max(waited, 0) / 1e9 + max(runs, 0) * switch_interval
++    outside = max(began - before.began, 0.0) + max(after.ended - ended, 0.0)
++    return min(max(min(longest, own) - outside, 0.0), max(ended - began, 0.0), EXCUSED_MOST)
++
++
+ def own_time(call: Call, intervals: Sequence[Interval]) -> float:
+-    """Returns a call's elapsed time less the sink code it could have been waiting on.
++    """Returns a call's elapsed time less what it could not have spent: sink code and starvation.
+ 
+-    The subtraction is the union of every interval's overlap with the call, on any thread,
++    The first subtraction is the union of every interval's overlap with the call, on any thread,
+     because a close runs on a closer thread and a delivery on the drain thread: subtracting only
+     the caller's thread flags a ``shutdown()`` that is correctly waiting for a slow close. The one
+     interval left out is a stretch on the call's own thread that began at or before the call and
+-    ended at or after it, which is the sink code the call was made from.
++    ended at or after it, which is the sink code the call was made from. The second is the call's
++    ``starved`` seconds (:func:`starved`), which no caller records together with intervals.
+ 
+     Args:
+       call: The call.
+@@ -321,7 +436,7 @@ def own_time(call: Call, intervals: Sequence[Interval]) -> float:
+         if high > start:
+             covered += high - start
+             edge = high
+-    return (call.ended - call.began) - covered
++    return (call.ended - call.began) - covered - call.starved
+ 
+ 
+ def check_call(call: Call, intervals: Sequence[Interval]) -> None:
+@@ -342,6 +457,11 @@ def check_call(call: Call, intervals: Sequence[Interval]) -> None:
+     if own <= call.budget + EPSILON:
+         return
+     detail = f"{call.name}: own time {own:.3f} s against a budget of {call.budget:.3f} s"
++    if call.starved > 0.0:
++        detail += (
++            f", being {call.ended - call.began:.3f} s elapsed less {call.starved:.3f} s "
++            f"excused as waiting for a CPU"
++        )
+     if call.budget > 0.0:
+         raise BoundExceeded(call.name, detail=detail)
+     raise Stalled(call.name, detail=detail)
+@@ -686,14 +806,14 @@ def gate_margin_line(reports: Iterable[object]) -> str | None:
+     """Returns the gating model's worst-margin line over its passing runs, or ``None`` (SPEC-086).
+ 
+     The twin of :func:`margin_line` for ``tests/test_invariants_model.py``: each gating run
+-    records its worst ``elapsed - budget`` under :data:`GATE_MARGIN`, a property of its own, so
++    records its worst ``own time - budget`` under :data:`GATE_MARGIN`, a property of its own, so
+     neither line reads the other's runs. A soak item records none, because it does not gate.
+ 
+     Args:
+       reports: The session's ``passed`` reports.
+ 
+     Returns:
+-      One line naming the worst ``elapsed - budget`` and its test id.
++      One line naming the worst ``own time - budget`` and its test id.
+ 
+     Raises:
+       None.
+@@ -703,7 +823,7 @@ def gate_margin_line(reports: Iterable[object]) -> str | None:
+         return None
+     mark = "within" if worst[0] <= MARGIN_REDERIVE else "ABOVE"
+     return (
+-        f"model gate: worst elapsed less budget over passing runs is {worst[0]:.3f} s at "
++        f"model gate: worst own time less budget over passing runs is {worst[0]:.3f} s at "
+         f"{worst[1]} ({mark} the {MARGIN_REDERIVE:.3f} s re-derive mark)"
+     )
+ 
+diff --git a/tests/test_invariants_model.py b/tests/test_invariants_model.py
+index 40cfa63d..85539959 100644
+--- a/tests/test_invariants_model.py
++++ b/tests/test_invariants_model.py
+@@ -40,8 +40,9 @@ already reports ``RUNNING`` from the config.
+ (orphans balance after every step, spans after every truthy ``flush()`` and every shutdown); 3,
+ the wall-clock half (every step, the fork included, and each of a forked child's three calls,
+ returns within its own timeout plus ``model_oracles.EPSILON``, one second, with a budget of zero
+-for an ``info()`` and a traced call); 4 (every ``span.end`` arrives on a drain thread and every
+-orphan on the caller's); 5 (after each shutdown every recorder written to is closed, nothing is
++for an ``info()`` and a traced call, each on its own time, which is defined below); 4 (every
++``span.end`` arrives on a drain thread and every orphan on the caller's); 5 (after each
++shutdown every recorder written to is closed, nothing is
+ owed, no two closes overlapped, and no child closed an inherited sink; after **every** step no
+ close of a sink enters at the write count of the close before it, and after every shutdown and
+ exit drain no sink was written after its last close returned); 6 by construction, since one
+@@ -69,9 +70,15 @@ into stderr and none is supplied; **13** needs a bad argument and every step is
+ 
+ **The bound is one second past each call's own timeout, in both halves** (SPEC-086 FR-001), not
+ ten: the passive sink waits on nothing, so a call that spends more than its timeout plus
+-``EPSILON`` overran it. The session prints the worst ``elapsed - budget`` over the passing runs
+-(``model_oracles.gate_margin_line``), so a margin creeping toward the second is seen before it
+-fails. ``tests/test_worker.py`` still owns the bounds against a sink that wedges.
++``EPSILON`` overran it. **What is bounded is the call's own time**: its elapsed time less the
++seconds ``model_oracles.starved`` excuses as starvation, from each thread's wait for a CPU as
++Linux counts it, read around the call by ``_cpu_waits`` in ``_clocked``. The excuse is an
++estimate with a ceiling of one more ``EPSILON``, so a call two seconds past its budget fails at
++any load, and a call that only sleeps is excused about one switch interval; where the kernel
++offers no count, own time is elapsed time. The rule and what it rejects are a decision in
++``docs/decisions/working-rules/``. The session prints the worst ``own time - budget`` over the
++passing runs (``model_oracles.gate_margin_line``), so a margin creeping toward the second is seen
++before it fails. ``tests/test_worker.py`` still owns the bounds against a sink that wedges.
+ 
+ **Which runs exist is a setting** (FR-002). ``LOG_FOUNDRY_MODEL_SEEDS`` holds a comma-separated
+ list of integers and inclusive ``a-b`` ranges, such as ``0-999``; set, both halves run exactly those
+@@ -146,15 +153,19 @@ from model_oracles import (
+     SinkEvent,
+     Stalled,
+     Take,
++    Waits,
+     Write,
+     check_call,
+     check_late_write,
+     check_ledger,
+     check_repeat,
+     check_unowed_repeat,
++    own_time,
+     rerun_command,
++    sched_counts,
+     seeds_from,
+     soak_from,
++    starved,
+     take_of_each_close,
+ )
+ from model_oracles import Ledger as OracleLedger
+@@ -792,11 +803,9 @@ class Ledger:
+         Judged after the run rather than here, because an assertion raised on an actor's thread
+         would reach ``run_concurrently`` and read as an escaped exception, invariant 1's failure.
+         """
+-        began = time.monotonic()
+-        call()
+-        ended = time.monotonic()
++        made, _ = _clocked(name, budget, call)
+         with self._lock:
+-            self.calls.append(Call(name, threading.get_ident(), budget, began, ended))
++            self.calls.append(made)
+ 
+ 
+ @log_foundry.trace
+@@ -1001,11 +1010,99 @@ def _rerun_on_failure(
+         raise
+ 
+ 
++_WAIT_FILES: dict[int, int] = {}
++"""An open descriptor on each live thread's ``schedstat``, by native thread id."""
++
++_WAIT_LOCK = threading.Lock()
++"""Held for one reading, so no reader closes a descriptor another is about to read."""
++
++
++_COUNTS_WAITS = os.path.exists("/proc/thread-self/schedstat")
++"""Whether this kernel keeps the count :func:`_cpu_waits` reads: Linux with scheduler accounting."""
++
++
++def _cpu_waits() -> Waits | None:
++    """Reads how long each thread of this process has waited runnable for a CPU, and how often.
++
++    From ``/proc/self/task/<tid>/schedstat``, which Linux keeps per thread: its second field
++    counts nanoseconds only while a thread is runnable and not running, so a thread blocked on a
++    lock, a wait or a sleep adds nothing to it, and its third counts the times the thread was
++    given a CPU. The threads are ``threading.enumerate()``'s, which covers the actors, the
++    library's worker and its closers, and the calling thread by its own id, because on Python
++    3.12 a forked child's ``Thread.native_id`` is still its parent thread's.
++
++    Returns:
++      The reading, or ``None`` where there is nothing to read (macOS, or a kernel built without
++      scheduler accounting), which :func:`model_oracles.starved` reads as no starvation at all,
++      so the bound is then the plain elapsed one.
++    """
++    if not _COUNTS_WAITS:
++        return None
++    began = time.monotonic()
++    waits: dict[int, tuple[int, int]] = {}
++    with _WAIT_LOCK:
++        live = {thread.native_id for thread in threading.enumerate()} - {None}
++        live.add(threading.get_native_id())
++        for tid in live:
++            fd = _WAIT_FILES.get(tid)
++            if fd is None:
++                try:
++                    fd = os.open(f"/proc/self/task/{tid}/schedstat", os.O_RDONLY)
++                except OSError:
++                    continue
++                _WAIT_FILES[tid] = fd
++            try:
++                counts = sched_counts(os.pread(fd, 64, 0))
++            except OSError:
++                counts = None
++            if counts is not None:
++                waits[tid] = counts
++        for tid in _WAIT_FILES.keys() - live:
++            os.close(_WAIT_FILES.pop(tid))
++    return Waits(began, time.monotonic(), threading.get_native_id(), waits) if waits else None
++
++
++def _forget_wait_files() -> None:
++    """Drops what a forked child inherited: descriptors on its parent's threads, and the lock.
++
++    Another thread of the parent may have held the lock at the fork, and nothing in the child
++    would ever release it.
++    """
++    global _WAIT_LOCK
++    _WAIT_LOCK = threading.Lock()
++    for fd in _WAIT_FILES.values():
++        with contextlib.suppress(OSError):
++            os.close(fd)
++    _WAIT_FILES.clear()
++
++
++os.register_at_fork(after_in_child=_forget_wait_files)
++
++
++def _clocked[T](name: str, budget: float, call: Callable[[], T]) -> tuple[Call, T]:
++    """Makes one call on this thread and returns its record beside what it returned.
++
++    The one place a call is timed: an actor's, a sequential step's, the fork step's and each of
++    a forked child's three all come through here, so the starvation read around one is read
++    around every one. The kernel's count is read before the clock starts and again after it
++    stops, so neither reading is inside the call's elapsed time: a reading waits on a lock and
++    opens files, and a starved machine can hold it there for as long as it holds anything else,
++    which is not time the library spent. :func:`model_oracles.starved` takes the two gaps this
++    leaves outside the call back off what it excuses.
++    """
++    before = _cpu_waits()
++    began = time.monotonic()
++    result = call()
++    ended = time.monotonic()
++    kept = starved(before, _cpu_waits(), began, ended, sys.getswitchinterval())
++    return Call(name, threading.get_ident(), budget, began, ended, kept), result
++
++
+ def _bounded(call: Call, where: str) -> float:
+-    """Holds one call to ``elapsed <= budget + EPSILON`` and returns its margin (FR-001).
++    """Holds one call to ``own time <= budget + EPSILON`` and returns its margin (FR-001).
+ 
+     No sink-code interval is subtracted: a passive recorder waits on nothing, so all of a call's
+-    time is the library's.
++    time is the library's or the machine's, and the machine's is the call's ``starved`` seconds.
+     """
+     try:
+         check_call(call, ())
+@@ -1014,16 +1111,20 @@ def _bounded(call: Call, where: str) -> float:
+             f"invariant 3 (within its timeout plus {EPSILON:.1f} s): "
+             f"{' '.join(exc.signatures)}, {exc.detail}; {_machine()} {where}"
+         ) from exc
+-    return (call.ended - call.began) - call.budget
++    return own_time(call, ()) - call.budget
+ 
+ 
+ def _machine() -> str:
+-    """How loaded this machine was when a bound failed, so starvation reads apart from a stall.
+-
+-    Under 40 busy-loops on a 10-core machine, a load of 81 to 112, 4 of 6 runs of this file
+-    failed a zero-budget call at 1.03 to 1.35 s of own time; at a load of 50 to 55 it was green 13
+-    of 13. The bound is not skipped or widened under load, since that would let a real stall pass
+-    as starvation; the failure says how starved the run was, and a reader decides.
++    """How loaded this machine was when a bound failed, beside the starvation already excused.
++
++    The bound is not skipped or widened under load, since that would let a real stall pass as
++    starvation. What load can have cost a call is estimated from the kernel's count of each
++    thread's wait for a CPU and taken off, up to a ceiling (:func:`model_oracles.starved`). The
++    load average is still printed for what that estimate leaves in, which a reader weighs: a
++    caller blocked on a lock behind a starved thread, a call starved past the ceiling, time a
++    hypervisor keeps a virtual CPU from running, and every machine with no count at all. What
++    was measured, and how much still fails under load, is under the open item *Two timing tests
++    fail* in ``docs/architecture.md`` §12.
+     """
+     try:
+         one, five, fifteen = os.getloadavg()
+@@ -1189,7 +1290,7 @@ def _interleaving(
+     as a note, so neither can hide the other; the soak's own verdict is left in ``soak.report``.
+ 
+     Returns:
+-      The ledger, and the worst ``elapsed - budget`` over every call the run made.
++      The ledger, and the worst ``own time - budget`` over every call the run made.
+     """
+     ledger = Ledger(form=form, seed=seed, soak=soak)
+     runs = _spy_on_runs(monkeypatch) if form != "emit" else None
+@@ -1585,6 +1686,174 @@ def test_a_bound_failure_names_the_machines_load() -> None:
+     assert _bounded(Call("flush", 0, 2.0, 0.0, 2.5), "") == 0.5
+ 
+ 
++def test_a_bound_is_judged_on_what_starvation_leaves() -> None:
++    """A call's starved seconds come off before the bound, and its margin is what is left."""
++    assert _bounded(Call("info", 0, 0.0, 0.0, 1.5, 0.75), "") == pytest.approx(0.75)
++    with pytest.raises(AssertionError) as caught:
++        _bounded(Call("info", 0, 0.0, 0.0, 2.5, 0.75), "where=here")
++    text = str(caught.value)
++    assert "Stalled:info, info: own time 1.750 s against a budget of 0.000 s" in text, text
++    assert "2.500 s elapsed less 0.750 s excused as waiting for a CPU; load average" in text, text
++
++
++def test_a_forked_childs_starvation_reaches_its_bound() -> None:
++    """Each call a child reports is judged on its own time, with the starvation the child read."""
++    budgets = _CHILD_BUDGETS
++    within = [(name, budget + 1.5, 0.75) for name, budget in budgets.items()]
++    assert _child_margin(within, "") == pytest.approx(0.75)
++    stalled = [(name, budget + 2.5, 0.75) for name, budget in budgets.items()]
++    with pytest.raises(AssertionError) as caught:
++        _child_margin(stalled, "")
++    assert "Stalled:child-info, child-info: own time 1.750 s" in str(caught.value), caught.value
++
++
++def test_a_call_that_sleeps_is_still_a_stall() -> None:
++    """A real stall is a blocked wait, and nothing read around it may count it as starvation.
++
++    The call sleeps a second past ``EPSILON`` through the same ``timed`` every actor's call goes
++    through, with the kernel's count read around it wherever there is one. A reader that
++    reported blocked time or elapsed time as waiting for a CPU would excuse it.
++    """
++    ledger = Ledger()
++    ledger.timed("info", 0.0, functools.partial(time.sleep, EPSILON + 1.0))
++    (call,) = ledger.calls
++    assert call.starved <= EPSILON / 2, f"a sleep read as {call.starved:.3f} s of starvation"
++    with pytest.raises(AssertionError, match="Stalled:info"):
++        _bounded(call, "")
++
++
++_COUNTED = pytest.mark.skipif(
++    not sys.platform.startswith("linux"),
++    reason="only Linux counts a thread's wait for a CPU, and CI runs on Linux only",
++)
++
++
++@_COUNTED
++def test_a_call_starved_of_a_cpu_is_recorded_as_starved() -> None:
++    """On Linux the kernel's count is read, and a timed call that waited for a CPU records it.
++
++    Two threads pinned to one CPU each hash inside ``timed`` with the interpreter lock released,
++    so each is runnable while the other runs, and the record of either call must carry that
++    wait. Without a reading the bound falls back to elapsed time and a loaded runner fails it
++    again, quietly, so a missing reading on Linux is a failure here and not a skip.
++    """
++    reading = _cpu_waits()
++    assert reading is not None, "this Linux kernel offers no /proc/<pid>/task/<tid>/schedstat"
++    assert threading.get_native_id() in reading.by_thread, "the reading leaves its own reader out"
++    cpu = min(os.sched_getaffinity(0))
++    ledger = Ledger()
++    together = threading.Barrier(2)
++    work = functools.partial(hashlib.pbkdf2_hmac, "sha256", b"model", b"salt", 400_000)
++
++    def hash_on_one_cpu() -> None:
++        os.sched_setaffinity(0, {cpu})
++        together.wait(timeout=5)
++        ledger.timed("info", 0.0, work)
++
++    threads = [threading.Thread(target=hash_on_one_cpu) for _ in range(2)]
++    for thread in threads:
++        thread.start()
++    for thread in threads:
++        thread.join()
++    starved_for = [round(call.starved, 4) for call in ledger.calls]
++    assert len(starved_for) == 2, f"a thread never made its call: {starved_for}"
++    assert max(starved_for) >= 0.01, f"neither call recorded 10 ms of starvation: {starved_for}"
++    assert _cpu_waits() is not None
++    alive = {thread.native_id for thread in threading.enumerate()}
++    assert set(_WAIT_FILES) <= alive, "a reading kept a descriptor on a thread that has ended"
++
++
++@_COUNTED
++def test_a_stall_beside_a_starved_sibling_is_still_a_stall() -> None:
++    """A caller blocked for a real reason is not excused by another thread's wait for a CPU.
++
++    Two siblings share one CPU and hash with the interpreter lock released, so each waits for
++    about half of every second, while the caller sleeps 0.3 s past ``EPSILON``. Excusing the
++    longest any thread waited would pass this call, as a review found it did; the caller itself
++    waited for nothing and woke once.
++    """
++    cpu = min(os.sched_getaffinity(0))
++    stop = threading.Event()
++
++    def hash_on_one_cpu() -> None:
++        os.sched_setaffinity(0, {cpu})
++        while not stop.is_set():
++            hashlib.pbkdf2_hmac("sha256", b"model", b"salt", 20_000)
++
++    siblings = [threading.Thread(target=hash_on_one_cpu) for _ in range(2)]
++    for thread in siblings:
++        thread.start()
++    ledger = Ledger()
++    try:
++        ledger.timed("info", 0.0, functools.partial(time.sleep, EPSILON + 0.3))
++    finally:
++        stop.set()
++        for thread in siblings:
++            thread.join()
++    (call,) = ledger.calls
++    assert call.starved <= 0.15, f"a sleep borrowed {call.starved:.3f} s from its siblings' wait"
++    with pytest.raises(AssertionError, match="Stalled:info"):
++        _bounded(call, "")
++
++
++@_COUNTED
++def test_a_reading_that_waited_to_read_ends_after_the_wait() -> None:
++    """A reading stamps its end once it has read, so a wait for the lock falls inside the reading.
++
++    ``model_oracles.starved`` takes the gap from a call's end to the second reading's end back
++    off, and a reading stamped before its wait would hide that gap and credit the call with
++    whatever its process waited through while the reading was blocked.
++    """
++    readings: list[Waits | None] = []
++    with _WAIT_LOCK:
++        reader = threading.Thread(target=lambda: readings.append(_cpu_waits()))
++        reader.start()
++        time.sleep(0.2)
++        released = time.monotonic()
++    reader.join(timeout=5)
++    assert len(readings) == 1 and readings[0] is not None, readings
++    assert readings[0].ended >= released, "the reading ended before the lock it needed was free"
++
++
++@_COUNTED
++def test_a_reading_is_not_charged_to_the_call_it_is_read_around() -> None:
++    """A reading that waits a second for its lock leaves the call's elapsed time alone.
++
++    The first reading is made before the call's clock starts. Made after it, the second the
++    reading spends waiting here would be the call's, with nothing counted as waiting for a CPU
++    to excuse it.
++    """
++    _WAIT_LOCK.acquire()
++    release = threading.Timer(1.0, _WAIT_LOCK.release)
++    release.start()
++    try:
++        made, _ = _clocked("info", 0.0, lambda: None)
++    finally:
++        release.join()
++    elapsed = made.ended - made.began
++    assert elapsed < EPSILON / 2, f"a call that does nothing took {elapsed:.3f} s"
++
++
++@_COUNTED
++def test_a_forked_child_reads_its_own_threads_whoever_held_the_lock() -> None:
++    """A child drops its parent's descriptors and lock, so it reads itself and cannot deadlock."""
++    assert _cpu_waits() is not None
++    parents = set(_WAIT_FILES)
++    assert parents, "the parent's reading left no descriptor to inherit"
++
++    def child() -> str:
++        waits = _cpu_waits()
++        mine = waits is not None and threading.get_native_id() in waits.by_thread
++        return json.dumps({"mine": mine, "kept": sorted(_WAIT_FILES)})
++
++    with _WAIT_LOCK:
++        reaped = run_in_child(child)
++    assert reaped.finished, f"the child never read, as if it waited on the lock: {reaped.output}"
++    report = json.loads(reaped.output)
++    assert report["mine"], f"the child's reading does not name its own thread: {report}"
++    assert not parents & set(report["kept"]), f"the child kept a parent's descriptor: {report}"
++
++
+ def test_a_writers_arm_is_matched_to_its_sink() -> None:
+     """SPEC-086 FR-003: inside the orphan path only that sink's arm is a writer's; in a build, any."""
+     soak, mine, other = _SoakRecord(), object(), object()
+@@ -2242,10 +2511,22 @@ _CHILD_BUDGETS = {"info": 0.0, "flush": FLUSH_TIMEOUT, "shutdown": SHUTDOWN_TIME
+ """The budget of each of a forked child's three calls, each held to its own (SPEC-086 FR-001)."""
+ 
+ 
++def _child_margin(calls: Sequence[tuple[str, float, float]], where: str) -> float:
++    """Holds each call a forked child reported to its budget and returns the worst margin.
++
++    A child reports each call's name, elapsed seconds and starved seconds, which it read around
++    the call itself, and each is judged as its parent's calls are.
++    """
++    return max(
++        _bounded(Call(f"child-{name}", 0, _CHILD_BUDGETS[name], 0.0, elapsed, kept), where)
++        for name, elapsed, kept in calls
++    )
++
++
+ def _fork_step(run: _Run, expected: State, where: str) -> float:
+     """Forks at a step boundary and checks the child's half of invariant 12 and the parent's.
+ 
+-    Returns the worst ``elapsed - budget`` over the child's three calls.
++    Returns the worst ``own time - budget`` over the child's three calls.
+     """
+     before = [(len(s.threads), s.closes) for s in run.sinks]
+     parent_state = _lifecycle._state.state
+@@ -2262,9 +2543,8 @@ def _fork_step(run: _Run, expected: State, where: str) -> float:
+             ("flush", functools.partial(log_foundry.flush, timeout=FLUSH_TIMEOUT)),
+             ("shutdown", functools.partial(log_foundry.shutdown, timeout=SHUTDOWN_TIMEOUT)),
+         ):
+-            started = time.monotonic()
+-            call()
+-            calls.append((name, time.monotonic() - started))
++            made, _ = _clocked(name, _CHILD_BUDGETS[name], call)
++            calls.append((name, made.ended - made.began, made.starved))
+         return json.dumps(
+             {
+                 "initial": initial,
+@@ -2286,12 +2566,9 @@ def _fork_step(run: _Run, expected: State, where: str) -> float:
+     assert report["stored"] == report["derived"], (
+         f"SPEC-078 FR-003 (the child's stored state is its derived one): {report} {where}"
+     )
+-    names = [name for name, _ in report["calls"]]
++    names = [name for name, _, _ in report["calls"]]
+     assert names == list(_CHILD_BUDGETS), f"invariant 12 (the child made its three calls): {where}"
+-    worst = max(
+-        _bounded(Call(f"child-{name}", 0, _CHILD_BUDGETS[name], 0.0, elapsed), f"{report} {where}")
+-        for name, elapsed in report["calls"]
+-    )
++    worst = _child_margin(report["calls"], f"{report} {where}")
+     assert report["in_inherited"] + report["in_own"] == 1, (
+         f"invariant 12 (the child's event landed in a child recorder): {report} {where}"
+     )
+@@ -2506,19 +2783,19 @@ def _drive(seed: int, monkeypatch: pytest.MonkeyPatch) -> tuple[float, collectio
+         run.history.append(f"{step}@{cell[1].name}")
+         where = run.where(index)
+         if step == "fork":
+-            started = time.monotonic()
+-            margins.append(_fork_step(run, expected, where))
+-            ended = time.monotonic()
+-            margins.append(_bounded(Call(step, driver, _budget(step), started, ended), where))
++            made, childs = _clocked(
++                step, _budget(step), functools.partial(_fork_step, run, expected, where)
++            )
++            margins.extend((childs, _bounded(made, where)))
+             model.take(step)
+             _check_close_count(run, step, where)
+             continue
+-        started = time.monotonic()
+         try:
+-            result = _take(run, step, nested, label)
++            made, result = _clocked(
++                step, _budget(step), functools.partial(_take, run, step, nested, label)
++            )
+         except BaseException as exc:
+             pytest.fail(f"invariant 1 (never fail the caller): {step} raised {exc!r} {where}")
+-        ended = time.monotonic()
+         model.take(step)
+         state = _lifecycle._state.state
+         assert state is expected, f"state {state.name} is not the table's {expected.name} {where}"
+@@ -2536,7 +2813,7 @@ def _drive(seed: int, monkeypatch: pytest.MonkeyPatch) -> tuple[float, collectio
+         assert (_lifecycle._state.live_worker() is not None) == model.live, (
+             f"liveness is not the model's {where}"
+         )
+-        margins.append(_bounded(Call(step, driver, _budget(step), started, ended), where))
++        margins.append(_bounded(made, where))
+         _check_samples(label, step, driver, where)
+         _check_transient(cell, label, transient, where)
+         _check_invariants(run, step, result, driver, where)
+diff --git a/tests/test_model_oracles.py b/tests/test_model_oracles.py
+index f4685228..a84f8f14 100644
+--- a/tests/test_model_oracles.py
++++ b/tests/test_model_oracles.py
+@@ -42,6 +42,7 @@ import model_sinks
+ import test_model_cells
+ from model_oracles import (
+     EPSILON,
++    EXCUSED_MOST,
+     GATE_MARGIN,
+     HANG_AFTER,
+     MARGIN,
+@@ -61,6 +62,7 @@ from model_oracles import (
+     Note,
+     Take,
+     Wait,
++    Waits,
+     Write,
+     changes_overlapped,
+     check_call,
+@@ -81,8 +83,10 @@ from model_oracles import (
+     parse_seeds,
+     parse_soak,
+     rerun_command,
++    sched_counts,
+     seeds_from,
+     soak_from,
++    starved,
+     take_of_each_close,
+ )
+ from model_pins import PINS, Cell, PinnedVerdict, cell_id, cells, judge, pin_of, scheduled, withheld
+@@ -199,6 +203,207 @@ def test_the_watchdog_ends_a_call_on_its_own_time_only() -> None:
+     assert overdue([_call(0.0, deadline - 0.5)], []) is None
+ 
+ 
++# -- starvation: what a starved machine may excuse of a call's elapsed time ---------------
++
++
++@pytest.mark.parametrize(
++    ("schedstat", "expected"),
++    [
++        pytest.param(b"37417 912 4\n", (912, 4), id="the-second-and-third-counters"),
++        pytest.param(b"5 0 9\n", (0, 9), id="never-waited"),
++        pytest.param(b"", None, id="an-ended-thread"),
++        pytest.param(b"37417 912\n", None, id="two-counters"),
++        pytest.param(b"37417 912 1 4\n", None, id="four-counters"),
++        pytest.param(b"37417 -912 1\n", None, id="not-a-count"),
++    ],
++)
++def test_a_threads_counts_are_the_second_and_third_of_its_schedstat(
++    schedstat: bytes, expected: tuple[int, int] | None
++) -> None:
++    """The first counter is time on a CPU, which would excuse a call for being busy."""
++    assert sched_counts(schedstat) == expected
++
++
++_SECOND = 1_000_000_000
++_TICK = 0.005
++"""The switch interval the corpus passes: a thread given a CPU once is credited this much."""
++
++
++def _waits(
++    at: float, by_thread: dict[int, tuple[float, int]], took: float = 0.0, reader: int = 1
++) -> Waits:
++    """A reading by thread 1 that began at ``at``: seconds waited and times given a CPU, each."""
++    counts = {
++        thread: (round(waited * _SECOND), runs) for thread, (waited, runs) in by_thread.items()
++    }
++    return Waits(at, at + took, reader, counts)
++
++
++_IDLE = (0.0, 0)
++_WOKEN = (0.0, 1000)
++"""A caller given a CPU a thousand times, so its own credit never limits what a row excuses."""
++
++
++@pytest.mark.parametrize(
++    ("before", "after", "expected"),
++    [
++        pytest.param(None, _waits(12.0, {1: (1.0, 1000)}), 0.0, id="no-reading-before"),
++        pytest.param(_waits(10.0, {1: _IDLE}), None, 0.0, id="no-reading-after"),
++        pytest.param(_waits(10.0, {}), _waits(12.0, {}), 0.0, id="no-threads"),
++        pytest.param(
++            _waits(10.0, {1: (7.0, 3), 2: (9.0, 5)}),
++            _waits(12.0, {1: (7.0, 3), 2: (9.0, 5)}),
++            0.0,
++            id="nobody-waited",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE, 2: _IDLE, 3: _IDLE}),
++            _waits(12.0, {1: _WOKEN, 2: (0.3, 9), 3: (0.6, 9)}),
++            0.6,
++            id="the-longest-not-the-sum",
++        ),
++        pytest.param(
++            _waits(10.0, {1: (5.0, 0)}),
++            _waits(12.0, {1: (5.8, 1000)}),
++            0.8,
++            id="since-the-first-reading",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE}),
++            _waits(12.0, {1: _WOKEN, 2: (0.9, 9)}),
++            0.0,
++            id="a-thread-first-seen-after",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE, 2: _IDLE}),
++            _waits(12.0, {1: (0.1, 1000)}),
++            0.1,
++            id="a-thread-ended-inside",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE, 2: _IDLE}),
++            _waits(12.0, {1: (0.0, 1), 2: (0.9, 9)}),
++            _TICK,
++            id="a-blocked-caller-beside-a-starved-thread",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE, 2: _IDLE}),
++            _waits(12.0, {1: (0.2, 40), 2: (0.9, 9)}),
++            0.2 + 40 * _TICK,
++            id="the-callers-own-wait-and-wakes",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE, 2: _IDLE}),
++            _waits(12.0, {1: (0.3, 0), 2: (0.1, 9)}, reader=2),
++            0.0,
++            id="readings-by-two-threads",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE}),
++            _waits(12.0, {1: (5.0, 1000)}),
++            EXCUSED_MOST,
++            id="capped-at-the-most-excused",
++        ),
++        pytest.param(
++            _waits(10.0, {1: (1.0, 0)}), _waits(12.0, {1: _WOKEN}), 0.0, id="never-negative"
++        ),
++        pytest.param(
++            _waits(9.6, {1: _IDLE}),
++            _waits(12.0, {1: (0.9, 1000)}),
++            0.5,
++            id="less-the-gap-before-the-call",
++        ),
++        pytest.param(
++            _waits(9.6, {1: _IDLE}, took=0.3),
++            _waits(12.0, {1: (0.9, 1000)}),
++            0.5,
++            id="less-the-whole-gap-from-the-first-readings-start",
++        ),
++        pytest.param(
++            _waits(10.0, {1: _IDLE}),
++            _waits(12.0, {1: (0.9, 1000)}, took=0.3),
++            0.6,
++            id="less-the-gap-after-the-call",
++        ),
++        pytest.param(
++            _waits(9.0, {1: _IDLE}),
++            _waits(12.5, {1: (0.9, 1000)}, took=0.5),
++            0.0,
++            id="gaps-longer-than-the-wait",
++        ),
++        pytest.param(
++            _waits(10.2, {1: _IDLE}, took=0.1),
++            _waits(11.5, {1: (0.9, 1000)}, took=0.1),
++            0.9,
++            id="readings-inside-the-call",
++        ),
++    ],
++)
++def test_starved_is_the_lesser_of_the_longest_wait_and_the_callers_own(
++    before: Waits | None, after: Waits | None, expected: float
++) -> None:
++    """A call from 10 to 12 s read by thread 1: silent without a reading, and never over the cap."""
++    assert starved(before, after, 10.0, 12.0, _TICK) == pytest.approx(expected)
++
++
++def test_starved_is_never_more_than_the_call_took() -> None:
++    """A call shorter than the cap is excused at most its own length, and none of no length."""
++    before, after = _waits(10.0, {1: _IDLE}), _waits(10.4, {1: (5.0, 1000)})
++    assert starved(before, after, 10.0, 10.4, _TICK) == pytest.approx(0.4)
++    assert starved(before, _waits(10.0, {1: (5.0, 1000)}), 10.0, 10.0, _TICK) == 0.0
++
++
++def test_the_most_excused_is_one_bound_and_no_more() -> None:
++    """The ceiling is ``EPSILON``, so twice it past a budget fails however starved the machine."""
++    assert EXCUSED_MOST == EPSILON
++    starved_for = starved(_waits(0.0, {1: _IDLE}), _waits(9.0, {1: (9.0, 9000)}), 0.0, 9.0, _TICK)
++    late = Call("c", 1, 0.0, 0.0, 2 * EPSILON + 0.1, min(starved_for, 2 * EPSILON + 0.1))
++    assert _signatures(check_call, late, ()) == frozenset({"Stalled:c"})
++
++
++def test_own_time_is_also_less_the_starved_seconds() -> None:
++    """Starvation is subtracted once, beside the sink code and not instead of it."""
++    call = Call("c", 1, 0.0, 0.0, 10.0, 4.0)
++    assert own_time(call, ()) == pytest.approx(6.0)
++    assert own_time(call, (Interval(2, 0.0, 3.0),)) == pytest.approx(3.0)
++    assert _call(0.0, 10.0).starved == 0.0
++
++
++@pytest.mark.parametrize(
++    ("call", "expected"),
++    [
++        pytest.param(Call("c", 1, 0.0, 0.0, 1.5, 0.6), frozenset(), id="starved-under-the-bound"),
++        pytest.param(
++            Call("c", 1, 0.0, 0.0, 2.5, 0.6), frozenset({"Stalled:c"}), id="the-rest-is-a-stall"
++        ),
++        pytest.param(Call("c", 1, 3.0, 0.0, 4.5, 0.6), frozenset(), id="a-budget-and-starved"),
++        pytest.param(
++            Call("c", 1, 3.0, 0.0, 5.5, 0.6),
++            frozenset({"BoundExceeded:c"}),
++            id="the-rest-is-over-budget",
++        ),
++    ],
++)
++def test_the_time_oracle_excuses_starvation_and_nothing_else(
++    call: Call, expected: frozenset[str]
++) -> None:
++    """A starved call is judged on what is left, so a stall beside starvation is still a stall."""
++    assert _signatures(check_call, call, ()) == expected
++
++
++def test_a_starved_calls_failure_says_what_was_subtracted() -> None:
++    """The detail names the elapsed time and the starvation, and is unchanged without any."""
++    with pytest.raises(model_oracles.Stalled) as starved_call:
++        check_call(Call("info", 1, 0.0, 0.0, 2.5, 0.6), ())
++    assert starved_call.value.detail == (
++        "info: own time 1.900 s against a budget of 0.000 s, being 2.500 s elapsed less "
++        "0.600 s excused as waiting for a CPU"
++    )
++    with pytest.raises(model_oracles.Stalled) as plain:
++        check_call(_call(0.0, 1.5), ())
++    assert plain.value.detail == "c: own time 1.500 s against a budget of 0.000 s"
++
++
+ @pytest.mark.parametrize(
+     ("wait", "expected"),
+     [
